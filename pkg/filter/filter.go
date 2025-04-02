@@ -33,12 +33,15 @@ func FilterDevices(celProgram cel.Program, devices []resourcev1beta1.Device) []r
 	for _, dev := range devices {
 		out, _, err := celProgram.Eval(map[string]interface{}{"attributes": dev.Basic.Attributes})
 		if err != nil {
-			klog.Fatalf("prg.Eval() failed: %v", err)
+			klog.Infof("prg.Eval() failed: %v", err)
+			filteredDevices = append(filteredDevices, dev)
+			continue
 		}
 		// The result should be a boolean.
 		result, ok := out.(celtypes.Bool)
 		if !ok {
 			klog.Infof("CEL expression did not evaluate to a boolean got: %T", out)
+			filteredDevices = append(filteredDevices, dev)
 			continue
 		}
 		if result == celtypes.True {
