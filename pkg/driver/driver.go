@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/google/cel-go/cel"
@@ -90,6 +91,10 @@ type NetworkDriver struct {
 	netdb *inventory.DB
 	// options
 	celProgram cel.Program
+
+	// cache for interface name to device name
+	mu       sync.Mutex
+	devNames map[string]string
 }
 
 type Option func(*NetworkDriver)
@@ -105,6 +110,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		driverName:       driverName,
 		kubeClient:       kubeClient,
 		claimAllocations: store,
+		devNames:         map[string]string{},
 	}
 
 	for _, o := range opts {
@@ -251,20 +257,26 @@ func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox)
 			}
 
 			klog.Infof("RunPodSandbox allocation.Devices.Result: %#v", result)
+			np.mu.Lock()
+			ifName := np.devNames[result.Device]
+			if ifName == "" {
+				ifName = result.Device
+			}
+			np.mu.Unlock()
 			// TODO signal this via DRA
-			if rdmaDev, _ := rdmamap.GetRdmaDeviceForNetdevice(result.Device); rdmaDev != "" {
+			if rdmaDev, _ := rdmamap.GetRdmaDeviceForNetdevice(ifName); rdmaDev != "" {
 				err := nsAttachRdmadev(rdmaDev, ns)
 				if err != nil {
-					klog.Infof("RunPodSandbox error getting RDMA device %s to namespace %s: %v", result.Device, ns, err)
-					continue
+					klog.Infof("RunPodSandbox error getting RDMA device %s to namespace %s: %v", ifName, ns, err)
+					// continue
 				}
 			}
 
 			// TODO config options to rename the device and pass parameters
 			// use https://github.com/opencontainers/runtime-spec/pull/1271
-			err := nsAttachNetdev(result.Device, ns, result.Device)
+			err := nsAttachNetdev(ifName, ns, ifName)
 			if err != nil {
-				klog.Infof("RunPodSandbox error moving device %s to namespace %s: %v", result.Device, ns, err)
+				klog.Infof("RunPodSandbox error moving device %s to namespace %s: %v", ifName, ns, err)
 				return err
 			}
 		}
@@ -314,11 +326,17 @@ func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox
 			}
 
 			klog.V(4).Infof("podStopHook Device %s", result.Device)
+			np.mu.Lock()
+			ifName := np.devNames[result.Device]
+			if ifName == "" {
+				ifName = result.Device
+			}
+			np.mu.Unlock()
 			// TODO config options to rename the device and pass parameters
 			// use https://github.com/opencontainers/runtime-spec/pull/1271
-			err := nsDetachNetdev(ns, result.Device)
+			err := nsDetachNetdev(ns, ifName)
 			if err != nil {
-				klog.Infof("StopPodSandbox error moving device %s to namespace %s: %v", result.Device, ns, err)
+				klog.Infof("StopPodSandbox error moving device %s to namespace %s: %v", ifName, ns, err)
 				continue
 			}
 		}
@@ -347,6 +365,12 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 			resources := kubeletplugin.Resources{
 				Devices: devices,
 			}
+			np.mu.Lock()
+			for _, dev := range devices {
+				np.devNames[dev.Name] = *dev.Basic.Attributes["dra.net/name"].StringValue
+			}
+			np.mu.Unlock()
+
 			err := np.draPlugin.PublishResources(ctx, resources)
 			if err != nil {
 				klog.Error(err, "unexpected error trying to publish resources")

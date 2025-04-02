@@ -1,4 +1,3 @@
-
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
@@ -76,7 +75,7 @@ spec:
         k8s-app: dranet
     spec:
       nodeSelector:
-        dra.net/acceleratorpod: "true"
+        cloud.google.com/gke-gpu: "true"
       hostNetwork: true
       tolerations:
       - operator: Exists
@@ -89,6 +88,8 @@ spec:
         volumeMounts:
         - mountPath: /etc
           name: etc
+        - mountPath: /home
+          name: home
         securityContext:
           privileged: true
         command:
@@ -108,12 +109,21 @@ spec:
              echo "restarting containerd"
              nsenter -t 1 -m -u -i -n -p -- systemctl restart containerd
           fi
+          if grep -q "DynamicResourceAllocation" /home/kubernetes/kubelet-config.yaml
+          then
+             echo "kubelet config contains DynamicResourceAllocation reference already; taking no action"
+          else
+             echo "kubelet config does not mention DynamicResourceAllocation, thus enabling it";
+             sed -i '/featureGates:/a\  DynamicResourceAllocation: true' /home/kubernetes/kubelet-config.yaml
+             echo "restarting kubelet"
+             nsenter -t 1 -m -u -i -n -p -- systemctl restart kubelet
+          fi
       containers:
       - name: dranet
         args:
         - /dranet
         - --v=4
-        image: ghcr.io/google/dranet:stable
+        image: aojea/dranet:kubecon
         imagePullPolicy: Always
         resources:
           requests:
@@ -152,4 +162,7 @@ spec:
       - name: etc
         hostPath:
           path: /etc
+      - name: home
+        hostPath:
+          path: /home
 ---
