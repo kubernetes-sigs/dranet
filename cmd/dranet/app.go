@@ -51,6 +51,7 @@ var (
 	kubeconfig       string
 	bindAddress      string
 	celExpression    string
+	dranetMode       string
 
 	ready atomic.Bool
 )
@@ -60,6 +61,7 @@ func init() {
 	flag.StringVar(&bindAddress, "bind-address", ":9177", "The IP address and port for the metrics and healthz server to serve on")
 	flag.StringVar(&hostnameOverride, "hostname-override", "", "If non-empty, will be used as the name of the Node that kube-network-policies is running on. If unset, the node name is assumed to be the same as the node's hostname.")
 	flag.StringVar(&celExpression, "filter", `attributes["dra.net/type"].StringValue  != "veth"`, "CEL expression to filter network interface attributes (v1beta1.DeviceAttribute).")
+	flag.StringVar(&dranetMode, "mode", "dra", "The mode of operation for the driver. Options are 'dra', 'device-plugin', or 'hybrid'.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -70,6 +72,11 @@ func init() {
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	allowedModes := map[string]bool{"dra": true, "device-plugin": true, "hybrid": true}
+	if !allowedModes[dranetMode] {
+		klog.Fatalf("invalid mode %q. Allowed modes are 'dra', 'device-plugin', 'hybrid'", dranetMode)
+	}
 
 	printVersion()
 	flag.VisitAll(func(f *flag.Flag) {

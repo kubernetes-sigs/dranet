@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 const (
@@ -54,11 +55,12 @@ func WithFilter(filter cel.Program) Option {
 }
 
 type NetworkDriver struct {
-	driverName string
-	nodeName   string
-	kubeClient kubernetes.Interface
-	draPlugin  *kubeletplugin.Helper
-	nriPlugin  stub.Stub
+	driverName   string
+	nodeName     string
+	kubeClient   kubernetes.Interface
+	draPlugin    *kubeletplugin.Helper
+	devicePlugin *devicePlugin
+	nriPlugin    stub.Stub
 
 	// contains the host interfaces
 	netdb      *inventory.DB
@@ -94,6 +96,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		o(plugin)
 	}
 
+	// register the DRA plugin
 	driverPluginPath := filepath.Join(kubeletPluginPath, driverName)
 	err = os.MkdirAll(driverPluginPath, 0750)
 	if err != nil {
@@ -120,6 +123,36 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	if err != nil {
 		return nil, err
 	}
+
+	// register the device plugin
+
+	_, err = os.Stat(pluginapi.DevicePluginPath)
+	if err != nil {
+		klog.Fatalf("kubelet plugin path %s does not exist: %v", pluginapi.DevicePluginPath, err)
+	}
+
+	devicePlugin := newPlugin()
+
+	plugin.devicePlugin = devicePlugin
+
+	go func() {
+		for i := 0; i < maxAttempts; i++ {
+			if err := os.Remove(plugin.devicePlugin.Endpoint); err != nil && !os.IsNotExist(err) {
+				klog.Info("error removing the plugin unix socket %s", plugin.devicePlugin.Endpoint)
+			}
+			err = plugin.devicePlugin.run(ctx)
+			if err != nil {
+				klog.Infof("Unable to start plugin: %v", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				klog.Infof("Restarting device plugin %d out of %d", i, maxAttempts)
+			}
+		}
+		klog.Fatalf("device plugin failed for %d times to be restarted", maxAttempts)
+	}()
 
 	// register the NRI plugin
 	nriOpts := []stub.Option{
@@ -179,7 +212,9 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 
 func (np *NetworkDriver) Stop() {
 	np.nriPlugin.Stop()
-	np.draPlugin.Stop()
+	if np.draPlugin != nil {
+		np.draPlugin.Stop()
+	}
 }
 
 func (np *NetworkDriver) Shutdown(_ context.Context) {
