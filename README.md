@@ -41,7 +41,7 @@ a GRPC call to DRANET via NRI to execute the necessary network configurations.
 
 A more detailed diagram illustrating this process can be found in our
 documentation: [How It
-Works](https://google.github.io/dranet/docs/concepts/howitworks/).
+Works](https://dranet.dev/docs/concepts/howitworks/).
 
 ## Quick Start
 
@@ -104,32 +104,24 @@ network devices.
 
 For examples of how to use DRANET with `DeviceClass` and `ResourceClaim` to
 attach network interfaces to pods, please refer to the [Quick Start
-guide](https://google.github.io/dranet/docs/quick-start).
+guide](https://dranet.dev/docs/quick-start).
 
 
 ## Contributing
 
-We welcome your contributions! Please review our [Contributor License
-Agreement](https://cla.developers.google.com/about) and [Google's Open Source
-Community Guidelines](https://opensource.google/conduct/) before you begin. All
-submissions require review via [GitHub pull
-requests](https://docs.github.com/articles/about-pull-requests).
-
-For detailed development instructions, including local development with KIND and
-troubleshooting tips, see our [Developer
-Guide](https://google.github.io/dranet/docs/contributing/developer-guide).
+We welcome your contributions! Please check out our [CONTRIBUTING.md](CONTRIBUTING.md) for more information.
 
 ## Further Reading
 
 Explore more concepts and advanced topics:
 
 * **Design:** Understand the architectural choices behind DRANET:
-  [Design](https://google.github.io/dranet/docs/concepts/howitworks)
+  [Design](https://dranet.dev/docs/concepts/howitworks)
 * **RDMA:** Learn about RDMA components in Linux and their interplay:
-  [RDMA](https://google.github.io/dranet/docs/concepts/rdma)
+  [RDMA](https://dranet.dev/docs/concepts/rdma)
 * **References:** A list of relevant Kubernetes Enhancement Proposals (KEPs) and
   presentations:
-  [References](https://google.github.io/dranet/docs/concepts/references)
+  [References](https://dranet.dev/docs/concepts/references)
 
 ## Disclaimer
 
