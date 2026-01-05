@@ -57,6 +57,7 @@ var (
 	minPollInterval  time.Duration
 	maxPollInterval  time.Duration
 	pollBurst        int
+	podUID           string
 
 	ready atomic.Bool
 )
@@ -69,6 +70,7 @@ func init() {
 	flag.DurationVar(&minPollInterval, "inventory-min-poll-interval", 2*time.Second, "The minimum interval between two consecutive polls of the inventory.")
 	flag.DurationVar(&maxPollInterval, "inventory-max-poll-interval", 1*time.Minute, "The maximum interval between two consecutive polls of the inventory.")
 	flag.IntVar(&pollBurst, "inventory-poll-burst", 5, "The number of polls that can be run in a burst.")
+	flag.StringVar(&podUID, "pod-uid", "", "The UID of the pod running this plugin. This field is required for enabling rolling update support.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -164,6 +166,10 @@ func main() {
 		inventory.WithMaxPollInterval(maxPollInterval),
 	)
 	opts = append(opts, driver.WithInventory(db))
+	if podUID != "" {
+		opts = append(opts, driver.WithPodUID(podUID))
+		klog.Infof("Rolling updates enabled with pod UID: %s", podUID)
+	}
 	dranet, err := driver.Start(ctx, driverName, clientset, nodeName, opts...)
 	if err != nil {
 		klog.Fatalf("driver failed to start: %v", err)
