@@ -79,4 +79,4 @@ kind-image: image
 	kubectl apply -f install.yaml
 
 # The main release target, which pushes all images
-release: push-image
+release: image-push
