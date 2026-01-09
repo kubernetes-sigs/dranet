@@ -31,6 +31,7 @@ import (
 	"github.com/google/dranet/internal/nlwrap"
 
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -80,6 +81,13 @@ func WithInventory(db inventoryDB) Option {
 	}
 }
 
+// WithPodUID sets the pod UID for rolling updates support.
+func WithPodUID(uid string) Option {
+	return func(o *NetworkDriver) {
+		o.podUID = uid
+	}
+}
+
 type NetworkDriver struct {
 	driverName string
 	nodeName   string
@@ -94,6 +102,7 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+	podUID         string
 }
 
 type Option func(*NetworkDriver)
@@ -132,11 +141,17 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		kubeletplugin.NodeName(nodeName),
 		kubeletplugin.KubeClient(kubeClient),
 	}
+	if plugin.podUID != "" {
+		kubeletOpts = append(kubeletOpts, kubeletplugin.RollingUpdate(types.UID(plugin.podUID)))
+		klog.Infof("Enabling rolling update mode with pod UID: %s", plugin.podUID)
+	}
 	d, err := kubeletplugin.Start(ctx, plugin, kubeletOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("start kubelet plugin: %w", err)
 	}
 	plugin.draPlugin = d
+
+	klog.Infof("Waiting for kubelet to register plugin %s", driverName)
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(context.Context) (bool, error) {
 		status := plugin.draPlugin.RegistrationStatus()
 		if status == nil {
