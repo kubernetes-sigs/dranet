@@ -393,7 +393,15 @@ func (db *DB) discoverRDMADevices(devices []resourceapi.Device) []resourceapi.De
 	for i := range devices {
 		isRDMA := false
 		if ifName := devices[i].Attributes[apis.AttrInterfaceName].StringValue; ifName != nil && *ifName != "" {
+			// Try rdmamap library first
 			isRDMA = rdmamap.IsRDmaDeviceForNetdevice(*ifName)
+
+			// Fallback to sysfs check if rdmamap fails. This is particularly
+			// needed for InfiniBand interfaces where rdmamap has a bug comparing
+			// against node GUID instead of port GUID.
+			if !isRDMA {
+				isRDMA = hasRDMADeviceInSysfs(*ifName)
+			}
 		} else if pciAddr := devices[i].Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil && *pciAddr != "" {
 			rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)
 			isRDMA = len(rdmaDevices) != 0

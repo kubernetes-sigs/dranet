@@ -100,6 +100,33 @@ func sriovNumVFs(name string) int {
 	return t
 }
 
+// hasRDMADeviceInSysfs checks if a network interface has RDMA capability by
+// examining the sysfs infiniband directory. This serves as a workaround for
+// cases where the rdmamap library fails to detect RDMA devices, particularly
+// for InfiniBand interfaces where the library incorrectly compares against the
+// node GUID instead of the port GUID.
+//
+// The function checks /sys/class/net/{ifname}/device/infiniband/ for any RDMA
+// device entries. If the directory exists and contains at least one entry, the
+// interface is considered RDMA-capable.
+func hasRDMADeviceInSysfs(ifName string) bool {
+	// Check if the infiniband directory exists under the device
+	ibPath := filepath.Join(sysnetPath, ifName, "device", "infiniband")
+	entries, err := os.ReadDir(ibPath)
+	if err != nil {
+		// Directory doesn't exist or can't be read
+		return false
+	}
+	// If there's at least one entry (RDMA device), return true
+	for _, entry := range entries {
+		if entry.IsDir() {
+			klog.V(4).Infof("Found RDMA device %s for interface %s via sysfs", entry.Name(), ifName)
+			return true
+		}
+	}
+	return false
+}
+
 // pciAddress BDF Notation
 // [domain:]bus:device.function
 // https://wiki.xenproject.org/wiki/Bus:Device.Function_(BDF)_Notation
