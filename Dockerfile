@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # setup cross-compile env
-FROM --platform=$BUILDPLATFORM golang:1.24 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
 ARG TARGETARCH
 ARG GOARCH=${TARGETARCH} CGO_ENABLED=0
 
