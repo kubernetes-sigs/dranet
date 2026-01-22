@@ -92,7 +92,7 @@ Allocation](https://cloud.google.com/kubernetes-engine/docs/how-to/set-up-dra)
 Install the latest stable version of DRANET using the provided manifest:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/google/dranet/refs/heads/main/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/dranet/refs/heads/main/install.yaml
 ```
 
 ### How to Use It

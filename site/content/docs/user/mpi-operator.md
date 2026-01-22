@@ -9,7 +9,7 @@ The goal is resource compartmentalization: ensuring that each part of your distr
 
 ## DRANET + MPI Operator: A Powerful Combination
 
-- DRANET: Provides the mechanism to discover RDMA-capable NICs on your Kubernetes nodes and make them available for Pods to claim. Through DRA, Pods can request a specific NIC, and DRANET, via NRI hooks, will configure it within the Pod's namespace, [even naming it predictably (e.g., dranet0)](google/dranet/dranet-dcd98f563b1a24f4800cf3d2d502ec5b2f488ddc/site/content/docs/user/interface-configuration.md)
+- DRANET: Provides the mechanism to discover RDMA-capable NICs on your Kubernetes nodes and make them available for Pods to claim. Through DRA, Pods can request a specific NIC, and DRANET, via NRI hooks, will configure it within the Pod's namespace, [even naming it predictably (e.g., dranet0)](/docs/user/interface-configuration.md)
 
 - [Kubeflow MPI Operator](https://github.com/kubeflow/mpi-operator): Simplifies the deployment and management of MPI-based applications on Kubernetes. It handles the setup of MPI ranks, hostfiles, and the execution of mpirun.
 

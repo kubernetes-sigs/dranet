@@ -87,7 +87,7 @@ kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container
 Apply the following manifest to install DRANET:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/google/dranet/refs/heads/main/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/dranet/refs/heads/main/install.yaml
 ```
 
 Once DRANET is running you'll be able to obtain the network resources exposed via the daemonsets, per example, this specific node has 8 RDMA nics as per the machine specification:

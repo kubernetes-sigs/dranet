@@ -49,7 +49,7 @@ gcloud container node-pools create POOL_NAME \
 Apply the following manifest to install DRANET:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/google/dranet/refs/heads/main/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/dranet/refs/heads/main/install.yaml
 ```
 
 Once DRANET is running you'll be able to obtain the network resources exposed by the dranet Pods, in order to avoid noise, DRANET has a flag that allow to set client side filter to control the exposed resources, in this case, we can set the flag to ignore network devices that are `virtual`, the manifest will look like:

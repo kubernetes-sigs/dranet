@@ -56,7 +56,7 @@ kubernetes_feature_enabled{name="DynamicResourceAllocation",stage="BETA"} 1
 You can install the latest stable version of `DRANET` using the provided manifest:
 
 ```
-kubectl apply -f https://raw.githubusercontent.com/google/dranet/refs/heads/main/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/dranet/refs/heads/main/install.yaml
 ```
 
 ### How to use it
