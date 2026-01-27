@@ -3,7 +3,7 @@ module github.com/google/dranet
 go 1.25.0
 
 require (
-	cloud.google.com/go/compute v1.53.0
+	cloud.google.com/go/compute v1.54.0
 	cloud.google.com/go/compute/metadata v0.9.0
 	cloud.google.com/go/container v1.45.0
 	github.com/Mellanox/rdmamap v1.1.0
