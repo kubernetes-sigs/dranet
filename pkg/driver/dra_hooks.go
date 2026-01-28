@@ -331,7 +331,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 
 		// Get RDMA configuration: link and char devices
-		if rdmaDev, _ := rdmamap.GetRdmaDeviceForNetdevice(ifName); rdmaDev != "" {
+		if rdmaDev, err := getRdmaDeviceFromNetdev(ifName); err == nil && rdmaDev != "" {
 			klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
 			podCfg.RDMADevice.LinkDev = rdmaDev
 			// Obtain the char devices associated to the rdma device
