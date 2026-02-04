@@ -23,7 +23,6 @@ rules:
       - nodes
     verbs:
       - get
-      - list
   - apiGroups:
       - "resource.k8s.io"
     resources:
@@ -96,18 +95,12 @@ spec:
       hostPID: true
       initContainers:
       - name: enable-nri
-        image: bitnami/kubectl:latest
-        env:
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
+        image: busybox:stable
         volumeMounts:
         - mountPath: /etc
           name: etc
         securityContext:
           privileged: true
-          runAsUser: 0
         command:
         - /bin/sh
         - -c
@@ -116,61 +109,15 @@ spec:
           set -o pipefail
           set -o nounset
           set -x
-
-          CONTAINER_RUNTIME_VERSION="$(kubectl get node "${NODE_NAME}" -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}')"
-          echo "Detected node container runtime: ${CONTAINER_RUNTIME_VERSION}"
-
-          case "${CONTAINER_RUNTIME_VERSION}" in
-            containerd://*)
-              if grep -q "io.containerd.nri.v1.nri" /etc/containerd/config.toml
-              then
-                echo "containerd config contains NRI reference already; taking no action"
-              else
-                echo "containerd config does not mention NRI, thus enabling it";
-                printf '%s\n' "[plugins.\"io.containerd.nri.v1.nri\"]" "  disable = false" "  disable_connections = false" "  plugin_config_path = \"/etc/nri/conf.d\"" "  plugin_path = \"/opt/nri/plugins\"" "  plugin_registration_timeout = \"5s\"" "  plugin_request_timeout = \"5s\"" "  socket_path = \"/var/run/nri/nri.sock\"" >> /etc/containerd/config.toml
-                echo "restarting containerd"
-                nsenter -t 1 -m -u -i -n -p -- systemctl restart containerd
-              fi
-              ;;
-            cri-o://*|crio://*)
-              enable_nri_crio() {
-                mkdir -p /etc/crio/crio.conf.d
-                printf '%s\n' "[crio.nri]" "enable_nri = true" > /etc/crio/crio.conf.d/99-dranet-crio.conf
-                echo "restarting crio"
-                # cri-o service name has two variants, try both.
-                if nsenter -t 1 -m -u -i -n -p -- systemctl restart crio
-                then
-                  :
-                else
-                  nsenter -t 1 -m -u -i -n -p -- systemctl restart cri-o
-                fi
-              }
-
-              version_ge() {
-                [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
-              }
-
-              if grep -Rqs '^\s*enable_nri\s*=\s*true\s*$' /etc/crio 2>/dev/null
-              then
-                echo "cri-o config enabled NRI already; taking no action"
-              elif grep -Rqs '^\s*enable_nri\s*=\s*false\s*$' /etc/crio 2>/dev/null
-              then
-                echo "cri-o config disabled NRI, thus enabling it"
-                enable_nri_crio
-              # cri-o enabled NRI by default on v1.30+
-              elif version_ge "${CONTAINER_RUNTIME_VERSION#*://}" "1.30"
-              then
-                echo "cri-o config enabled NRI by default; taking no action"
-              else
-                echo "cri-o does not enable NRI by default, thus enabling it"
-                enable_nri_crio
-              fi
-              ;;
-            *)
-              echo "unsupported container runtime string: ${CONTAINER_RUNTIME_VERSION}"
-              exit 1
-              ;;
-          esac
+          if grep -q "io.containerd.nri.v1.nri" /etc/containerd/config.toml
+          then
+             echo "containerd config contains NRI reference already; taking no action"
+          else
+             echo "containerd config does not mention NRI, thus enabling it";
+             printf '%s\n' "[plugins.\"io.containerd.nri.v1.nri\"]" "  disable = false" "  disable_connections = false" "  plugin_config_path = \"/etc/nri/conf.d\"" "  plugin_path = \"/opt/nri/plugins\"" "  plugin_registration_timeout = \"5s\"" "  plugin_request_timeout = \"5s\"" "  socket_path = \"/var/run/nri/nri.sock\"" >> /etc/containerd/config.toml
+             echo "restarting containerd"
+             nsenter -t 1 -m -u -i -n -p -- systemctl restart containerd
+          fi
       containers:
       - name: dranet
         args:
