@@ -19,8 +19,10 @@ package driver
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 
+	"github.com/Mellanox/rdmamap"
 	"github.com/google/dranet/internal/nlwrap"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -77,6 +79,34 @@ func nsDetachRdmadev(containerNsPAth string, ifName string) error {
 	}
 	return nil
 
+}
+
+// getRdmaDeviceFromNetdev returns the RDMA device name for a given network interface
+func getRdmaDeviceFromNetdev(ifName string) (string, error) {
+	var rdmaDev string
+	if rdmaDev, _ := rdmamap.GetRdmaDeviceForNetdevice(ifName); rdmaDev == "" {
+
+		//Fallback to sysfs check if rdmamap fails. This is particularly related to a known
+		// issue to detect RDMA devices for certain Mellanox NICs
+		// https://github.com/Mellanox/rdmamap/issues/15
+
+		rdmaDir := filepath.Join("/sys/class/net", ifName, "device/infiniband")
+
+		entries, err := os.ReadDir(rdmaDir)
+		if err != nil {
+			return "", fmt.Errorf("no RDMA device for %s: %w", ifName, err)
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				return entry.Name(), nil // Return first RDMA device found (e.g., "mlx5_0")
+			}
+		}
+
+		return "", fmt.Errorf("no RDMA device found for %s", ifName)
+	}
+
+	return rdmaDev, nil
 }
 
 // GetDeviceInfo retrieves device type, major, and minor numbers for a given path.
