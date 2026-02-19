@@ -401,7 +401,7 @@ func (db *DB) discoverRDMADevices(devices []resourceapi.Device) []resourceapi.De
 			// against node GUID instead of port GUID:
 			// https://github.com/Mellanox/rdmamap/issues/15
 			if !isRDMA {
-				isRDMA = hasRDMADeviceInSysfs(*ifName)
+				isRDMA = isRdmaDeviceInSysfs(*ifName)
 			}
 		} else if pciAddr := devices[i].Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil && *pciAddr != "" {
 			rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)

@@ -26,6 +26,7 @@ import (
 
 	"github.com/google/dranet/pkg/apis"
 	"github.com/google/dranet/pkg/filter"
+	"github.com/google/dranet/pkg/inventory"
 
 	"github.com/Mellanox/rdmamap"
 	"github.com/google/dranet/internal/nlwrap"
@@ -331,7 +332,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 
 		// Get RDMA configuration: link and char devices
-		if rdmaDev, _ := rdmamap.GetRdmaDeviceForNetdevice(ifName); rdmaDev != "" {
+		if rdmaDev, err := inventory.GetRdmaDeviceFromSysfs(ifName); err == nil && rdmaDev != "" {
 			klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
 			podCfg.RDMADevice.LinkDev = rdmaDev
 			// Obtain the char devices associated to the rdma device
