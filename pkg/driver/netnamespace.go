@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"slices"
 	"syscall"
 
@@ -28,9 +29,10 @@ import (
 	"github.com/google/dranet/internal/nlwrap"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"k8s.io/component-helpers/node/util/sysctl"
 )
 
-func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []apis.RouteConfig) error {
+func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []apis.RouteConfig, vrfTable int) error {
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
 		return err
@@ -66,10 +68,17 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 	})
 
 	for _, route := range routeConfig {
+		table := route.Table
+		// If VRF is enabled (vrfTable > 0), all routes for this interface
+		// must go into the VRF table to be reachable via the VRF device.
+		if vrfTable > 0 {
+			table = vrfTable
+		}
+
 		r := netlink.Route{
 			LinkIndex: nsLink.Attrs().Index,
 			Scope:     netlink.Scope(route.Scope),
-			Table:     route.Table,
+			Table:     table,
 		}
 
 		_, dst, err := net.ParseCIDR(route.Destination)
@@ -174,4 +183,93 @@ func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) err
 		}
 	}
 	return errors.Join(errorList...)
+}
+
+func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFConfig) (int, error) {
+	if vrfConfig == nil {
+		return 0, fmt.Errorf("vrf config is nil")
+	}
+	if vrfConfig.Name == "" {
+		return 0, fmt.Errorf("vrf name not specified")
+	}
+
+	if vrfConfig.Table == nil {
+		return 0, fmt.Errorf("vrf table not specified")
+	}
+
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return 0, err
+	}
+	defer containerNs.Close()
+
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		return 0, fmt.Errorf("can not get netlink handle: %v", err)
+	}
+	defer nhNs.Close()
+
+	nsLink, err := nhNs.LinkByName(ifName)
+	if err != nil {
+		return 0, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPath, err)
+	}
+
+	vrfName := vrfConfig.Name
+	vrfTable := uint32(*vrfConfig.Table)
+
+	vrfLink, err := nhNs.LinkByName(vrfName)
+	if err != nil {
+		vrfReq := &netlink.Vrf{
+			LinkAttrs: netlink.LinkAttrs{Name: vrfName},
+			Table:     vrfTable,
+		}
+		if err := nhNs.LinkAdd(vrfReq); err != nil {
+			return 0, fmt.Errorf("failed to add vrf %s: %w", vrfName, err)
+		}
+		vrfLink, err = nhNs.LinkByName(vrfName)
+		if err != nil {
+			return 0, fmt.Errorf("failed to find vrf %s after creation: %w", vrfName, err)
+		}
+	}
+
+	if err := nhNs.LinkSetUp(vrfLink); err != nil {
+		return 0, fmt.Errorf("failed to set up vrf %s: %w", vrfName, err)
+	}
+
+	if err := nhNs.LinkSetMaster(nsLink, vrfLink); err != nil {
+		return 0, fmt.Errorf("failed to enslave %s to vrf %s: %w", ifName, vrfName, err)
+	}
+
+	if err := enableVRFSysctls(int(containerNs)); err != nil {
+		return 0, fmt.Errorf("failed to enable vrf sysctls: %w", err)
+	}
+
+	return int(vrfTable), nil
+}
+
+func enableVRFSysctls(containerNsFd int) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origns, err := netns.Get()
+	if err != nil {
+		return err
+	}
+	defer origns.Close() //nolint:errcheck
+
+	if err := netns.Set(netns.NsHandle(containerNsFd)); err != nil {
+		return err
+	}
+	defer netns.Set(origns) //nolint:errcheck
+
+	sysctlInterface := sysctl.New()
+	if err := sysctlInterface.SetSysctl("net/ipv4/tcp_l3mdev_accept", 1); err != nil {
+		return fmt.Errorf("failed to set tcp_l3mdev_accept: %w", err)
+	}
+
+	if err := sysctlInterface.SetSysctl("net/ipv4/udp_l3mdev_accept", 1); err != nil {
+		return fmt.Errorf("failed to set udp_l3mdev_accept: %w", err)
+	}
+
+	return nil
 }

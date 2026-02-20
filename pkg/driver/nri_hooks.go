@@ -198,18 +198,29 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 			}
 		}
 
+		vrfTable := 0
+		if config.NetworkInterfaceConfigInPod.Interface.VRF != nil {
+			vrfTable, err = applyVRFConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Interface.VRF)
+			if err != nil {
+				return fmt.Errorf("error configuring VRF for device %s in ns %s: %w", deviceName, ns, err)
+			}
+		}
+
 		// Configure routes
-		err = applyRoutingConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Routes)
+		err = applyRoutingConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Routes, vrfTable)
 		if err != nil {
 			klog.Infof("RunPodSandbox error configuring device %s namespace %s routing: %v", deviceName, ns, err)
 			return fmt.Errorf("error configuring device %s routes on namespace %s: %v", deviceName, ns, err)
 		}
 
 		// Configure rules
-		err = applyRulesConfig(ns, config.NetworkInterfaceConfigInPod.Rules)
-		if err != nil {
-			klog.Infof("RunPodSandbox error configuring device %s namespace %s rules: %v", deviceName, ns, err)
-			return fmt.Errorf("error configuring device %s rules on namespace %s: %v", deviceName, ns, err)
+		// If VRF is enabled, rules are not needed/supported as routing is handled by the VRF table + l3mdev.
+		if vrfTable == 0 {
+			err = applyRulesConfig(ns, config.NetworkInterfaceConfigInPod.Rules)
+			if err != nil {
+				klog.Infof("RunPodSandbox error configuring device %s namespace %s rules: %v", deviceName, ns, err)
+				return fmt.Errorf("error configuring device %s rules on namespace %s: %v", deviceName, ns, err)
+			}
 		}
 
 		// Configure neighbors

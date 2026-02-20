@@ -27,6 +27,7 @@ type NetworkConfig struct {
 	Routes []RouteConfig `json:"routes,omitempty"`
 
 	// Rules defines routing rules to be configured for this interface.
+	// Rules are not supported when VRF (Interface.VRF) is enabled.
 	Rules []RuleConfig `json:"rules,omitempty"`
 
 	// Neighbors defines permanent neighbor (ARP/NDP) entries to be added for this interface.
@@ -76,6 +77,23 @@ type InterfaceConfig struct {
 	// DisableEBPFPrograms, if true, attempts to detach all eBPF programs
 	// (both TC and TCX) from the network interface assigned to the Pod.
 	DisableEBPFPrograms *bool `json:"disableEbpfPrograms,omitempty"`
+
+	// VRF specifies the Virtual Routing and Forwarding domain this interface should belong to.
+	// If provided, the interface will be enslaved to a VRF device with this name.
+	// This enables grouping multiple network interfaces into the same VRF.
+	VRF *VRFConfig `json:"vrf,omitempty"`
+}
+
+// VRFConfig represents the configuration for a Virtual Routing and Forwarding domain.
+type VRFConfig struct {
+	// Name is the name of the VRF device to create (e.g., "vrf0").
+	// If not specified, a name will be automatically generated based on the interface index.
+	Name string `json:"name,omitempty"`
+
+	// Table is the routing table ID to use for this VRF.
+	// If not specified, a unique table ID will be automatically assigned (typically interface index + 100).
+	// Common reserved tables: 255 (local), 254 (main), 253 (default).
+	Table *int `json:"table,omitempty"`
 }
 
 // RouteConfig represents a network route configuration.
@@ -90,6 +108,17 @@ type RouteConfig struct {
 	// Refers to Linux route scopes (e.g., 0 for RT_SCOPE_UNIVERSE, 253 for RT_SCOPE_LINK).
 	Scope uint8 `json:"scope,omitempty"`
 	// Table is the routing table to use for the route.
+	// 0 usually means "unspecified" and defaults to the 'main' table (254) in Linux.
+	//
+	// IMPORTANT: If VRF is enabled on the interface, this field is IGNORED.
+	// Dranet will automatically assign ALL routes for the interface to the VRF's table
+	// to ensure they are reachable via the VRF device.
+	//
+	// Common reserved tables:
+	// - 255: local (handled by kernel)
+	// - 254: main (default table for most routes)
+	// - 253: default
+	// - 0: unspec
 	Table int `json:"table,omitempty"`
 }
 
@@ -101,7 +130,7 @@ type RuleConfig struct {
 	Source string `json:"source,omitempty"`
 	// Destination is the destination IP address for the rule.
 	Destination string `json:"destination,omitempty"`
-	// Table is the routing table to use for the rule.
+	// Table is the routing table ID to look up if the rule matches.
 	Table int `json:"table,omitempty"`
 }
 

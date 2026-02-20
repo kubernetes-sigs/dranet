@@ -29,4 +29,8 @@ const (
 	// Ref. https://man7.org/linux/man-pages/man8/rdma-system.8.html
 	RdmaNetnsModeShared    = "shared"
 	RdmaNetnsModeExclusive = "exclusive"
+
+	// VRFTableOffset is the offset used for VRF routing tables to avoid ID collisions
+	// with reserved tables (0, 253, 254, 255) and to identify DRANET managed tables.
+	VRFTableOffset = 1000
 )

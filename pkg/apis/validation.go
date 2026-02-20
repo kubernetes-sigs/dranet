@@ -59,6 +59,9 @@ func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
 		}
 	}
 
+	// Apply defaults
+	config.Default()
+
 	// Validate InterfaceConfig
 	allErrors = append(allErrors, validateInterfaceConfig(&config.Interface, "interface")...)
 
@@ -69,7 +72,11 @@ func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
 
 	// Validate Rules
 	if len(config.Rules) > 0 {
-		allErrors = append(allErrors, validateRules(config.Rules, "rules")...)
+		if config.Interface.VRF != nil {
+			allErrors = append(allErrors, fmt.Errorf("rules are not supported when VRF is enabled"))
+		} else {
+			allErrors = append(allErrors, validateRules(config.Rules, "rules")...)
+		}
 	}
 
 	// Validate EthtoolConfig if present
@@ -168,6 +175,28 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 
 	if cfg.GROIPv4MaxSize != nil && *cfg.GROIPv4MaxSize <= 0 {
 		allErrors = append(allErrors, fmt.Errorf("%s.grov4MaxSize: must be positive, got %d", fieldPath, *cfg.GROIPv4MaxSize))
+	}
+
+	if cfg.VRF != nil {
+		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
+	}
+
+	return allErrors
+}
+
+func validateVRFConfig(cfg *VRFConfig, fieldPath string) (allErrors []error) {
+	if cfg.Name == "" {
+		allErrors = append(allErrors, fmt.Errorf("%s.name: cannot be empty", fieldPath))
+	}
+
+	if cfg.Table != nil {
+		if *cfg.Table <= 0 {
+			allErrors = append(allErrors, fmt.Errorf("%s.table: must be a positive integer, got %d", fieldPath, *cfg.Table))
+		}
+		// Avoid reserved Linux routing tables
+		if *cfg.Table == 253 || *cfg.Table == 254 || *cfg.Table == 255 {
+			allErrors = append(allErrors, fmt.Errorf("%s.table: cannot use reserved table ID %d", fieldPath, *cfg.Table))
+		}
 	}
 
 	return allErrors
