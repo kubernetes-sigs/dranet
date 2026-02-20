@@ -16,22 +16,22 @@ limitations under the License.
 
 package cloudprovider
 
-type CloudInstance struct {
-	Name                string
-	Type                string
-	Provider            CloudProvider
-	AcceleratorProtocol string
-	Interfaces          []NetworkInterface
-	Topology            string
+import resourceapi "k8s.io/api/resource/v1"
+
+// DeviceIdentifiers contains locally discovered hardware identifiers
+// that a cloud provider can use to match against its metadata.
+type DeviceIdentifiers struct {
+	MAC        string
+	PCIAddress string
+	Name       string
 }
 
-type NetworkInterface struct {
-	IPv4      string   `json:"ip,omitempty"`
-	IPv6      []string `json:"ipv6,omitempty"`
-	Mac       string   `json:"mac,omitempty"`
-	MTU       int      `json:"mtu,omitempty"`
-	Network   string   `json:"network,omitempty"`
-	IPAliases []string `json:"ipAliases,omitempty"`
+// CloudInstance defines the generic interface for all cloud providers.
+type CloudInstance interface {
+	GetProvider() CloudProvider
+	// GetDeviceAttributes takes multiple identifiers, allowing the provider
+	// to choose the best way to match the local device to cloud metadata.
+	GetDeviceAttributes(id DeviceIdentifiers) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
 }
 
 // CloudProvider represents the type of cloud provider.
