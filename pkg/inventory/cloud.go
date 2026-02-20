@@ -24,16 +24,16 @@ import (
 
 	"k8s.io/klog/v2"
 
+	"github.com/google/dranet/pkg/apis"
 	"github.com/google/dranet/pkg/cloudprovider"
 	"github.com/google/dranet/pkg/cloudprovider/gce"
 	resourceapi "k8s.io/api/resource/v1"
 )
 
 // getInstanceProperties get the instace properties and stores them in a global variable to be used in discovery
-// TODO(aojea) support more cloud providers
-func getInstanceProperties(ctx context.Context) *cloudprovider.CloudInstance {
+func getInstanceProperties(ctx context.Context) cloudprovider.CloudInstance {
 	var err error
-	var instance *cloudprovider.CloudInstance
+	var instance cloudprovider.CloudInstance
 	if metadata.OnGCE() {
 		// Get google compute instance metadata for network interfaces
 		// https://cloud.google.com/compute/docs/metadata/predefined-metadata-keys
@@ -48,18 +48,24 @@ func getInstanceProperties(ctx context.Context) *cloudprovider.CloudInstance {
 }
 
 // getProviderAttributes retrieves cloud provider-specific attributes for a network interface
-func getProviderAttributes(mac string, instance *cloudprovider.CloudInstance) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
-	if instance == nil {
-		klog.Warningf("instance metadata is nil, cannot get provider attributes.")
+func getProviderAttributes(device *resourceapi.Device, instance cloudprovider.CloudInstance) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
+	if instance == nil || device == nil {
+		klog.Warningf("instance metadata or device is nil, cannot get provider attributes.")
 		return nil
 	}
-	switch instance.Provider {
-	case cloudprovider.CloudProviderGCE:
-		return gce.GetGCEAttributes(mac, instance)
-	default:
-		klog.Warningf("cloud provider %q is not supported", instance.Provider)
+
+	id := cloudprovider.DeviceIdentifiers{
+		Name: device.Name,
 	}
-	return nil
+	// get the device identifiers from the device attributes
+	if macAttr, ok := device.Attributes[apis.AttrMac]; ok && macAttr.StringValue != nil {
+		id.MAC = *macAttr.StringValue
+	}
+	if pciAttr, ok := device.Attributes[apis.AttrPCIAddress]; ok && pciAttr.StringValue != nil {
+		id.PCIAddress = *pciAttr.StringValue
+	}
+
+	return instance.GetDeviceAttributes(id)
 }
 
 // getLastSegmentAndTruncate extracts the last segment from a path

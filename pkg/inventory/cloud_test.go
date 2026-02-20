@@ -19,6 +19,7 @@ package inventory
 import (
 	"testing"
 
+	"github.com/google/dranet/pkg/apis"
 	"github.com/google/dranet/pkg/cloudprovider"
 	"github.com/google/dranet/pkg/cloudprovider/gce"
 	"github.com/google/go-cmp/cmp"
@@ -27,152 +28,105 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+// mockCloudInstance implements cloudprovider.CloudInstance for testing
+type mockCloudInstance struct {
+	provider         cloudprovider.CloudProvider
+	deviceAttributes map[string]map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
+}
+
+func (m *mockCloudInstance) GetProvider() cloudprovider.CloudProvider {
+	return m.provider
+}
+
+func (m *mockCloudInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
+	// For testing, we primarily look up by MAC if present, similar to the GCE implementation for now
+	if id.MAC != "" {
+		return m.deviceAttributes[id.MAC]
+	}
+	// We could extend this to look up by Name or PCIAddress if tests require it
+	return nil
+}
+
 func TestGetProviderAttributes(t *testing.T) {
 	tests := []struct {
 		name     string
-		mac      string
-		instance *cloudprovider.CloudInstance
+		device   *resourceapi.Device
+		instance cloudprovider.CloudInstance
 		want     map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
 	}{
 		{
 			name:     "nil instance",
-			mac:      "00:11:22:33:44:55",
+			device:   &resourceapi.Device{Name: "dev1"},
 			instance: nil,
 			want:     nil,
 		},
 		{
-			name: "instance with no interfaces",
-			mac:  "00:11:22:33:44:55",
-			instance: &cloudprovider.CloudInstance{
-				Provider:   cloudprovider.CloudProviderGCE,
-				Type:       "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{},
-			},
-			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				gce.AttrGCEMachineType: {StringValue: ptr.To("machine-type-a")},
-			},
+			name:     "nil device",
+			device:   nil,
+			instance: &mockCloudInstance{provider: cloudprovider.CloudProviderGCE},
+			want:     nil,
 		},
 		{
-			name: "MAC not found in instance interfaces, no topology",
-			mac:  "00:11:22:33:44:FF", // MAC that won't be found
-			instance: &cloudprovider.CloudInstance{
-				Provider: cloudprovider.CloudProviderGCE,
-				Type:     "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{
-					{Mac: "00:11:22:33:44:55", Network: "projects/12345/networks/test-network"},
+			name: "instance with no matching MAC",
+			device: &resourceapi.Device{
+				Name: "dev1",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrMac: {StringValue: ptr.To("00:11:22:33:44:FF")},
 				},
 			},
-			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				gce.AttrGCEMachineType: {StringValue: ptr.To("machine-type-a")},
-			},
-		},
-		{
-			name: "MAC not found in instance interfaces, has topology",
-			mac:  "00:11:22:33:44:FF", // MAC that won't be found
-			instance: &cloudprovider.CloudInstance{
-				Provider: cloudprovider.CloudProviderGCE,
-				Type:     "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{
-					{Mac: "00:11:22:33:44:55", Network: "projects/12345/networks/test-network"},
-				},
-				Topology: "/block/subblock/host",
-			},
-			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				gce.AttrGCEBlock:       {StringValue: ptr.To("block")},
-				gce.AttrGCESubBlock:    {StringValue: ptr.To("subblock")},
-				gce.AttrGCEHost:        {StringValue: ptr.To("host")},
-				gce.AttrGCEMachineType: {StringValue: ptr.To("machine-type-a")},
-			},
-		},
-		{
-			name: "GCE provider, MAC found, valid network",
-			mac:  "00:11:22:33:44:55",
-			instance: &cloudprovider.CloudInstance{
-				Provider: cloudprovider.CloudProviderGCE,
-				Type:     "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{
-					{Mac: "00:11:22:33:44:55", Network: "projects/12345/networks/test-network"},
-					{Mac: "AA:BB:CC:DD:EE:FF", Network: "projects/67890/networks/other-network"},
-				},
-				Topology: "/block/subblock/host",
-			},
-			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				gce.AttrGCENetworkName:          {StringValue: ptr.To("test-network")},
-				gce.AttrGCENetworkProjectNumber: {IntValue: ptr.To(int64(12345))},
-				gce.AttrGCEBlock:                {StringValue: ptr.To("block")},
-				gce.AttrGCESubBlock:             {StringValue: ptr.To("subblock")},
-				gce.AttrGCEHost:                 {StringValue: ptr.To("host")},
-				gce.AttrGCEMachineType:          {StringValue: ptr.To("machine-type-a")},
-			},
-		},
-		{
-			name: "GCE provider, MAC found, invalid network string for GCE parsing",
-			mac:  "00:11:22:33:44:55",
-			instance: &cloudprovider.CloudInstance{
-				Provider: cloudprovider.CloudProviderGCE,
-				Type:     "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{
-					{Mac: "00:11:22:33:44:55", Network: "invalid-gce-network-string"},
-				},
-			},
-			want: nil, // gce.GetGCEAttributes returns nil for invalid network string
-		},
-		{
-			name: "GCE provider, MAC found, valid network, invalid topology",
-			mac:  "00:11:22:33:44:55",
-			instance: &cloudprovider.CloudInstance{
-				Provider: cloudprovider.CloudProviderGCE,
-				Type:     "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{
-					{Mac: "00:11:22:33:44:55", Network: "projects/12345/networks/test-network"},
-					{Mac: "AA:BB:CC:DD:EE:FF", Network: "projects/67890/networks/other-network"},
-				},
-				Topology: "/block/subblock",
-			},
-			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				gce.AttrGCENetworkName:          {StringValue: ptr.To("test-network")},
-				gce.AttrGCENetworkProjectNumber: {IntValue: ptr.To(int64(12345))},
-				gce.AttrGCEMachineType:          {StringValue: ptr.To("machine-type-a")},
-			},
-		},
-		{
-			name: "Unsupported provider, MAC found",
-			mac:  "00:11:22:33:44:55",
-			instance: &cloudprovider.CloudInstance{
-				Provider: cloudprovider.CloudProviderAWS, // Unsupported provider
-				Type:     "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{
-					{Mac: "00:11:22:33:44:55", Network: "aws-network-info"},
+			instance: &mockCloudInstance{
+				provider: cloudprovider.CloudProviderGCE,
+				deviceAttributes: map[string]map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					"00:11:22:33:44:55": {
+						gce.AttrGCEMachineType: {StringValue: ptr.To("machine-type-a")},
+					},
 				},
 			},
 			want: nil,
 		},
 		{
-			name: "GCE provider, MAC found, with IP aliases",
-			mac:  "00:11:22:33:44:55",
-			instance: &cloudprovider.CloudInstance{
-				Provider: cloudprovider.CloudProviderGCE,
-				Type:     "machine-type-a",
-				Interfaces: []cloudprovider.NetworkInterface{
-					{
-						Mac:       "00:11:22:33:44:55",
-						Network:   "projects/12345/networks/test-network",
-						IPAliases: []string{"10.0.0.1/24", "10.0.0.2/24"},
+			name: "MAC found",
+			device: &resourceapi.Device{
+				Name: "dev1",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrMac: {StringValue: ptr.To("00:11:22:33:44:55")},
+				},
+			},
+			instance: &mockCloudInstance{
+				provider: cloudprovider.CloudProviderGCE,
+				deviceAttributes: map[string]map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					"00:11:22:33:44:55": {
+						gce.AttrGCENetworkName: {StringValue: ptr.To("test-network")},
+						gce.AttrGCEMachineType: {StringValue: ptr.To("machine-type-a")},
 					},
 				},
 			},
 			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				gce.AttrGCENetworkName:          {StringValue: ptr.To("test-network")},
-				gce.AttrGCENetworkProjectNumber: {IntValue: ptr.To(int64(12345))},
-				gce.AttrGCEIPAliases:            {StringValue: ptr.To("10.0.0.1/24,10.0.0.2/24")},
-				gce.AttrGCEMachineType:          {StringValue: ptr.To("machine-type-a")},
+				gce.AttrGCENetworkName: {StringValue: ptr.To("test-network")},
+				gce.AttrGCEMachineType: {StringValue: ptr.To("machine-type-a")},
 			},
+		},
+		{
+			name: "Device Name used (future proofing)",
+			device: &resourceapi.Device{
+				Name: "dev-pci-1", // PCI device without MAC
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrPCIAddress: {StringValue: ptr.To("0000:00:01.0")},
+				},
+			},
+			instance: &mockCloudInstance{
+				provider: cloudprovider.CloudProviderGCE,
+				// Mock implementation currently only checks MAC, so this returns nil
+				// This test case ensures we can pass non-MAC devices without crashing
+				deviceAttributes: map[string]map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+			},
+			want: nil,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := getProviderAttributes(tt.mac, tt.instance)
+			got := getProviderAttributes(tt.device, tt.instance)
 			if diff := cmp.Diff(tt.want, got, cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("getProviderAttributes() returned unexpected diff (-want, +got):\n%s", diff)
 			}

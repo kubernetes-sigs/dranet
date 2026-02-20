@@ -62,7 +62,7 @@ var (
 )
 
 type DB struct {
-	instance *cloudprovider.CloudInstance
+	instance cloudprovider.CloudInstance
 	// TODO: it is not common but may happen in edge cases that the default
 	// gateway changes revisit once we have more evidence this can be a
 	// potential problem or break some use cases.
@@ -415,11 +415,7 @@ func (db *DB) discoverRDMADevices(devices []resourceapi.Device) []resourceapi.De
 func (db *DB) addCloudAttributes(devices []resourceapi.Device) []resourceapi.Device {
 	for i := range devices {
 		device := &devices[i]
-		mac, ok := device.Attributes[apis.AttrMac]
-		if !ok || mac.StringValue == nil {
-			continue
-		}
-		maps.Copy(device.Attributes, getProviderAttributes(*mac.StringValue, db.instance))
+		maps.Copy(device.Attributes, getProviderAttributes(device, db.instance))
 	}
 	return devices
 }
