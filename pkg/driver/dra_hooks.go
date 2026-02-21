@@ -301,12 +301,16 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 		podCfg.NetworkInterfaceConfigInPod.Routes = append(podCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 
-		for _, table := range tables.UnsortedList() {
-			if rules, ok := rulesByTable[table]; ok {
-				klog.V(5).Infof("Adding %d rules for table %d associated with interface %s", len(rules), table, ifName)
-				podCfg.NetworkInterfaceConfigInPod.Rules = append(podCfg.NetworkInterfaceConfigInPod.Rules, rules...)
-				// Avoid adding the same rule twice
-				delete(rulesByTable, table)
+		// If VRF is enabled, we do not need to copy the rules from the host
+		// because the VRF handles the routing table lookup.
+		if podCfg.NetworkInterfaceConfigInPod.Interface.VRF == nil {
+			for _, table := range tables.UnsortedList() {
+				if rules, ok := rulesByTable[table]; ok {
+					klog.V(5).Infof("Adding %d rules for table %d associated with interface %s", len(rules), table, ifName)
+					podCfg.NetworkInterfaceConfigInPod.Rules = append(podCfg.NetworkInterfaceConfigInPod.Rules, rules...)
+					// Avoid adding the same rule twice
+					delete(rulesByTable, table)
+				}
 			}
 		}
 

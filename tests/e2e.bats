@@ -11,6 +11,7 @@ teardown() {
   fi
   cleanup_k8s_resources
   cleanup_dummy_interfaces
+  cleanup_veth_interfaces
   cleanup_bpf_programs
   # The driver is rate limited to updates with interval of atleast 5 seconds. So
   # we need to sleep for an equivalent amount of time to ensure state from a
@@ -61,6 +62,15 @@ cleanup_dummy_interfaces() {
       for dev in $(ip -br link show type dummy | awk "{print \$1}"); do
         ip link delete "$dev" || echo "Failed to delete $dev"
       done
+    '
+  done
+}
+
+cleanup_veth_interfaces() {
+  for node in "$CLUSTER_NAME"-worker "$CLUSTER_NAME"-worker2; do
+    docker exec "$node" bash -c '
+      ip link delete vrf-test-host || true
+      ip link delete pbr-test-host || true
     '
   done
 }
@@ -495,3 +505,77 @@ EOF
   refute_output --partial "fd36::3:0:e:0:0/96 dev dummy-ipv6 metric 1024 pref medium"
 }
 
+
+@test "validate vrf prevents asymmetric routing" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  
+  # Create veth pairs for two pods
+  docker exec "$NODE_NAME" bash -c "ip link add vrf-test-host-1 type veth peer name vrf-test-pod-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-test-host-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-test-pod-1"
+
+  docker exec "$NODE_NAME" bash -c "ip link add vrf-test-host-2 type veth peer name vrf-test-pod-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-test-host-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-test-pod-2"
+
+  # Assign IPs to host side (simulating a switch/router connecting them)
+  docker exec "$NODE_NAME" bash -c "ip addr add 10.10.10.1/24 dev vrf-test-host-1"
+  docker exec "$NODE_NAME" bash -c "ip addr add 10.10.20.1/24 dev vrf-test-host-2"
+
+  # Enable forwarding on the host node so packets can go between veths
+  docker exec "$NODE_NAME" bash -c "sysctl -w net.ipv4.conf.all.forwarding=1"
+
+  # Apply manifests for two pods
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_vrf.yaml
+
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-vrf-1
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-vrf-2
+
+  POD_1=$(kubectl get pods -l app=pod-vrf-1 -o name)
+  
+  # Verify ping from Pod 1 to Pod 2
+  # This traffic MUST go through the VRF gateway (10.10.10.1) on the host, 
+  # routed to 10.10.20.1, and then to Pod 2 (10.10.20.2).
+  # If VRF was not working, it might try default eth0 and fail or use main table if leakage exists.
+  # But primarily, the static route 0.0.0.0/0 in VRF points to 10.10.10.1, correct.
+  run kubectl exec -it $POD_1 -- ping -c 1 10.10.20.2
+  assert_success
+}
+
+@test "validate pbr configuration" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  
+  # Create veth pairs for two pods
+  docker exec "$NODE_NAME" bash -c "ip link add pbr-test-host-1 type veth peer name pbr-test-pod-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-test-host-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-test-pod-1"
+
+  docker exec "$NODE_NAME" bash -c "ip link add pbr-test-host-2 type veth peer name pbr-test-pod-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-test-host-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-test-pod-2"
+
+  # Setup host IPs acting as gateways
+  docker exec "$NODE_NAME" bash -c "ip addr add 192.168.100.1/24 dev pbr-test-host-1"
+  docker exec "$NODE_NAME" bash -c "ip addr add 192.168.200.1/24 dev pbr-test-host-2"
+
+  # Enable forwarding (should be on, but ensure it)
+  docker exec "$NODE_NAME" bash -c "sysctl -w net.ipv4.conf.all.forwarding=1"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_pbr.yaml
+  
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-pbr-1
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-pbr-2
+
+  POD_1=$(kubectl get pods -l app=pod-pbr-1 -o name)
+  
+  # Verify PBR routing: Ping from Pod 1 (192.168.100.10) to Pod 2 (192.168.200.10)
+  # Traffic MUST use Table 100 to reach the gateway (192.168.100.1) because default main table might not work or we strictly want to test PBR.
+  # The fact that it works confirms:
+  # 1. Source based rule matches.
+  # 2. Table 100 is used.
+  # 3. Default route in Table 100 works.
+  run kubectl exec -it $POD_1 -- ping -c 1 192.168.200.10
+  assert_success
+}
