@@ -117,10 +117,27 @@ func TestValidateConfig(t *testing.T) {
 			expectedCfg: &invalidRuleConf,
 			errContains: []string{"rules[0].source: invalid CIDR format 'invalid-cidr'"},
 		},
+		{
+			name:        "config with VRF and empty name",
+			raw:         newRawExtension(t, NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: ""}}}),
+			expectErr:   true,
+			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: ""}}},
+			errContains: []string{"interface.vrf.name: cannot be empty"},
+		},
+		{
+			name:        "config with VRF and rules validation error",
+			raw:         newRawExtension(t, NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: "my-vrf"}}, Rules: []RuleConfig{{Table: 100}}}),
+			expectErr:   true,
+			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: "my-vrf"}}, Rules: []RuleConfig{{Table: 100}}},
+			errContains: []string{"rules are not supported when VRF is enabled"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.expectedCfg != nil {
+				tt.expectedCfg.Default()
+			}
 			cfg, errs := ValidateConfig(tt.raw)
 			hasErrs := len(errs) > 0
 
