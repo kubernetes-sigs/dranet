@@ -1,0 +1,151 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: dynamic-interface-pbr-1
+spec:
+  devices:
+    requests:
+      - name: req-veth
+        exactly:
+          deviceClassName: dra.net
+          selectors:
+            - cel:
+                expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "pbr-test-pod-1"
+    config:
+      - opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              name: "eth1"
+              addresses:
+                - "192.168.100.10/24"
+            rules:
+              - source: "192.168.100.0/24"
+                table: 100
+                priority: 32000
+              - destination: "192.168.200.0/24"
+                table: 100
+                priority: 32000
+            routes:
+              - destination: "0.0.0.0/0"
+                table: 100
+                gateway: "192.168.100.2"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pbr-1
+  labels:
+    app: pod-pbr-1
+spec:
+  containers:
+    - name: ctr1
+      image: registry.k8s.io/e2e-test-images/agnhost:2.54
+      command: ["/agnhost", "netexec", "--http-port=8080"]
+  resourceClaims:
+    - name: pbr1
+      resourceClaimName: dynamic-interface-pbr-1
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: dynamic-interface-pbr-2
+spec:
+  devices:
+    requests:
+      - name: req-veth
+        exactly:
+          deviceClassName: dra.net
+          selectors:
+            - cel:
+                expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "pbr-test-pod-2"
+    config:
+      - opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              name: "eth1"
+              addresses:
+                - "192.168.200.10/24"
+            rules:
+              - source: "192.168.200.0/24"
+                table: 100
+                priority: 32000
+              - destination: "192.168.100.0/24"
+                table: 100
+                priority: 32000
+            routes:
+              - destination: "0.0.0.0/0"
+                table: 100
+                gateway: "192.168.200.2"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pbr-2
+  labels:
+    app: pod-pbr-2
+spec:
+  containers:
+    - name: ctr1
+      image: registry.k8s.io/e2e-test-images/agnhost:2.54
+      command: ["/agnhost", "netexec", "--http-port=8080"]
+  resourceClaims:
+    - name: pbr2
+      resourceClaimName: dynamic-interface-pbr-2
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: dynamic-interface-pbr-router
+spec:
+  devices:
+    requests:
+      - name: req-veth-router-1
+        exactly:
+          deviceClassName: dra.net
+          selectors:
+            - cel:
+                expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "pbr-rtr-1"
+      - name: req-veth-router-2
+        exactly:
+          deviceClassName: dra.net
+          selectors:
+            - cel:
+                expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "pbr-rtr-2"
+    config:
+      - requests:
+          - req-veth-router-1
+        opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              name: "eth1"
+              addresses:
+                - "192.168.100.2/24"
+              forwarding: true
+      - requests:
+          - req-veth-router-2
+        opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              name: "eth2"
+              addresses:
+                - "192.168.200.2/24"
+              forwarding: true
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pbr-router
+  labels:
+    app: pod-pbr-router
+spec:
+  containers:
+    - name: ctr1
+      image: registry.k8s.io/e2e-test-images/agnhost:2.54
+      command: ["/agnhost", "netexec", "--http-port=8080"]
+  resourceClaims:
+    - name: pbr-router
+      resourceClaimName: dynamic-interface-pbr-router

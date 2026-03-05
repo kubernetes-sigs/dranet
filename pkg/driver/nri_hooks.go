@@ -179,6 +179,14 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 		// The interface name inside the container's namespace.
 		ifNameInNs := networkData.InterfaceName
 
+		// Apply interface-specific forwarding
+		if config.NetworkInterfaceConfigInPod.Interface.Forwarding != nil && *config.NetworkInterfaceConfigInPod.Interface.Forwarding {
+			err = applyInterfaceForwarding(ns, ifNameInNs, *config.NetworkInterfaceConfigInPod.Interface.Forwarding)
+			if err != nil {
+				return fmt.Errorf("error applying forwarding config for %s in ns %s: %v", ifNameInNs, ns, err)
+			}
+		}
+
 		// Apply Ethtool configurations
 		if config.NetworkInterfaceConfigInPod.Ethtool != nil {
 			err = applyEthtoolConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Ethtool)
@@ -198,18 +206,29 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 			}
 		}
 
+		vrfTable := 0
+		if config.NetworkInterfaceConfigInPod.Interface.VRF != nil {
+			vrfTable, err = applyVRFConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Interface.VRF)
+			if err != nil {
+				return fmt.Errorf("error configuring VRF for device %s in ns %s: %w", deviceName, ns, err)
+			}
+		}
+
 		// Configure routes
-		err = applyRoutingConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Routes)
+		err = applyRoutingConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Routes, vrfTable)
 		if err != nil {
 			klog.Infof("RunPodSandbox error configuring device %s namespace %s routing: %v", deviceName, ns, err)
 			return fmt.Errorf("error configuring device %s routes on namespace %s: %v", deviceName, ns, err)
 		}
 
 		// Configure rules
-		err = applyRulesConfig(ns, config.NetworkInterfaceConfigInPod.Rules)
-		if err != nil {
-			klog.Infof("RunPodSandbox error configuring device %s namespace %s rules: %v", deviceName, ns, err)
-			return fmt.Errorf("error configuring device %s rules on namespace %s: %v", deviceName, ns, err)
+		// If VRF is enabled, rules are not needed/supported as routing is handled by the VRF table + l3mdev.
+		if vrfTable == 0 {
+			err = applyRulesConfig(ns, config.NetworkInterfaceConfigInPod.Rules)
+			if err != nil {
+				klog.Infof("RunPodSandbox error configuring device %s namespace %s rules: %v", deviceName, ns, err)
+				return fmt.Errorf("error configuring device %s rules on namespace %s: %v", deviceName, ns, err)
+			}
 		}
 
 		// Configure neighbors
