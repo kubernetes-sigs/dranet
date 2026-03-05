@@ -1,0 +1,73 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  annotations:
+    resource.kubernetes.io/pod-claim-name: gpu-nic
+  creationTimestamp: "2026-03-04T15:55:17Z"
+  finalizers:
+  - resource.kubernetes.io/delete-protection
+  generateName: nccl-test-dra-worker-0-gpu-nic-
+  name: nccl-test-dra-worker-0-gpu-nic-sbmhc
+  namespace: default
+  ownerReferences:
+  - apiVersion: v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: Pod
+    name: nccl-test-dra-worker-0
+    uid: 73a80211-3b6f-4c1a-a9ce-d14de38359be
+  resourceVersion: "3093435"
+  uid: 99b2df4b-a79f-45c8-9957-a4da5901c456
+spec:
+  devices:
+    requests:
+    - exactly:
+        allocationMode: ExactCount
+        count: 1
+        deviceClassName: gpu.nvidia.com
+        selectors:
+        - cel:
+            expression: device.attributes["resource.kubernetes.io"]["pciBusID"]
+              == "0008:06:00.0"
+      name: gpu
+    - exactly:
+        allocationMode: ExactCount
+        count: 1
+        deviceClassName: dranet.net
+        selectors:
+        - cel:
+            expression: device.attributes["dra.net"]["rdmaDevice"] == "mlx5_2"
+      name: nic
+status:
+  allocation:
+    devices:
+      results:
+      - device: gpu-0
+        driver: gpu.nvidia.com
+        pool: aks-user-34494392-vmss000000
+        request: gpu
+      - device: pci-0103-00-00-0
+        driver: dra.net
+        pool: aks-user-34494392-vmss000000
+        request: nic
+    nodeSelector:
+      nodeSelectorTerms:
+      - matchFields:
+        - key: metadata.name
+          operator: In
+          values:
+          - aks-user-34494392-vmss000000
+  devices:
+  - conditions:
+    - lastTransitionTime: "2026-03-04T15:55:18Z"
+      message: ""
+      reason: RDMAOnlyDeviceReady
+      status: "True"
+      type: Ready
+    device: pci-0103-00-00-0
+    driver: dra.net
+    pool: aks-user-34494392-vmss000000
+  reservedFor:
+  - name: nccl-test-dra-worker-0
+    resource: pods
+    uid: 73a80211-3b6f-4c1a-a9ce-d14de38359be

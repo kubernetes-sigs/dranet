@@ -298,6 +298,16 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []resourceapi.Device) []resou
 			continue
 		}
 
+		// Skip IPoIB interfaces. The underlying PCI device will be discovered
+		// as an IB-only RDMA device (no netdev) via discoverRDMADevices.
+		// Associating the IPoIB netdev with the PCI device would mask the
+		// IB-only nature of the device and prevent correct RDMA char device
+		// injection into pods.
+		if link.Type() == "ipoib" {
+			klog.V(4).Infof("Network Interface %s is IPoIB, skipping netdev association (will be discovered as IB-only RDMA device)", ifName)
+			continue
+		}
+
 		pciAddr, err := pciAddressForNetInterface(ifName)
 		if err == nil {
 			// It's a PCI device.
@@ -410,6 +420,11 @@ func (db *DB) discoverRDMADevices(devices []resourceapi.Device) []resourceapi.De
 		} else if pciAddr := devices[i].Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil && *pciAddr != "" {
 			rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)
 			isRDMA = len(rdmaDevices) != 0
+			if isRDMA {
+				// IB-only device: has RDMA capability but no netdev interface.
+				rdmaDevName := rdmaDevices[0]
+				devices[i].Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: &rdmaDevName}
+			}
 		}
 		devices[i].Attributes[apis.AttrRDMA] = resourceapi.DeviceAttribute{BoolValue: &isRDMA}
 	}
@@ -498,6 +513,35 @@ func (db *DB) getNetInterfaceNameWithoutRescan(deviceName string) (string, error
 		return "", fmt.Errorf("device %s has no interface name in local store", deviceName)
 	}
 	return *device.Attributes[apis.AttrInterfaceName].StringValue, nil
+}
+
+// IsIBOnlyDevice returns true if the device has RDMA capability but no netdev
+// interface (i.e. an InfiniBand-only device). Derived from existing attributes:
+// a device with a non-empty rdmaDevice and no ifName is IB-only.
+func (db *DB) IsIBOnlyDevice(deviceName string) bool {
+	device, exists := db.GetDevice(deviceName)
+	if !exists {
+		return false
+	}
+	rdmaAttr := device.Attributes[apis.AttrRDMADevice]
+	ifAttr := device.Attributes[apis.AttrInterfaceName]
+	return rdmaAttr.StringValue != nil && *rdmaAttr.StringValue != "" &&
+		(ifAttr.StringValue == nil || *ifAttr.StringValue == "")
+}
+
+// GetRDMADeviceName returns the RDMA link name (e.g. "mlx5_0") for an IB-only
+// device. It returns an error if the device is not found or has no RDMA device
+// name recorded.
+func (db *DB) GetRDMADeviceName(deviceName string) (string, error) {
+	device, exists := db.GetDevice(deviceName)
+	if !exists {
+		return "", fmt.Errorf("device %s not found in store", deviceName)
+	}
+	attr, ok := device.Attributes[apis.AttrRDMADevice]
+	if !ok || attr.StringValue == nil {
+		return "", fmt.Errorf("device %s has no RDMA device name in local store", deviceName)
+	}
+	return *attr.StringValue, nil
 }
 
 // isNetworkDevice checks the class is 0x2, defined for all types of network controllers

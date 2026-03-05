@@ -250,6 +250,45 @@ func validateEthtoolConfig(cfg *EthtoolConfig, fieldPath string) (allErrors []er
 	return allErrors
 }
 
+// ValidateRDMAOnlyConfig checks that a NetworkConfig does not contain
+// network-specific fields that are meaningless (and unsupported) for an
+// RDMA-only device (i.e. a device with no network interface). Callers should
+// invoke this after confirming the allocated device has no ifName.
+func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
+	if raw == nil || raw.Raw == nil || len(raw.Raw) == 0 {
+		return nil
+	}
+	var config NetworkConfig
+	var allErrors []error
+	strictErrs, err := json.UnmarshalStrict(raw.Raw, &config)
+	if err != nil {
+		return []error{fmt.Errorf("failed to unmarshal JSON data: %w", err)}
+	}
+	for _, e := range strictErrs {
+		allErrors = append(allErrors, fmt.Errorf("failed to unmarshal strict JSON data: %w", e))
+	}
+	if config.Interface.Name != "" || len(config.Interface.Addresses) > 0 ||
+		config.Interface.MTU != nil || config.Interface.HardwareAddr != nil ||
+		config.Interface.DHCP != nil || config.Interface.GSOMaxSize != nil ||
+		config.Interface.GROMaxSize != nil || config.Interface.GSOIPv4MaxSize != nil ||
+		config.Interface.GROIPv4MaxSize != nil || config.Interface.DisableEBPFPrograms != nil {
+		allErrors = append(allErrors, fmt.Errorf("interface configuration is not supported for RDMA-only devices (no network interface present)"))
+	}
+	if len(config.Routes) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("routes are not supported for RDMA-only devices (no network interface present)"))
+	}
+	if len(config.Rules) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("rules are not supported for RDMA-only devices (no network interface present)"))
+	}
+	if config.Ethtool != nil {
+		allErrors = append(allErrors, fmt.Errorf("ethtool configuration is not supported for RDMA-only devices (no network interface present)"))
+	}
+	if len(config.Neighbors) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("neighbors are not supported for RDMA-only devices (no network interface present)"))
+	}
+	return allErrors
+}
+
 // validateNeighborConfig validates a slice of NeighborConfig.
 func validateNeighborConfig(neighbors []NeighborConfig, fieldPath string) (allErrors []error) {
 	for i, neighbor := range neighbors {

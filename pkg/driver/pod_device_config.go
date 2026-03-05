@@ -47,8 +47,9 @@ type PodConfig struct {
 // RDMAConfig contains parameters for setting up an RDMA device associated
 // with a network interface.
 type RDMAConfig struct {
-	// LinkDev is the name of the RDMA link device (e.g., "mlx5_0") that
-	// corresponds to the allocated network device.
+	// LinkDev is the name of the RDMA link device (e.g., "mlx5_0").
+	// Depending on the type of device (RoCE, IB) it may have a network device
+	// associated. For IB-only devices there is no associated network interface.
 	LinkDev string
 
 	// DevChars is a list of user-space RDMA character

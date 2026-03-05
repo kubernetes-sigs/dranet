@@ -56,6 +56,10 @@ func (m *fakeInventoryDB) GetResources(_ context.Context) <-chan []resourcev1.De
 
 func (m *fakeInventoryDB) GetNetInterfaceName(_ string) (string, error) { return "", nil }
 
+func (m *fakeInventoryDB) IsIBOnlyDevice(_ string) bool { return false }
+
+func (m *fakeInventoryDB) GetRDMADeviceName(_ string) (string, error) { return "", nil }
+
 func (m *fakeInventoryDB) AddPodNetNs(podKey string, netNs string) {
 	m.podNetNs[podKey] = netNs
 }

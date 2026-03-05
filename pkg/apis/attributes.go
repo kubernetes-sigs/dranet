@@ -45,4 +45,5 @@ const (
 	AttrSRIOVVfs        = AttrPrefix + "/" + "sriovVfs"
 	AttrVirtual         = AttrPrefix + "/" + "virtual"
 	AttrRDMA            = AttrPrefix + "/" + "rdma"
+	AttrRDMADevice      = AttrPrefix + "/" + "rdmaDevice"
 )

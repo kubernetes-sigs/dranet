@@ -222,6 +222,46 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			},
 			NetworkInterfaceConfigInPod: netconf,
 		}
+
+		// IB-only path: device has RDMA capability but no netdev interface.
+		if np.netdb.IsIBOnlyDevice(result.Device) {
+			// Reject any network-specific config fields for RDMA-only devices.
+			for _, config := range claim.Status.Allocation.Devices.Config {
+				if config.Opaque == nil ||
+					config.Opaque.Driver != np.driverName ||
+					len(config.Requests) > 0 && !slices.Contains(config.Requests, requestName) {
+					continue
+				}
+				if errs := apis.ValidateRDMAOnlyConfig(&config.Opaque.Parameters); len(errs) > 0 {
+					errorList = append(errorList, errs...)
+				}
+			}
+			if len(errorList) > 0 {
+				continue
+			}
+			rdmaDevName, err := np.netdb.GetRDMADeviceName(result.Device)
+			if err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to get RDMA device name for IB-only device %s: %v", result.Device, err))
+				continue
+			}
+			podCfg.RDMADevice.LinkDev = rdmaDevName
+			charDevices.Insert(rdmaCmPath)
+			charDevices.Insert(rdmamap.GetRdmaCharDevices(rdmaDevName)...)
+			for _, devpath := range charDevices.UnsortedList() {
+				dev, err := GetDeviceInfo(devpath)
+				if err != nil {
+					klog.Infof("fail to get device info for %s : %v", devpath, err)
+				} else {
+					podCfg.RDMADevice.DevChars = append(podCfg.RDMADevice.DevChars, dev)
+				}
+			}
+			for _, uid := range podUIDs {
+				np.podConfigStore.Set(uid, result.Device, podCfg)
+			}
+			klog.V(4).Infof("IB-only claim resources for pods %v : %#v", podUIDs, podCfg)
+			continue
+		}
+
 		ifName, err := np.netdb.GetNetInterfaceName(result.Device)
 		if err != nil {
 			errorList = append(errorList, fmt.Errorf("failed to get network interface name for device %s: %v", result.Device, err))

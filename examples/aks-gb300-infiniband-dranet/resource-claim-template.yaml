@@ -1,0 +1,68 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 1nic-aligned
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"]["pciBusID"] == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dranet.net
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["dra.net"]["rdmaDevice"] == "mlx5_0"'
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 1nic-unaligned
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"]["pciBusID"] == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dranet.net
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["dra.net"]["rdmaDevice"] == "mlx5_2"'
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 2nic-aligned
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"]["pciBusID"] == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dranet.net
+          count: 2
+          selectors:
+          - cel:
+              expression: 'device.attributes["dra.net"]["rdma"] == true && device.attributes["dra.net"]["numaNode"] == 0'

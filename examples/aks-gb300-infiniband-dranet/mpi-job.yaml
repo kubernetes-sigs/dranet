@@ -1,0 +1,61 @@
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: nccl-test-dra
+spec:
+  slotsPerWorker: 1
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          containers:
+          - name: nccl
+            image: ghcr.io/coreweave/nccl-tests:12.9.1-devel-ubuntu24.04-nccl2.29.2-1-d73ec07
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              sleep 5
+              mpirun -np 2 \
+                --allow-run-as-root \
+                -bind-to none \
+                -x LD_LIBRARY_PATH \
+                -x NCCL_DEBUG=INFO \
+                -x NCCL_SOCKET_IFNAME=eth0 \
+                -x NCCL_IB_DISABLE=0 \
+                -x NCCL_SHM_DISABLE=1 \
+                -x NCCL_MNNVL_ENABLE=0 \
+                -x NCCL_NVLS_ENABLE=0 \
+                -x NCCL_NET_GDR_LEVEL=PHB \
+                -x NCCL_IB_DATA_DIRECT=0 \
+                /opt/nccl_tests/build/all_reduce_perf -b 512M -e 8G -f 2 -g 1 -c 0
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    training.kubeflow.org/job-name: nccl-test-dra
+                    training.kubeflow.org/job-role: worker
+                topologyKey: kubernetes.io/hostname
+          automountServiceAccountToken: false
+          resourceClaims:
+          - name: gpu-nic
+            resourceClaimTemplateName: 1nic-unaligned
+          containers:
+          - name: nccl
+            image: ghcr.io/coreweave/nccl-tests:12.9.1-devel-ubuntu24.04-nccl2.29.2-1-d73ec07
+            resources:
+              claims:
+              - name: gpu-nic
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
