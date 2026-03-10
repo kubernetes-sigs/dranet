@@ -22,6 +22,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/dranet/pkg/apis"
 )
@@ -222,11 +224,12 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 	config3_1 := PodConfig{Claim: claim2, NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "p3d1c2"}}} // Pod3, Dev1, Claim2
 
 	tests := []struct {
-		name                string
-		initialConfigs      func() *PodConfigStore
-		claimToDelete       types.NamespacedName
-		expectedPodsAfter   map[types.UID]map[string]PodConfig
-		checkSpecificConfig func(t *testing.T, store *PodConfigStore)
+		name                 string
+		initialConfigs       func() *PodConfigStore
+		claimToDelete        types.NamespacedName
+		expectedPodsAfter    map[types.UID]map[string]PodConfig
+		expectedReturnedUIDs []types.UID
+		checkSpecificConfig  func(t *testing.T, store *PodConfigStore)
 	}{
 		{
 			name: "delete claim associated with one pod, one device",
@@ -240,6 +243,7 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 			expectedPodsAfter: map[types.UID]map[string]PodConfig{
 				podUID1: {dev1: config1_1}, // Pod1 (Claim1) should remain
 			},
+			expectedReturnedUIDs: []types.UID{podUID3},
 		},
 		{
 			name: "delete claim associated with multiple pods",
@@ -255,6 +259,7 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 			expectedPodsAfter: map[types.UID]map[string]PodConfig{
 				podUID3: {dev1: config3_1}, // Pod3 (Claim2) should remain
 			},
+			expectedReturnedUIDs: []types.UID{podUID1, podUID2},
 		},
 		{
 			name: "delete non-existent claim",
@@ -267,21 +272,27 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 			expectedPodsAfter: map[types.UID]map[string]PodConfig{
 				podUID1: {dev1: config1_1}, // Pod1 should remain
 			},
+			expectedReturnedUIDs: []types.UID{},
 		},
 		{
 			name: "delete claim from empty store",
 			initialConfigs: func() *PodConfigStore {
 				return NewPodConfigStore()
 			},
-			claimToDelete:     claim1,
-			expectedPodsAfter: map[types.UID]map[string]PodConfig{},
+			claimToDelete:        claim1,
+			expectedPodsAfter:    map[types.UID]map[string]PodConfig{},
+			expectedReturnedUIDs: []types.UID{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := tt.initialConfigs()
-			store.DeleteClaim(tt.claimToDelete)
+			gotUIDs := store.DeleteClaim(tt.claimToDelete)
+
+			if diff := cmp.Diff(tt.expectedReturnedUIDs, gotUIDs, cmpopts.SortSlices(func(a, b types.UID) bool { return a < b })); diff != "" {
+				t.Errorf("DeleteClaim() returned UIDs mismatch (-want +got):\n%s", diff)
+			}
 
 			if !reflect.DeepEqual(store.configs, tt.expectedPodsAfter) {
 				t.Errorf("configs mismatch after DeleteClaim.\nGot:    %+v\nWanted: %+v", store.configs, tt.expectedPodsAfter)
