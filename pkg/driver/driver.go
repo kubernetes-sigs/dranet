@@ -81,6 +81,14 @@ func WithInventory(db inventoryDB) Option {
 	}
 }
 
+// WithSkipIBInterfaceMove skips moving InfiniBand network interfaces
+// into the pod network namespace when enabled.
+func WithSkipIBInterfaceMove(skip bool) Option {
+	return func(o *NetworkDriver) {
+		o.skipIBInterfaceMove = skip
+	}
+}
+
 type NetworkDriver struct {
 	driverName string
 	nodeName   string
@@ -94,7 +102,9 @@ type NetworkDriver struct {
 
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
-	podConfigStore *PodConfigStore
+	// skipIBInterfaceMove skips moving InfiniBand network interfaces into the pod network namespace
+	skipIBInterfaceMove bool
+	podConfigStore      *PodConfigStore
 }
 
 type Option func(*NetworkDriver)

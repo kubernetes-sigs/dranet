@@ -156,6 +156,18 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 		ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 
 		klog.V(2).Infof("RunPodSandbox processing Network device: %s", ifName)
+
+		// Skip moving the network interface if flagged (e.g., InfiniBand interfaces)
+		if config.SkipNetdevMove {
+			klog.V(2).Infof("RunPodSandbox skipping moving InfiniBand interface %s into pod namespace", ifName)
+			resourceClaimStatusDevice.WithConditions(
+				metav1apply.Condition().
+					WithType("Ready").
+					WithReason("NetworkDeviceSkipped").
+					WithStatus(metav1.ConditionTrue).
+					WithLastTransitionTime(metav1.Now()),
+			)
+		} else {
 		// TODO config options to rename the device and pass parameters
 		// use https://github.com/opencontainers/runtime-spec/pull/1271
 		networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
@@ -226,6 +238,7 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 				WithReason("NetworkReady").
 				WithLastTransitionTime(metav1.Now()),
 		)
+		} // end of !SkipNetdevMove
 
 		// Move the RDMA device to the namespace if the host is in exclusive mode
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
@@ -310,8 +323,12 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		}
 	}
 	for deviceName, config := range podConfig {
-		if err := nsDetachNetdev(ns, config.NetworkInterfaceConfigInPod.Interface.Name, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
-			klog.Infof("fail to return network device %s : %v", deviceName, err)
+		if config.SkipNetdevMove {
+			klog.V(2).Infof("StopPodSandbox skipping detach of InfiniBand interface %s", config.NetworkInterfaceConfigInHost.Interface.Name)
+		} else {
+			if err := nsDetachNetdev(ns, config.NetworkInterfaceConfigInPod.Interface.Name, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
+				klog.Infof("fail to return network device %s : %v", deviceName, err)
+			}
 		}
 
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {

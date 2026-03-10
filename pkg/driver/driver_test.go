@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"testing"
 
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
@@ -70,4 +71,41 @@ func (m *fakeInventoryDB) GetPodNetNs(podKey string) string {
 
 func (m *fakeInventoryDB) GetDeviceConfig(deviceName string) (*apis.NetworkConfig, bool) {
 	return nil, false
+}
+
+func TestWithSkipIBInterfaceMove(t *testing.T) {
+	tests := []struct {
+		name     string
+		skip     bool
+		expected bool
+	}{
+		{
+			name:     "enabled",
+			skip:     true,
+			expected: true,
+		},
+		{
+			name:     "disabled",
+			skip:     false,
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nd := &NetworkDriver{}
+			opt := WithSkipIBInterfaceMove(tc.skip)
+			opt(nd)
+			if nd.skipIBInterfaceMove != tc.expected {
+				t.Errorf("skipIBInterfaceMove = %v, want %v", nd.skipIBInterfaceMove, tc.expected)
+			}
+		})
+	}
+}
+
+func TestWithSkipIBInterfaceMove_DefaultFalse(t *testing.T) {
+	nd := &NetworkDriver{}
+	if nd.skipIBInterfaceMove {
+		t.Error("skipIBInterfaceMove should be false by default")
+	}
 }

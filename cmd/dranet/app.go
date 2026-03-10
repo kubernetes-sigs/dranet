@@ -50,13 +50,14 @@ const (
 )
 
 var (
-	hostnameOverride string
-	kubeconfig       string
-	bindAddress      string
-	celExpression    string
-	minPollInterval  time.Duration
-	maxPollInterval  time.Duration
-	pollBurst        int
+	hostnameOverride    string
+	kubeconfig          string
+	bindAddress         string
+	celExpression       string
+	minPollInterval     time.Duration
+	maxPollInterval     time.Duration
+	pollBurst           int
+	skipIBInterfaceMove bool
 
 	ready atomic.Bool
 )
@@ -69,6 +70,7 @@ func init() {
 	flag.DurationVar(&minPollInterval, "inventory-min-poll-interval", 2*time.Second, "The minimum interval between two consecutive polls of the inventory.")
 	flag.DurationVar(&maxPollInterval, "inventory-max-poll-interval", 1*time.Minute, "The maximum interval between two consecutive polls of the inventory.")
 	flag.IntVar(&pollBurst, "inventory-poll-burst", 5, "The number of polls that can be run in a burst.")
+	flag.BoolVar(&skipIBInterfaceMove, "skip-ib-interface-move", false, "If true, skip moving InfiniBand network interfaces into the pod network namespace.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -164,6 +166,9 @@ func main() {
 		inventory.WithMaxPollInterval(maxPollInterval),
 	)
 	opts = append(opts, driver.WithInventory(db))
+	if skipIBInterfaceMove {
+		opts = append(opts, driver.WithSkipIBInterfaceMove(skipIBInterfaceMove))
+	}
 	dranet, err := driver.Start(ctx, driverName, clientset, nodeName, opts...)
 	if err != nil {
 		klog.Fatalf("driver failed to start: %v", err)

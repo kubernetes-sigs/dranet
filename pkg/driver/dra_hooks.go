@@ -235,6 +235,12 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 		podCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
 
+		// Skip moving InfiniBand interfaces into the pod namespace if the flag is enabled
+		if np.skipIBInterfaceMove && link.Attrs().EncapType == "infiniband" {
+			klog.V(2).Infof("Skipping moving InfiniBand interface %s into pod namespace", ifName)
+			podCfg.SkipNetdevMove = true
+		}
+
 		if podCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
 			// If the interface name was not explicitly overridden, use the same
 			// interface name within the pod's network namespace.
