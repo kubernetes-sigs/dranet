@@ -150,6 +150,12 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			continue
 		}
 		podUIDs = append(podUIDs, reserved.UID)
+
+		// Track pods with allocated devices so we can coordinate shutdown.
+		klog.V(3).Infof("Tracking pod %s for claim %s/%s", reserved.UID, claim.Namespace, claim.Name)
+		np.allocatedPodsMu.Lock()
+		np.allocatedPods[reserved.UID] = time.Time{} // Initialized with zero time
+		np.allocatedPodsMu.Unlock()
 	}
 	if len(podUIDs) == 0 {
 		klog.Infof("no pods allocated to claim %s/%s", claim.Namespace, claim.Name)
@@ -429,7 +435,16 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 }
 
 func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
-	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+	podUIDs := np.podConfigStore.DeleteClaim(claim.NamespacedName)
+
+	// Also remove from allocatedPods if it's there
+	np.allocatedPodsMu.Lock()
+	defer np.allocatedPodsMu.Unlock()
+	for _, uid := range podUIDs {
+		klog.V(3).Infof("Removing pod %s from allocatedPods because claim %s was unprepared", uid, claim.NamespacedName)
+		delete(np.allocatedPods, uid)
+	}
+
 	return nil
 }
 
