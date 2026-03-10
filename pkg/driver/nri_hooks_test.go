@@ -24,6 +24,8 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
 )
 
@@ -299,6 +301,97 @@ func TestStopPodSandboxMetrics(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStopPodSandbox_SkipNetdevMove(t *testing.T) {
+	np := &NetworkDriver{
+		podConfigStore: NewPodConfigStore(),
+		netdb:          newFakeInventoryDB(),
+	}
+
+	podUID := types.UID("test-pod-skip-ib")
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "test-pod",
+		Namespace: "test-ns",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{
+					Type: "network",
+					Path: "/var/run/netns/test",
+				},
+			},
+		},
+	}
+
+	// Config with SkipNetdevMove=true should not attempt nsDetachNetdev
+	configSkip := PodConfig{
+		Claim:          types.NamespacedName{Namespace: "ns", Name: "claim-ib"},
+		SkipNetdevMove: true,
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "ib0"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "ib0"},
+		},
+	}
+
+	np.podConfigStore.Set(podUID, "ib0", configSkip)
+
+	// This should succeed without error since SkipNetdevMove=true
+	// means nsDetachNetdev is not called (which would fail since
+	// the namespace and interface don't actually exist)
+	err := np.StopPodSandbox(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("StopPodSandbox failed unexpectedly: %v", err)
+	}
+}
+
+func TestRunPodSandbox_SkipNetdevMove(t *testing.T) {
+	np := &NetworkDriver{
+		podConfigStore: NewPodConfigStore(),
+		netdb:          newFakeInventoryDB(),
+		driverName:     "test.driver",
+		nodeName:       "test-node",
+		kubeClient:     fake.NewSimpleClientset(),
+	}
+
+	podUID := types.UID("test-pod-skip-ib-run")
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "test-pod",
+		Namespace: "test-ns",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{
+					Type: "network",
+					Path: "/var/run/netns/test",
+				},
+			},
+		},
+	}
+
+	// Config with SkipNetdevMove=true should not attempt nsAttachNetdev
+	configSkip := PodConfig{
+		Claim:          types.NamespacedName{Namespace: "ns", Name: "claim-ib"},
+		SkipNetdevMove: true,
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "ib0"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "ib0"},
+		},
+	}
+
+	np.podConfigStore.Set(podUID, "ib0", configSkip)
+
+	// This should succeed without error since SkipNetdevMove=true
+	// means nsAttachNetdev is not called (which would fail since
+	// the interface doesn't actually exist)
+	err := np.runPodSandbox(context.Background(), pod, map[string]PodConfig{"ib0": configSkip})
+	if err != nil {
+		t.Fatalf("runPodSandbox failed unexpectedly: %v", err)
 	}
 }
 

@@ -42,6 +42,11 @@ type PodConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig
+
+	// SkipNetdevMove indicates that the network interface should not be moved
+	// into the pod's network namespace. This is set when the interface is an
+	// InfiniBand interface and the skip-ib-interface-move flag is enabled.
+	SkipNetdevMove bool
 }
 
 // RDMAConfig contains parameters for setting up an RDMA device associated
