@@ -27,6 +27,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/azure"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/gce"
 )
 
@@ -39,6 +40,11 @@ func getInstanceProperties(ctx context.Context) cloudprovider.CloudInstance {
 		// https://cloud.google.com/compute/docs/metadata/predefined-metadata-keys
 		klog.Infof("running on GCE")
 		instance, err = gce.GetInstance(ctx)
+	} else if azure.OnAzure() {
+		// Get Azure instance metadata for placement group and VM size
+		// https://learn.microsoft.com/en-us/azure/virtual-machines/instance-metadata-service
+		klog.Infof("running on Azure")
+		instance, err = azure.GetInstance(ctx)
 	}
 	if err != nil {
 		klog.Infof("could not get instance properties: %v", err)
