@@ -385,6 +385,8 @@ func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 		vfs := int64(sriovNumVFs(ifName))
 		device.Attributes[apis.AttrSRIOVVfs] = resourceapi.DeviceAttribute{IntValue: &vfs}
 	}
+	isSriovVirtualFunction := isSriovVf(ifName, sysnetPath)
+	device.Attributes[apis.AttrIsSriovVf] = resourceapi.DeviceAttribute{BoolValue: &isSriovVirtualFunction}
 
 	if isVirtual(ifName, sysnetPath) {
 		device.Attributes[apis.AttrVirtual] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
