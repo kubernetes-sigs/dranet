@@ -20,17 +20,21 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"runtime"
 	"slices"
 	"syscall"
 
+	"sigs.k8s.io/dranet/internal/nlwrap"
 	"sigs.k8s.io/dranet/pkg/apis"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
-	"sigs.k8s.io/dranet/internal/nlwrap"
+	"k8s.io/component-helpers/node/util/sysctl"
+	"k8s.io/klog/v2"
 )
 
-func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []apis.RouteConfig) error {
+func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []apis.RouteConfig, vrfTable int) error {
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
 		return err
@@ -66,10 +70,17 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 	})
 
 	for _, route := range routeConfig {
+		table := route.Table
+		// If VRF is enabled (vrfTable > 0), all routes for this interface
+		// must go into the VRF table to be reachable via the VRF device.
+		if vrfTable > 0 {
+			table = vrfTable
+		}
+
 		r := netlink.Route{
 			LinkIndex: nsLink.Attrs().Index,
 			Scope:     netlink.Scope(route.Scope),
-			Table:     route.Table,
+			Table:     table,
 		}
 
 		_, dst, err := net.ParseCIDR(route.Destination)
@@ -174,4 +185,144 @@ func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) err
 		}
 	}
 	return errors.Join(errorList...)
+}
+
+// applyInterfaceForwarding enables IPv4 and IPv6 forwarding for a specific interface.
+// It uses the Kubernetes sysctl helper while locked into the pod's network namespace.
+func applyInterfaceForwarding(containerNsPath string, ifName string, enable bool) error {
+	if !enable {
+		return nil
+	}
+
+	origns, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("unexpected error trying to get namespace: %v", err)
+	}
+	defer origns.Close() // nolint:errcheck
+
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return fmt.Errorf("could not get network namespace from path %s: %w", containerNsPath, err)
+	}
+	defer containerNs.Close()
+
+	// Lock the OS thread and switch into the container's network namespace
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := netns.Set(containerNs); err != nil {
+		return fmt.Errorf("failed to join network namespace %s: %v", containerNsPath, err)
+	}
+	defer netns.Set(origns) // nolint:errcheck
+
+	// Initialize the Kubernetes sysctl interface
+	sysctlInterface := sysctl.New()
+	var errorList []error
+
+	// Enable IPv4 forwarding on the specific interface
+	v4Sysctl := fmt.Sprintf("net/ipv4/conf/%s/forwarding", ifName)
+	if err := sysctlInterface.SetSysctl(v4Sysctl, 1); err != nil {
+		errorList = append(errorList, fmt.Errorf("failed to set %s: %w", v4Sysctl, err))
+	}
+
+	// Enable IPv6 forwarding (gracefully handling disabled IPv6 stacks)
+	v6Sysctl := fmt.Sprintf("net/ipv6/conf/%s/forwarding", ifName)
+	if err := sysctlInterface.SetSysctl(v6Sysctl, 1); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// If the file doesn't exist, IPv6 is likely disabled on the node or namespace.
+			// We log this at V(4) so it doesn't spam normal logs, and we don't fail the setup.
+			klog.V(4).Infof("IPv6 sysctl %s not found; assuming IPv6 is disabled and skipping", v6Sysctl)
+		} else {
+			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", v6Sysctl, err))
+		}
+	}
+	return errors.Join(errorList...)
+}
+
+func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFConfig) (int, error) {
+	if vrfConfig == nil {
+		return 0, fmt.Errorf("vrf config is nil")
+	}
+	if vrfConfig.Name == "" {
+		return 0, fmt.Errorf("vrf name not specified")
+	}
+
+	if vrfConfig.Table == nil {
+		return 0, fmt.Errorf("vrf table not specified")
+	}
+
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return 0, err
+	}
+	defer containerNs.Close()
+
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		return 0, fmt.Errorf("can not get netlink handle: %v", err)
+	}
+	defer nhNs.Close()
+
+	nsLink, err := nhNs.LinkByName(ifName)
+	if err != nil {
+		return 0, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPath, err)
+	}
+
+	vrfName := vrfConfig.Name
+	vrfTable := uint32(*vrfConfig.Table)
+
+	vrfLink, err := nhNs.LinkByName(vrfName)
+	if err != nil {
+		vrfReq := &netlink.Vrf{
+			LinkAttrs: netlink.LinkAttrs{Name: vrfName},
+			Table:     vrfTable,
+		}
+		if err := nhNs.LinkAdd(vrfReq); err != nil {
+			return 0, fmt.Errorf("failed to add vrf %s: %w", vrfName, err)
+		}
+		vrfLink, err = nhNs.LinkByName(vrfName)
+		if err != nil {
+			return 0, fmt.Errorf("failed to find vrf %s after creation: %w", vrfName, err)
+		}
+	}
+
+	if err := nhNs.LinkSetUp(vrfLink); err != nil {
+		return 0, fmt.Errorf("failed to set up vrf %s: %w", vrfName, err)
+	}
+
+	if err := nhNs.LinkSetMaster(nsLink, vrfLink); err != nil {
+		return 0, fmt.Errorf("failed to enslave %s to vrf %s: %w", ifName, vrfName, err)
+	}
+
+	if err := enableVRFSysctls(int(containerNs)); err != nil {
+		return 0, fmt.Errorf("failed to enable vrf sysctls: %w", err)
+	}
+
+	return int(vrfTable), nil
+}
+
+func enableVRFSysctls(containerNsFd int) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origns, err := netns.Get()
+	if err != nil {
+		return err
+	}
+	defer origns.Close() //nolint:errcheck
+
+	if err := netns.Set(netns.NsHandle(containerNsFd)); err != nil {
+		return err
+	}
+	defer netns.Set(origns) //nolint:errcheck
+
+	sysctlInterface := sysctl.New()
+	if err := sysctlInterface.SetSysctl("net/ipv4/tcp_l3mdev_accept", 1); err != nil {
+		return fmt.Errorf("failed to set tcp_l3mdev_accept: %w", err)
+	}
+
+	if err := sysctlInterface.SetSysctl("net/ipv4/udp_l3mdev_accept", 1); err != nil {
+		return fmt.Errorf("failed to set udp_l3mdev_accept: %w", err)
+	}
+
+	return nil
 }

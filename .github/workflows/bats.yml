@@ -3,11 +3,11 @@ name: bats
 on:
   push:
     branches:
-      - 'main'
+      - "main"
     tags:
-      - 'v*'
+      - "v*"
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -25,6 +25,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: system-level-dependencies
+        run: |
+          sudo apt update
+          sudo apt -y install linux-modules-extra-$(uname -r)
+          sudo modprobe -v vrf
+
       - name: Setup Bats and bats libs
         id: setup-bats
         uses: bats-core/bats-action@77d6fb60505b4d0d1d73e48bd035b55074bbfb43 # 4.0.0
@@ -34,8 +40,8 @@ jobs:
       - name: Bats tests
         shell: bash
         env:
-         BATS_LIB_PATH: ${{ steps.setup-bats.outputs.lib-path }}
-         TERM: xterm
+          BATS_LIB_PATH: ${{ steps.setup-bats.outputs.lib-path }}
+          TERM: xterm
         run: bats -o _artifacts --print-output-on-failure tests/
 
       - name: Upload logs
@@ -44,4 +50,3 @@ jobs:
         with:
           name: kind-logs-${{ env.JOB_NAME }}-${{ github.run_id }}
           path: ./_artifacts
- 

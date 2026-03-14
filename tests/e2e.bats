@@ -11,6 +11,7 @@ teardown() {
   fi
   cleanup_k8s_resources
   cleanup_dummy_interfaces
+  cleanup_veth_interfaces
   cleanup_bpf_programs
   # The driver is rate limited to updates with interval of atleast 5 seconds. So
   # we need to sleep for an equivalent amount of time to ensure state from a
@@ -61,6 +62,17 @@ cleanup_dummy_interfaces() {
       for dev in $(ip -br link show type dummy | awk "{print \$1}"); do
         ip link delete "$dev" || echo "Failed to delete $dev"
       done
+    '
+  done
+}
+
+cleanup_veth_interfaces() {
+  for node in "$CLUSTER_NAME"-worker "$CLUSTER_NAME"-worker2; do
+    docker exec "$node" bash -c '
+      ip link delete vrf-test-pod-1 || true
+      ip link delete vrf-test-pod-2 || true
+      ip link delete pbr-test-pod-1 || true
+      ip link delete pbr-test-pod-2 || true
     '
   done
 }
@@ -495,3 +507,69 @@ EOF
   refute_output --partial "fd36::3:0:e:0:0/96 dev dummy-ipv6 metric 1024 pref medium"
 }
 
+
+@test "validate pbr configuration" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  
+  # Create veth pairs for Pod1 <-> Router and Pod2 <-> Router
+  # pbr-test-pod-1 connects to pbr-test-router-1 (Router Interface 1)
+  docker exec "$NODE_NAME" bash -c "ip link add pbr-test-pod-1 type veth peer name pbr-rtr-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-test-pod-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-rtr-1"
+
+  # pbr-test-pod-2 connects to pbr-test-router-2 (Router Interface 2)
+  docker exec "$NODE_NAME" bash -c "ip link add pbr-test-pod-2 type veth peer name pbr-rtr-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-test-pod-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev pbr-rtr-2"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_pbr.yaml
+  
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-pbr-1
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-pbr-router
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-pbr-2
+
+  POD_1=$(kubectl get pods -l app=pod-pbr-1 -o name)
+  
+  # Verify PBR routing: Ping from Pod 1 (192.168.100.10) to Pod 2 (192.168.200.10) via Router
+  # Traffic MUST use Table 100 to reach the gateway (192.168.100.2 - Router).
+  # Router then forwards to 192.168.200.2 which is its own interface on the other side?
+  # Interface 1: 192.168.100.2/24 (connected to pod-pbr-1)
+  # Interface 2: 192.168.200.2/24 (connected to pod-pbr-2)
+  # Pod-pbr-1 routes 192.168.200.0/24 via 192.168.100.2.
+  # Pod-pbr-2 has IP 192.168.200.10.
+  
+  run kubectl exec -it $POD_1 -- ping -c 1 192.168.200.10
+  assert_success
+}
+
+@test "validate vrf routing" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  
+  # Create veth pairs for Pod1 <-> Router and Pod2 <-> Router
+  # vrf-test-pod-1 connects to vrf-test-router-1 (Router Interface 1)
+  docker exec "$NODE_NAME" bash -c "ip link add vrf-test-pod-1 type veth peer name vrf-rtr-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-test-pod-1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-rtr-1"
+
+  # vrf-test-pod-2 connects to vrf-test-router-2 (Router Interface 2)
+  docker exec "$NODE_NAME" bash -c "ip link add vrf-test-pod-2 type veth peer name vrf-rtr-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-test-pod-2"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev vrf-rtr-2"
+
+  # Apply manifests for three pods
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_vrf.yaml
+
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-vrf-1
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-vrf-router
+  kubectl wait --timeout=60s --for=condition=ready pods -l app=pod-vrf-2
+
+  POD_1=$(kubectl get pods -l app=pod-vrf-1 -o name)
+  
+  # Verify ping from Pod 1 to Pod 2 via the Router.
+  # Traffic flow: Pod1(eth1) -> Router(eth1) -> Router(eth2) -> Pod2(eth1)
+  # We use -I eth1 to force usage of the VRF domain/interface.
+  run kubectl exec -it $POD_1 -- ping -I eth1 -c 1 10.10.20.1
+  assert_success
+}

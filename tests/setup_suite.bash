@@ -41,7 +41,7 @@ function setup_suite {
     docker exec "$node" mount --make-shared /sys/fs/bpf
   done
 
-  _install=$(sed s#"$IMAGE_NAME".*#"$IMAGE_NAME":test# < "$BATS_TEST_DIRNAME"/../install.yaml)
+  _install=$(sed -e s#"$IMAGE_NAME".*#"$IMAGE_NAME":test# -e 's/--v=4/--v=4\n        - --filter=/' < "$BATS_TEST_DIRNAME"/../install.yaml)
   printf '%s' "${_install}" | kubectl apply -f -
   kubectl wait --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet
 
