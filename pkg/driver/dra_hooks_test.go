@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	resourcev1 "k8s.io/api/resource/v1"
@@ -84,7 +85,9 @@ func TestPublishResourcesPrometheusMetrics(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			publishedDevicesTotal.Reset()
-			np := &NetworkDriver{}
+			np := &NetworkDriver{
+				allocatedPods: make(map[types.UID]time.Time),
+			}
 			np.publishResourcesPrometheusMetrics(tc.devices)
 
 			if got := testutil.ToFloat64(publishedDevicesTotal.WithLabelValues("rdma")); got != tc.expectedRdma {
@@ -142,8 +145,9 @@ func TestPrepareResourceClaimsMetrics(t *testing.T) {
 		draPluginRequestsLatencySeconds.Reset()
 
 		np := &NetworkDriver{
-			netdb:      newFakeInventoryDB(),
-			driverName: "test.driver",
+			netdb:       newFakeInventoryDB(),
+			driverName:  "test.driver",
+			allocatedPods: make(map[types.UID]time.Time),
 		}
 
 		claims := []*resourcev1.ResourceClaim{
@@ -194,6 +198,7 @@ func TestUnprepareResourceClaimsMetrics(t *testing.T) {
 
 		np := &NetworkDriver{
 			podConfigStore: NewPodConfigStore(),
+			allocatedPods:    make(map[types.UID]time.Time),
 		}
 		claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
 		np.podConfigStore.Set("pod-uid-1", "device-a", PodConfig{Claim: claimName})
@@ -248,9 +253,10 @@ func TestPublishResourcesMetrics(t *testing.T) {
 	fakeNetDB := newFakeInventoryDB()
 
 	np := &NetworkDriver{
-		draPlugin: fakeDraPlugin,
-		netdb:     fakeNetDB,
-		nodeName:  "test-node",
+		draPlugin:   fakeDraPlugin,
+		netdb:       fakeNetDB,
+		nodeName:    "test-node",
+		allocatedPods: make(map[types.UID]time.Time),
 	}
 
 	go np.PublishResources(ctx)

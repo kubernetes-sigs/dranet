@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -85,6 +86,7 @@ func TestCreateContainerMetrics(t *testing.T) {
 			np := &NetworkDriver{
 				podConfigStore: tc.podConfigStore,
 				netdb:          inventory.New(),
+				allocatedPods:    make(map[types.UID]time.Time),
 			}
 
 			podUID := types.UID("test-pod")
@@ -184,6 +186,7 @@ func TestRunPodSandboxMetrics(t *testing.T) {
 			np := &NetworkDriver{
 				podConfigStore: tc.podConfigStore,
 				netdb:          inventory.New(),
+				allocatedPods:    make(map[types.UID]time.Time),
 			}
 
 			// For the failure case, a pod config must exist.
@@ -255,6 +258,7 @@ func TestStopPodSandboxMetrics(t *testing.T) {
 			np := &NetworkDriver{
 				podConfigStore: tc.podConfigStore,
 				netdb:          inventory.New(),
+				allocatedPods:    make(map[types.UID]time.Time),
 			}
 			podUID := types.UID("test-pod")
 			pod := &api.PodSandbox{
@@ -322,6 +326,7 @@ func TestRemovePodSandboxMetrics(t *testing.T) {
 			np := &NetworkDriver{
 				podConfigStore: tc.podConfigStore,
 				netdb:          inventory.New(),
+				allocatedPods:    make(map[types.UID]time.Time),
 			}
 			podUID := types.UID("test-pod")
 			pod := &api.PodSandbox{

@@ -168,7 +168,7 @@ func main() {
 	if err != nil {
 		klog.Fatalf("driver failed to start: %v", err)
 	}
-	defer dranet.Stop() // Gracefully shutdown at the end.
+	defer dranet.Stop(cancel)
 
 	ready.Store(true)
 	klog.Info("driver started")
@@ -176,7 +176,6 @@ func main() {
 	select {
 	case sig := <-signalCh:
 		klog.Infof("Received shutdown signal: %q. Initiating graceful shutdown...", sig)
-		cancel()
 	case <-ctx.Done():
 		klog.Info("Context cancelled. Initiating graceful shutdown...")
 	}

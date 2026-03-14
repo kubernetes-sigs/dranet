@@ -70,6 +70,17 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 	if !ok {
 		return nil, nil, nil
 	}
+
+	defer func() {
+		// Update container creation activity timestamp.
+		np.allocatedPodsMu.Lock()
+		defer np.allocatedPodsMu.Unlock()
+		if _, ok := np.allocatedPods[types.UID(pod.GetUid())]; ok {
+			klog.V(3).Infof("Pod %s hit CreateContainer for container %s, updating activity timestamp", pod.Uid, ctr.Name)
+			np.allocatedPods[types.UID(pod.GetUid())] = time.Now()
+		}
+	}()
+
 	adjust, update, err := np.createContainer(ctx, pod, ctr, podConfig)
 	if err != nil {
 		status = statusFailed

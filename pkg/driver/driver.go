@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/cel-go/cel"
@@ -31,12 +32,14 @@ import (
 	"sigs.k8s.io/dranet/internal/nlwrap"
 
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+	"k8s.io/utils/clock"
 )
 
 const (
@@ -97,6 +100,21 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+
+	// allocatedPods tracks all pods for which this driver has successfully
+	// prepared resource claims. It maps the Pod's UID to its most recent NRI
+	// activity timestamp.
+	//
+	// An entry is added when a Pod's ResourceClaim is prepared, updated
+	// when a container is created for that Pod, and removed only when the
+	// ResourceClaim is unprepared (typically when the Pod is deleted).
+	//
+	// This map is used during Stop() to ensure that the driver doesn't shut
+	// down while pods are still being initialized in the container runtime.
+	allocatedPodsMu sync.Mutex
+	allocatedPods   map[types.UID]time.Time
+
+	clock clock.WithTicker // Injectable clock for testing
 }
 
 type Option func(*NetworkDriver)
@@ -118,6 +136,8 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		kubeClient:     kubeClient,
 		rdmaSharedMode: rdmaNetnsMode == apis.RdmaNetnsModeShared,
 		podConfigStore: NewPodConfigStore(),
+		allocatedPods:  make(map[types.UID]time.Time),
+		clock:          clock.RealClock{},
 	}
 
 	for _, o := range opts {
@@ -209,9 +229,84 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	return plugin, nil
 }
 
-func (np *NetworkDriver) Stop() {
-	// Stop NRI Plugin (it's expected that it returns when fully stopped).
-	np.nriPlugin.Stop()
-	// Stop DRA Plugin (returns only after it has fully stopped).
+// Stop handles the graceful termination of the Network Driver by coordinating the
+// shutdown of its DRA and NRI plugin components.
+//
+// The shutdown follows a sequence to prevent workload pods from starting
+// without their required devices during driver restarts or upgrades. It first
+// shuts down the DRA plugin to stop accepting new resource claims. It then
+// enters a wait-loop to ensure that all pods currently in the process of being
+// prepared have a chance to hit their NRI hooks and finish initialization. The
+// driver waits indefinitely for this activity, deferring the final termination
+// timeout to the Kubernetes terminationGracePeriodSeconds (defaulting to 30s)
+// configured for the pod. Once the wait criteria are met, it stops the NRI
+// plugin stub and exits.
+func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
+	klog.Info("Stopping driver...")
+
+	// Halt new PrepareResourceClaims requests to stabilize the set of pods
+	// requiring NRI processing.
 	np.draPlugin.Stop()
+
+	// Wait for prepared pods to finish NRI initialization.
+	gracePeriod := 10 * time.Second
+	pollInterval := 5 * time.Second
+	ticker := np.clock.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		done := func() bool {
+			np.allocatedPodsMu.Lock()
+			defer np.allocatedPodsMu.Unlock()
+
+			pendingCount := len(np.allocatedPods)
+
+			// waitingForActivity tracks pods that have been prepared but haven't
+			// triggered any NRI hook activity yet (e.g. because images are still
+			// being pulled).
+			waitingForActivity := 0
+
+			// waitingForGrace tracks pods that have recently triggered an NRI hook.
+			// We wait for a grace period after each hook to ensure subsequent
+			// containers in the same pod (like sidecars or the main app container)
+			// also have a chance to be processed.
+			waitingForGrace := 0
+
+			for _, lastActivity := range np.allocatedPods {
+				if lastActivity.IsZero() {
+					waitingForActivity++
+				} else if np.clock.Since(lastActivity) < gracePeriod {
+					waitingForGrace++
+				}
+			}
+
+			if pendingCount == 0 {
+				klog.Info("No pods with allocated devices found on this node. Proceeding with shutdown.")
+				return true
+			}
+			if waitingForActivity == 0 && waitingForGrace == 0 {
+				klog.Info("All prepared pods have hit NRI hooks and passed the grace period. Proceeding with shutdown.")
+				return true
+			}
+
+			klog.Infof("Waiting for %d prepared pods to finish NRI initialization: %d haven't hit NRI yet, %d still in grace period...",
+				pendingCount, waitingForActivity, waitingForGrace)
+			return false
+		}()
+
+		if done {
+			break
+		}
+
+		<-ticker.C()
+	}
+
+	// Now that we've finished waiting for the pods, cancel the top level
+	// context. That should also be sufficient to also stop nriPlugin,
+	// but we can still explicitly try closing it.
+	ctxCancel()
+
+	// Stop NRI Plugin.
+	np.nriPlugin.Stop()
+	klog.Info("Driver stopped.")
 }

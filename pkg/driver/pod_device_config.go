@@ -131,8 +131,9 @@ func (s *PodConfigStore) GetPodConfigs(podUID types.UID) (map[string]PodConfig, 
 	return configsCopy, true
 }
 
-// DeleteClaim removes all configurations associated with a given claim.
-func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) {
+// DeleteClaim removes all configurations associated with a given claim and
+// returns the list of Pod UIDs that were associated with it.
+func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	podsToDelete := []types.UID{}
@@ -148,4 +149,5 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) {
 	for _, uid := range podsToDelete {
 		delete(s.configs, uid)
 	}
+	return podsToDelete
 }
