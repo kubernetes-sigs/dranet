@@ -275,6 +275,20 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 	// The interface name inside the container's namespace.
 	ifNameInNs := networkData.InterfaceName
 
+	// If EnableIPv6 is set, enable IPv6 per-interface and re-apply any IPv6 addresses
+	// that were skipped in nsAttachNetdev because IPv6 was globally disabled in the pod
+	// namespace. This is needed on platforms such as OKE where RDMA NICs require a
+	// globally-routable IPv6 address to populate a routable RoCEv2 GID.
+	if config.NetworkInterfaceConfigInPod.Interface.EnableIPv6 != nil &&
+		*config.NetworkInterfaceConfigInPod.Interface.EnableIPv6 {
+		if err := enableIPv6ForInterface(ns, ifNameInNs); err != nil {
+			return fmt.Errorf("failed to enable IPv6 for %s in namespace %s: %w", ifNameInNs, ns, err)
+		}
+		if err := reapplyIPv6Addresses(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Interface.Addresses); err != nil {
+			return fmt.Errorf("failed to re-apply IPv6 addresses for %s in namespace %s: %w", ifNameInNs, ns, err)
+		}
+	}
+
 	// Apply Ethtool configurations
 	if config.NetworkInterfaceConfigInPod.Ethtool != nil {
 		err = applyEthtoolConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Ethtool)

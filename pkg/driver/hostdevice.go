@@ -150,6 +150,13 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		}
 		err = nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}})
 		if err != nil {
+			// IPv6 may be disabled in the pod namespace (single-stack IPv4 clusters set
+			// net.ipv6.conf.all.disable_ipv6=1). Soft-fail so that the caller can enable
+			// IPv6 per-interface and re-apply the address after moving the device.
+			if ip.To4() == nil && (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM)) {
+				klog.V(4).Infof("skipping IPv6 address %s on %s in namespace %s: IPv6 is disabled (will retry after per-interface enable)", address, nsLink.Attrs().Name, containerNsPAth)
+				continue
+			}
 			return nil, fmt.Errorf("failed to set up address %s on namespace %s: %w", address, containerNsPAth, err)
 		}
 		networkData.IPs = append(networkData.IPs, address)

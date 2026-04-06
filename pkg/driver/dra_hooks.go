@@ -563,9 +563,16 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 				klog.V(5).Infof("Skipping IPv6 link-local route %s for interface %s", route.String(), ifName)
 				continue
 			}
-			// Discard IPv6 proto=kernel routes
+			// Discard IPv6 proto=kernel routes (auto-generated connected routes).
 			if route.Protocol == unix.RTPROT_KERNEL {
 				klog.V(5).Infof("Skipping IPv6 proto=kernel route %s for interface %s", route.String(), ifName)
+				continue
+			}
+			// Discard IPv6 RA-assigned routes. These are injected by the cloud
+			// provider's RA daemon as an infrastructure side-effect (e.g. OCI on
+			// RDMA NICs) and must not be propagated into pod namespaces.
+			if route.Protocol == unix.RTPROT_RA {
+				klog.V(5).Infof("Skipping IPv6 RA route %s for interface %s", route.String(), ifName)
 				continue
 			}
 		}
