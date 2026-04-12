@@ -27,6 +27,18 @@ type DeviceIdentifiers struct {
 	MAC        string
 	PCIAddress string
 	Name       string
+	RDMA       bool
+}
+
+// NonUplinkChecker is an optional extension to CloudInstance. A provider may
+// implement this to exempt specific device classes from the default-gateway
+// uplink filter, even when those interfaces carry a default route. This is
+// needed on platforms where infrastructure daemons (e.g. RA) inject default
+// routes onto workload RDMA NICs as a side-effect of their setup.
+type NonUplinkChecker interface {
+	// IsNonUplink returns true if the device should be included in the
+	// ResourceSlice regardless of any default gateway route on that interface.
+	IsNonUplink(id DeviceIdentifiers) bool
 }
 
 // CloudInstance defines the generic interface for all cloud providers.

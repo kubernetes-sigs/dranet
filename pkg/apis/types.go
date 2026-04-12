@@ -86,6 +86,14 @@ type InterfaceConfig struct {
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.
 	VRF *VRFConfig `json:"vrf,omitempty"`
+
+	// EnableIPv6, if true, enables IPv6 on this specific interface even when IPv6 is
+	// globally disabled in the pod's network namespace (e.g. single-stack IPv4 clusters
+	// where the container runtime sets net.ipv6.conf.all.disable_ipv6=1). A per-interface
+	// sysctl override (net.ipv6.conf.<ifname>.disable_ipv6=0) is applied after the device
+	// is moved into the pod namespace. This is required on platforms such as OKE that need
+	// a globally-routable IPv6 address on RDMA interfaces to populate RoCEv2 GIDs.
+	EnableIPv6 *bool `json:"enableIPv6,omitempty"`
 }
 
 // VRFConfig represents the configuration for a Virtual Routing and Forwarding domain.

@@ -229,10 +229,28 @@ func (db *DB) scan() []resourceapi.Device {
 	devices = db.addCloudAttributes(devices)
 
 	// Remove default interface.
+	checker, hasChecker := db.instance.(cloudprovider.NonUplinkChecker)
 	filteredDevices := []resourceapi.Device{}
 	for _, device := range devices {
 		ifName := device.Attributes[apis.AttrInterfaceName].StringValue
 		if ifName != nil && db.gwInterfaces.Has(string(*ifName)) {
+			if hasChecker {
+				id := cloudprovider.DeviceIdentifiers{Name: device.Name}
+				if macAttr, ok := device.Attributes[apis.AttrMac]; ok && macAttr.StringValue != nil {
+					id.MAC = *macAttr.StringValue
+				}
+				if pciAttr, ok := device.Attributes[apis.AttrPCIAddress]; ok && pciAttr.StringValue != nil {
+					id.PCIAddress = *pciAttr.StringValue
+				}
+				if rdmaAttr, ok := device.Attributes[apis.AttrRDMA]; ok && rdmaAttr.BoolValue != nil {
+					id.RDMA = *rdmaAttr.BoolValue
+				}
+				if checker.IsNonUplink(id) {
+					klog.V(4).Infof("Interface %s has a default gateway route but is classified as a non-uplink by the cloud provider; including in discovery", *ifName)
+					filteredDevices = append(filteredDevices, device)
+					continue
+				}
+			}
 			klog.V(4).Infof("Ignoring interface %s from discovery since it is an uplink interface", *ifName)
 			continue
 		}
@@ -498,6 +516,9 @@ func (db *DB) updateDeviceStore(devices []resourceapi.Device) {
 			}
 			if pciAttr, ok := device.Attributes[apis.AttrPCIAddress]; ok && pciAttr.StringValue != nil {
 				id.PCIAddress = *pciAttr.StringValue
+			}
+			if rdmaAttr, ok := device.Attributes[apis.AttrRDMA]; ok && rdmaAttr.BoolValue != nil {
+				id.RDMA = *rdmaAttr.BoolValue
 			}
 
 			if conf := db.instance.GetDeviceConfig(id); conf != nil {

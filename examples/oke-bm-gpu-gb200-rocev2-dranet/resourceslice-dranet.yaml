@@ -1,0 +1,341 @@
+# Live ResourceSlice from node 10.140.65.248 (BM.GPU.GB200-v3.4)
+# Captured from a running cluster — use as reference for CEL selector values.
+# Only the 8 physical RDMA NICs (ConnectX-8) are shown; the node also exposes
+# management NICs (pci-0007-01-00-0 / eth0, pci-0017-01-00-0 / eth1) and
+# virtual pod-networking interfaces (eth0v*, net-mv2*) in the same slice.
+#
+# NUMA mapping (inferred from PCI domain):
+#   NUMA 0: rdma0 (0000:03:00.0), rdma1 (0000:03:00.1), rdma2 (0002:03:00.0), rdma3 (0002:03:00.1)
+#   NUMA 1: rdma4 (0010:03:00.0), rdma5 (0010:03:00.1), rdma6 (0012:03:00.0), rdma7 (0012:03:00.1)
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+metadata:
+  name: 10.140.65.248-dra.net-jb4n2
+spec:
+  driver: dra.net
+  nodeName: 10.140.65.248
+  pool:
+    generation: 1
+    name: 10.140.65.248
+    resourceSliceCount: 1
+  devices:
+  - name: pci-0000-03-00-0
+    attributes:
+      dra.net/ifName:
+        string: rdma0
+      dra.net/mac:
+        string: 60:5e:65:14:0f:10
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 0
+      dra.net/pciAddress:
+        string: "0000:03:00.0"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+  - name: pci-0000-03-00-1
+    attributes:
+      dra.net/ifName:
+        string: rdma1
+      dra.net/mac:
+        string: 60:5e:65:14:0f:11
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 0
+      dra.net/pciAddress:
+        string: "0000:03:00.1"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+  - name: pci-0002-03-00-0
+    attributes:
+      dra.net/ifName:
+        string: rdma2
+      dra.net/mac:
+        string: 60:5e:65:14:0f:40
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 0
+      dra.net/pciAddress:
+        string: "0002:03:00.0"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0002:00
+  - name: pci-0002-03-00-1
+    attributes:
+      dra.net/ifName:
+        string: rdma3
+      dra.net/mac:
+        string: 60:5e:65:14:0f:41
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 0
+      dra.net/pciAddress:
+        string: "0002:03:00.1"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0002:00
+  - name: pci-0010-03-00-0
+    attributes:
+      dra.net/ifName:
+        string: rdma4
+      dra.net/mac:
+        string: 60:5e:65:20:28:84
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 1
+      dra.net/pciAddress:
+        string: "0010:03:00.0"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0010:00
+  - name: pci-0010-03-00-1
+    attributes:
+      dra.net/ifName:
+        string: rdma5
+      dra.net/mac:
+        string: 60:5e:65:20:28:85
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 1
+      dra.net/pciAddress:
+        string: "0010:03:00.1"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0010:00
+  - name: pci-0012-03-00-0
+    attributes:
+      dra.net/ifName:
+        string: rdma6
+      dra.net/mac:
+        string: 60:5e:65:20:28:b4
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 1
+      dra.net/pciAddress:
+        string: "0012:03:00.0"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0012:00
+  - name: pci-0012-03-00-1
+    attributes:
+      dra.net/ifName:
+        string: rdma7
+      dra.net/mac:
+        string: 60:5e:65:20:28:b5
+      dra.net/mtu:
+        int: 9000
+      dra.net/numaNode:
+        int: 1
+      dra.net/pciAddress:
+        string: "0012:03:00.1"
+      dra.net/pciDevice:
+        string: CX8 Family [ConnectX-8]
+      dra.net/pciVendor:
+        string: Mellanox Technologies
+      dra.net/rdma:
+        bool: true
+      dra.net/sriov:
+        bool: true
+      dra.net/sriovVfs:
+        int: 0
+      dra.net/state:
+        string: up
+      dra.net/type:
+        string: device
+      dra.net/virtual:
+        bool: false
+      oke.dra.net/gpuMemoryFabricId:
+        string: redacted
+      oke.dra.net/hpcIslandId:
+        string: redacted
+      oke.dra.net/localBlockId:
+        string: redacted
+      oke.dra.net/networkBlockId:
+        string: redacted
+      oke.dra.net/rackId:
+        string: redacted
+      resource.kubernetes.io/pcieRoot:
+        string: pci0012:00

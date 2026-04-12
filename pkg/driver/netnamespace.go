@@ -94,6 +94,13 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 			r.Src = net.ParseIP(route.Source)
 		}
 		if err := nhNs.RouteAdd(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
+			// Soft-fail EACCES/EPERM for IPv6 routes: these occur when IPv6 is disabled
+			// in the pod namespace (single-stack IPv4 clusters). The caller is responsible
+			// for enabling IPv6 per-interface and re-applying routes if needed.
+			if dst != nil && dst.IP.To4() == nil && (errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)) {
+				klog.V(4).Infof("skipping IPv6 route %s for interface %s on namespace %s: IPv6 is disabled", r.String(), ifName, containerNsPAth)
+				continue
+			}
 			errorList = append(errorList, fmt.Errorf("fail to add route %s for interface %s on namespace %s: %w", r.String(), ifName, containerNsPAth, err))
 		}
 
@@ -298,6 +305,77 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 	}
 
 	return int(vrfTable), nil
+}
+
+// enableIPv6ForInterface sets net.ipv6.conf.<ifname>.disable_ipv6=0 inside the
+// pod network namespace, enabling IPv6 on that specific interface even when the
+// pod-level net.ipv6.conf.all.disable_ipv6=1 is set by the container runtime.
+// This is needed for RDMA NICs on platforms such as OKE that require a globally-
+// routable IPv6 address to populate a routable RoCEv2 GID.
+func enableIPv6ForInterface(containerNsPath, ifName string) error {
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return fmt.Errorf("could not get network namespace from path %s: %w", containerNsPath, err)
+	}
+	defer containerNs.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origNs, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("failed to get current network namespace: %w", err)
+	}
+	defer origNs.Close() //nolint:errcheck
+
+	if err := netns.Set(containerNs); err != nil {
+		return fmt.Errorf("failed to enter namespace %s: %w", containerNsPath, err)
+	}
+	defer netns.Set(origNs) //nolint:errcheck
+
+	sysctlInterface := sysctl.New()
+	sysctlKey := fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", ifName)
+	if err := sysctlInterface.SetSysctl(sysctlKey, 0); err != nil {
+		return fmt.Errorf("failed to set %s: %w", sysctlKey, err)
+	}
+	return nil
+}
+
+// reapplyIPv6Addresses adds any IPv6 addresses from the list to the named interface
+// inside the pod namespace. Used after enableIPv6ForInterface to apply addresses
+// that were skipped by nsAttachNetdev when IPv6 was still disabled.
+func reapplyIPv6Addresses(containerNsPath, ifName string, addresses []string) error {
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return fmt.Errorf("could not get network namespace from path %s: %w", containerNsPath, err)
+	}
+	defer containerNs.Close()
+
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		return fmt.Errorf("could not get netlink handle: %w", err)
+	}
+	defer nhNs.Close()
+
+	nsLink, err := nhNs.LinkByName(ifName)
+	if err != nil {
+		return fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPath, err)
+	}
+
+	var errorList []error
+	for _, address := range addresses {
+		ip, ipnet, err := net.ParseCIDR(address)
+		if err != nil {
+			continue
+		}
+		if ip.To4() != nil {
+			continue // only re-apply IPv6 addresses
+		}
+		if err := nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}); err != nil && !errors.Is(err, syscall.EEXIST) {
+			errorList = append(errorList, fmt.Errorf("failed to add IPv6 address %s on %s in namespace %s: %w", address, ifName, containerNsPath, err))
+		}
+	}
+	return errors.Join(errorList...)
 }
 
 func enableVRFSysctls(containerNsFd int) error {
