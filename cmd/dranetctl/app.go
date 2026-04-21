@@ -51,7 +51,17 @@ func main() {
 	klog.InitFlags(nil)
 	pflag.CommandLine.AddGoFlag(flag.CommandLine.Lookup("v"))
 	pflag.CommandLine.AddGoFlag(flag.CommandLine.Lookup("logtostderr"))
+	pflag.CommandLine.AddGoFlag(flag.CommandLine.Lookup("legacy_stderr_threshold_behavior"))
+	pflag.CommandLine.AddGoFlag(flag.CommandLine.Lookup("stderrthreshold"))
 	err := pflag.CommandLine.Set("logtostderr", "true")
+	if err != nil {
+		klog.Fatal(err)
+	}
+	err = pflag.CommandLine.Set("legacy_stderr_threshold_behavior", "false")
+	if err != nil {
+		klog.Fatal(err)
+	}
+	err = pflag.CommandLine.Set("stderrthreshold", "INFO")
 	if err != nil {
 		klog.Fatal(err)
 	}
