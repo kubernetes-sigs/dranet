@@ -33,12 +33,15 @@ This triggers the Prow postsubmit job [post-dranet-image](https://github.com/kub
 Use the [release-notes tool](https://github.com/kubernetes/release/blob/master/cmd/release-notes/README.md) to generate release notes from PR descriptions since the previous tag:
 
 ```bash
+export GITHUB_TOKEN=$(gh auth token)
 release-notes \
-  --github-org kubernetes-sigs \
-  --github-repo dranet \
+  --org kubernetes-sigs \
+  --repo dranet \
   --branch main \
-  --start-rev v1.0.0 \
-  --end-rev v1.1.0 \
+  --start-rev <Previous revision, e.g. v1.1.0> \
+  --skip-first-commit \
+  --dependencies=false \
+  --end-sha <Commit SHA, e.g. 81bd6fe8fb1f498ab900b33dbda3ae1db6771cd8> \
   --output release-notes.md
 ```
 Review and edit `release-notes.md`.
@@ -84,7 +87,7 @@ Once the PR is merged, the [`post-k8sio-image-promo`](https://testgrid.k8s.io/si
 crane digest registry.k8s.io/networking/dranet:v1.1.0
 
 # Verify the Helm chart artifact
-crane digest registry.k8s.io/networking/charts/dranet:v1.1.0
+crane digest registry.k8s.io/networking/charts/dranet:1.1.0
 # or
 helm show chart oci://registry.k8s.io/networking/charts/dranet --version 1.1.0
 ```
