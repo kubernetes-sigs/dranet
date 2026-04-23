@@ -174,6 +174,8 @@ func (db *DB) GetPodNetNs(pod string) string {
 }
 
 func (db *DB) Run(ctx context.Context) error {
+	registerMetrics()
+	begin := time.Now()
 	defer close(db.notifications)
 
 	// Resources are published periodically or if there is a netlink notification
@@ -192,7 +194,7 @@ func (db *DB) Run(ctx context.Context) error {
 	db.instance = getInstanceProperties(ctx, db.cloudProviderHint)
 	db.gwInterfaces = getDefaultGwInterfaces()
 	klog.V(2).Infof("Default gateway interfaces: %v", db.gwInterfaces.UnsortedList())
-
+	inventoryStartupDurationSeconds.Set(time.Since(begin).Seconds())
 	for {
 		err := db.rateLimiter.Wait(ctx)
 		if err != nil {
