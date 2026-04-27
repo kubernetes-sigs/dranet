@@ -35,6 +35,7 @@ func nsAttachRdmadev(hostIfName string, containerNsPAth string) error {
 	if err != nil {
 		return fmt.Errorf("could not get network namespace from path %s for network device %s : %w", containerNsPAth, hostIfName, err)
 	}
+	defer containerNs.Close()
 
 	hostDev, err := nlwrap.RdmaLinkByName(hostIfName)
 	if err != nil {
@@ -53,13 +54,17 @@ func nsDetachRdmadev(containerNsPAth string, ifName string) error {
 	if err != nil {
 		return fmt.Errorf("could not get network namespace from path %s for network device %s : %w", containerNsPAth, ifName, err)
 	}
+	defer containerNs.Close()
 
 	// to avoid golang problem with goroutines we create the socket in the
-	// namespace and use it directly
-	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	// namespace and use it directly. NETLINK_RDMA must be requested explicitly
+	// so that RdmaLinkByName and RdmaLinkSetNsFd operate on the container
+	// namespace's RDMA subsystem, not the host's.
+	nhNs, err := nlwrap.NewHandleAt(containerNs, unix.NETLINK_RDMA)
 	if err != nil {
 		return fmt.Errorf("could not get network namespace handle: %w", err)
 	}
+	defer nhNs.Close()
 
 	dev, err := nhNs.RdmaLinkByName(ifName)
 	if err != nil {

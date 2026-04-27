@@ -46,8 +46,9 @@ func (m *fakePluginHelper) RegistrationStatus() *registerapi.RegistrationStatus 
 
 // mockNetDB is a mock implementation of the inventoryDB interface for testing.
 type fakeInventoryDB struct {
-	resources chan []resourcev1.Device
-	podNetNs  map[string]string
+	resources   chan []resourcev1.Device
+	podNetNs    map[string]string
+	rescanCalls atomic.Int32
 }
 
 func newFakeInventoryDB() *fakeInventoryDB {
@@ -83,6 +84,10 @@ func (m *fakeInventoryDB) GetPodNetNs(podKey string) string {
 
 func (m *fakeInventoryDB) GetDeviceConfig(deviceName string) (*apis.NetworkConfig, bool) {
 	return nil, false
+}
+
+func (m *fakeInventoryDB) RequestRescan() {
+	m.rescanCalls.Add(1)
 }
 
 // fakeNriStub is a mock implementation of the stub.Stub interface for testing.

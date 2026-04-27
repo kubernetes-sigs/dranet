@@ -67,6 +67,7 @@ type inventoryDB interface {
 	AddPodNetNs(podKey string, netNs string)
 	RemovePodNetNs(podKey string)
 	GetPodNetNs(podKey string) (netNs string)
+	RequestRescan()
 }
 
 // WithFilter
