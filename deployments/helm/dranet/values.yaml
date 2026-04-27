@@ -3,7 +3,8 @@ fullnameOverride: ""
 
 image:
   repository: registry.k8s.io/networking/dranet
-  tag: stable
+  # tag defaults to .Chart.AppVersion when empty, which is set to the release tag at package time
+  tag: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -26,6 +27,10 @@ args: {}
 #  inventoryPollBurst: 5
 #  moveIBInterfaces: true
 #  cloudProviderHint: ""
+
+nodeSelector: {}
+
+affinity: {}
 
 tolerations:
   - operator: Exists

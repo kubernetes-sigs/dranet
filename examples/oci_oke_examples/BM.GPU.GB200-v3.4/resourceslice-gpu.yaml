@@ -1,0 +1,124 @@
+# Live ResourceSlice from node 10.140.65.248 (BM.GPU.GB200-v3.4)
+# Captured from a running cluster — use as reference for CEL selector values.
+# The gpu.nvidia.com driver does not expose numaNode; infer NUMA affinity from
+# pciBusID domain (0008/0009 → NUMA 0, 0018/0019 → NUMA 1).
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+metadata:
+  name: 10.140.65.248-gpu.nvidia.com-wgq4h
+spec:
+  driver: gpu.nvidia.com
+  nodeName: 10.140.65.248
+  pool:
+    generation: 1
+    name: 10.140.65.248
+    resourceSliceCount: 1
+  devices:
+  - name: gpu-0
+    attributes:
+      addressingMode:
+        string: ATS
+      architecture:
+        string: Blackwell
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 10.0.0
+      cudaDriverVersion:
+        version: 13.0.0
+      driverVersion:
+        version: 580.126.20
+      productName:
+        string: NVIDIA GB200
+      resource.kubernetes.io/pciBusID:
+        string: "0008:06:00.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0008:00
+      type:
+        string: gpu
+      uuid:
+        string: GPU-5d1d46ee-c7f8-fb08-137a-026f11ab6dd9
+    capacity:
+      memory:
+        value: 189471Mi
+  - name: gpu-1
+    attributes:
+      addressingMode:
+        string: ATS
+      architecture:
+        string: Blackwell
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 10.0.0
+      cudaDriverVersion:
+        version: 13.0.0
+      driverVersion:
+        version: 580.126.20
+      productName:
+        string: NVIDIA GB200
+      resource.kubernetes.io/pciBusID:
+        string: "0009:06:00.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0009:00
+      type:
+        string: gpu
+      uuid:
+        string: GPU-7d9b3513-8002-4843-9759-a0987d50a31c
+    capacity:
+      memory:
+        value: 189471Mi
+  - name: gpu-2
+    attributes:
+      addressingMode:
+        string: ATS
+      architecture:
+        string: Blackwell
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 10.0.0
+      cudaDriverVersion:
+        version: 13.0.0
+      driverVersion:
+        version: 580.126.20
+      productName:
+        string: NVIDIA GB200
+      resource.kubernetes.io/pciBusID:
+        string: "0018:06:00.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0018:00
+      type:
+        string: gpu
+      uuid:
+        string: GPU-42d06ef2-849e-5128-586d-7ccfcea6c0ce
+    capacity:
+      memory:
+        value: 189471Mi
+  - name: gpu-3
+    attributes:
+      addressingMode:
+        string: ATS
+      architecture:
+        string: Blackwell
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 10.0.0
+      cudaDriverVersion:
+        version: 13.0.0
+      driverVersion:
+        version: 580.126.20
+      productName:
+        string: NVIDIA GB200
+      resource.kubernetes.io/pciBusID:
+        string: "0019:06:00.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0019:00
+      type:
+        string: gpu
+      uuid:
+        string: GPU-6d140208-1af4-030d-7509-579195e27a2f
+    capacity:
+      memory:
+        value: 189471Mi

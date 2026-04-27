@@ -35,47 +35,59 @@ func TestGetDeviceAttributes(t *testing.T) {
 		want     map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
 	}{
 		{
-			name: "instance with all metadata",
+			name: "full topology with gpu memory fabric (GB200/GB300 shapes)",
 			instance: &OKEInstance{
-				Shape:              "BM.GPU.H100.8",
-				FaultDomain:        "FAULT-DOMAIN-1",
-				AvailabilityDomain: "TrcQ:US-ASHBURN-AD-2",
+				HPCIslandId:     "fake-island-id",
+				NetworkBlockId:  "fake-network-block-id",
+				LocalBlockId:    "fake-local-block-id",
+				RackId:          "fake-rack-id",
+				GpuMemoryFabric: "fake-gpu-memory-fabric-id",
 			},
 			id: cloudprovider.DeviceIdentifiers{Name: "dev1"},
 			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				AttrOKEShape:              {StringValue: ptr.To("BM.GPU.H100.8")},
-				AttrOKEFaultDomain:        {StringValue: ptr.To("FAULT-DOMAIN-1")},
-				AttrOKEAvailabilityDomain: {StringValue: ptr.To("TrcQ:US-ASHBURN-AD-2")},
+				AttrOKEHPCIslandId:     {StringValue: ptr.To("fake-island-id")},
+				AttrOKENetworkBlockId:  {StringValue: ptr.To("fake-network-block-id")},
+				AttrOKELocalBlockId:    {StringValue: ptr.To("fake-local-block-id")},
+				AttrOKERackId:          {StringValue: ptr.To("fake-rack-id")},
+				AttrOKEGpuMemoryFabric: {StringValue: ptr.To("fake-gpu-memory-fabric-id")},
 			},
 		},
 		{
-			name: "instance with only shape",
+			name: "H100 fallback: only networkBlockId and rackId (no rdmaTopologyData)",
 			instance: &OKEInstance{
-				Shape:              "VM.Standard.E3.Flex",
-				FaultDomain:        "",
-				AvailabilityDomain: "",
+				NetworkBlockId: "fake-network-block-id",
+				RackId:         "fake-rack-id",
 			},
 			id: cloudprovider.DeviceIdentifiers{Name: "dev1"},
 			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				AttrOKEShape: {StringValue: ptr.To("VM.Standard.E3.Flex")},
+				AttrOKENetworkBlockId: {StringValue: ptr.To("fake-network-block-id")},
+				AttrOKERackId:         {StringValue: ptr.To("fake-rack-id")},
 			},
 		},
 		{
-			name: "instance with no metadata",
+			name: "partial topology (only hpcIslandId and networkBlockId)",
 			instance: &OKEInstance{
-				Shape:              "",
-				FaultDomain:        "",
-				AvailabilityDomain: "",
+				HPCIslandId:    "fake-island-id",
+				NetworkBlockId: "fake-network-block-id",
 			},
-			id:   cloudprovider.DeviceIdentifiers{Name: "dev1"},
-			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+			id: cloudprovider.DeviceIdentifiers{Name: "dev1"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				AttrOKEHPCIslandId:    {StringValue: ptr.To("fake-island-id")},
+				AttrOKENetworkBlockId: {StringValue: ptr.To("fake-network-block-id")},
+			},
+		},
+		{
+			name:     "no topology data",
+			instance: &OKEInstance{},
+			id:       cloudprovider.DeviceIdentifiers{Name: "dev1"},
+			want:     map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
 		},
 		{
 			name: "attributes are node-level, same for any device identifier",
 			instance: &OKEInstance{
-				Shape:              "BM.GPU.H100.8",
-				FaultDomain:        "FAULT-DOMAIN-3",
-				AvailabilityDomain: "TrcQ:US-ASHBURN-AD-2",
+				HPCIslandId:    "fake-island-id",
+				NetworkBlockId: "fake-network-block-id",
+				RackId:         "fake-rack-id",
 			},
 			id: cloudprovider.DeviceIdentifiers{
 				Name:       "pci-0000-0c-00-0",
@@ -83,9 +95,9 @@ func TestGetDeviceAttributes(t *testing.T) {
 				PCIAddress: "0000:0c:00.0",
 			},
 			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				AttrOKEShape:              {StringValue: ptr.To("BM.GPU.H100.8")},
-				AttrOKEFaultDomain:        {StringValue: ptr.To("FAULT-DOMAIN-3")},
-				AttrOKEAvailabilityDomain: {StringValue: ptr.To("TrcQ:US-ASHBURN-AD-2")},
+				AttrOKEHPCIslandId:    {StringValue: ptr.To("fake-island-id")},
+				AttrOKENetworkBlockId: {StringValue: ptr.To("fake-network-block-id")},
+				AttrOKERackId:         {StringValue: ptr.To("fake-rack-id")},
 			},
 		},
 	}
@@ -100,11 +112,68 @@ func TestGetDeviceAttributes(t *testing.T) {
 	}
 }
 
+func TestOCIDSuffix(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "valid OCID extracts 60-char suffix",
+			input: "ocid1.hpcisland.oc1.test-region-1.aaaaaaaa2mvjha24vj6evyafdqtis6nzqibhrnxxhzt65zkc3upy4xlrz5za",
+			want:  "aaaaaaaa2mvjha24vj6evyafdqtis6nzqibhrnxxhzt65zkc3upy4xlrz5za",
+		},
+		{
+			name:  "OCID with suffix longer than 60 chars is truncated to last 60",
+			input: "ocid1.hpcisland.oc1.test-region-1.xaaaaaaaa2mvjha24vj6evyafdqtis6nzqibhrnxxhzt65zkc3upy4xlrz5za",
+			want:  "aaaaaaaa2mvjha24vj6evyafdqtis6nzqibhrnxxhzt65zkc3upy4xlrz5za",
+		},
+		{
+			name:  "empty string returns empty (field not present on shape)",
+			input: "",
+			want:  "",
+		},
+		{
+			name:    "non-OCID string returns error",
+			input:   "fakehexhash",
+			wantErr: true,
+		},
+		{
+			name:    "non-OCID dotted string returns error",
+			input:   "some.dotted.value",
+			wantErr: true,
+		},
+		{
+			name:    "OCID without dot separator returns error",
+			input:   "ocid1-hpcisland-no-dots",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ocidSuffix(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ocidSuffix(%q) = %q, want error", tt.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ocidSuffix(%q) unexpected error: %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Errorf("ocidSuffix(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetDeviceConfig(t *testing.T) {
 	instance := &OKEInstance{
-		Shape:              "BM.GPU.H100.8",
-		FaultDomain:        "FAULT-DOMAIN-1",
-		AvailabilityDomain: "TrcQ:US-ASHBURN-AD-2",
+		HPCIslandId:    "fake-island-id",
+		NetworkBlockId: "fake-network-block-id",
+		RackId:         "fake-rack-id",
 	}
 	got := instance.GetDeviceConfig(cloudprovider.DeviceIdentifiers{Name: "dev1"})
 	if got != nil {

@@ -1,0 +1,21 @@
+# 1gpu-1nic: 1 GPU + 1 RDMA NIC per worker.
+# The scheduler co-allocates from the same node automatically.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 1gpu-1nic
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["dra.net"].rdma == true && device.attributes["dra.net"].ifName.startsWith("rdma")'

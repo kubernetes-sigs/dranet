@@ -17,6 +17,8 @@ limitations under the License.
 package inventory
 
 import (
+	"math"
+
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
@@ -28,53 +30,88 @@ import (
 )
 
 // getDefaultGwInterfaces returns a set of interface names that are configured
-// as default gateways in the main routing table. It identifies these by querying
-// the main routing table for routes with an unspecified destination (0.0.0.0/0
-// for IPv4 or ::/0 for IPv6).
+// as active default gateways in the main routing table, respecting route metrics.
+// It identifies defaults as routes where Dst is nil (kernel default) or where
+// Dst is exactly 0.0.0.0/0 (IPv4) or ::/0 (IPv6).
 func getDefaultGwInterfaces() sets.Set[string] {
-	interfaces := sets.Set[string]{}
+	interfaces := make(sets.Set[string])
+
 	filter := &netlink.Route{
 		Table: unix.RT_TABLE_MAIN,
 	}
 	routes, err := nlwrap.RouteListFiltered(netlink.FAMILY_ALL, filter, netlink.RT_FILTER_TABLE)
 	if err != nil {
+		klog.Errorf("Failed to list routes: %v", err)
 		return interfaces
 	}
+
+	minMetricV4 := math.MaxInt32
+	minMetricV6 := math.MaxInt32
+
+	v4Interfaces := make(sets.Set[string])
+	v6Interfaces := make(sets.Set[string])
 
 	for _, r := range routes {
 		if r.Family != netlink.FAMILY_V4 && r.Family != netlink.FAMILY_V6 {
 			continue
 		}
 
-		if r.Dst != nil && !r.Dst.IP.IsUnspecified() {
-			continue
+		if r.Dst != nil {
+			ones, bits := r.Dst.Mask.Size()
+			if !r.Dst.IP.IsUnspecified() || ones != 0 || (bits != 32 && bits != 128) {
+				continue
+			}
 		}
 
-		// no multipath
-		if len(r.MultiPath) == 0 {
-			if r.Gw == nil {
-				continue
+		metric := r.Priority
+
+		// 1. Gather all relevant link indices for this route
+		var linkIndices []int
+		if len(r.MultiPath) > 0 {
+			for _, nh := range r.MultiPath {
+				linkIndices = append(linkIndices, nh.LinkIndex)
 			}
-			intfLink, err := netlink.LinkByIndex(r.LinkIndex)
-			if err != nil {
-				klog.Infof("Failed to get interface link for route %v : %v", r, err)
-				continue
-			}
-			interfaces.Insert(intfLink.Attrs().Name)
+		} else {
+			linkIndices = append(linkIndices, r.LinkIndex)
 		}
 
-		for _, nh := range r.MultiPath {
-			if nh.Gw == nil {
-				continue
-			}
-			intfLink, err := netlink.LinkByIndex(r.LinkIndex)
+		// 2. Evaluate each link index against our metric trackers
+		for _, linkIndex := range linkIndices {
+			intfLink, err := netlink.LinkByIndex(linkIndex)
 			if err != nil {
-				klog.Infof("Failed to get interface link for route %v : %v", r, err)
+				klog.Infof("Failed to get interface link for index %d: %v", linkIndex, err)
 				continue
 			}
-			interfaces.Insert(intfLink.Attrs().Name)
+			name := intfLink.Attrs().Name
+
+			if r.Family == netlink.FAMILY_V4 {
+				if metric < minMetricV4 {
+					minMetricV4 = metric
+					v4Interfaces = make(sets.Set[string]) // Clear previous losers
+					v4Interfaces.Insert(name)
+				} else if metric == minMetricV4 {
+					v4Interfaces.Insert(name) // ECMP tie: keep both
+				}
+			} else {
+				if metric < minMetricV6 {
+					minMetricV6 = metric
+					v6Interfaces = make(sets.Set[string]) // Clear previous losers
+					v6Interfaces.Insert(name)
+				} else if metric == minMetricV6 {
+					v6Interfaces.Insert(name) // ECMP tie: keep both
+				}
+			}
 		}
 	}
+
+	// Merge the winning IPv4 and IPv6 interfaces into the final set
+	for k := range v4Interfaces {
+		interfaces.Insert(k)
+	}
+	for k := range v6Interfaces {
+		interfaces.Insert(k)
+	}
+
 	return interfaces
 }
 

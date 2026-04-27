@@ -1,0 +1,9 @@
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: nccl-test-compute-domain
+spec:
+  numNodes: 0
+  channel:
+    resourceClaimTemplate:
+      name: nccl-test-compute-domain-channel

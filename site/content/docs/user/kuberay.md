@@ -172,7 +172,7 @@ spec:
 ```
 
 If in a future we want to create smaller workers that use a subset of GPUs in
-the Node we should use also the [NVIDIA GPU DRA Driver](./nvidia-dranet.md) to
+the Node we should use also the [NVIDIA GPU DRA Driver](/docs/user/nvidia-dranet) to
 ensure the allocated GPUs and NICs on the node are aligned for optimal
 performance.
 

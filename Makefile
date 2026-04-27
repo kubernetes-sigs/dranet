@@ -66,7 +66,7 @@ REGISTRY?=gcr.io/k8s-staging-networking
 TAG?=$(shell echo "$$(date +v%Y%m%d)-$$(git describe --always --dirty)")
 # the full image tag
 IMAGE?=$(REGISTRY)/$(IMAGE_NAME):$(TAG)
-CHART_REGISTRY?=$(REGISTRY)/charts/$(IMAGE_NAME)
+CHART_REGISTRY?=$(REGISTRY)/charts
 HELM_TAG?=$(shell git describe --tags --exact-match 2>/dev/null)
 # for helm chart version strip 'v' to have valid semver (example: v0.1.0 → 0.1.0)
 CHART_VERSION=$(shell echo "$(HELM_TAG)" | sed 's/^v//')

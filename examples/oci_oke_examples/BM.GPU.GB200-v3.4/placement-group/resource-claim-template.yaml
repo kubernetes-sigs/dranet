@@ -1,0 +1,103 @@
+# Topology-constrained ResourceClaimTemplates for OKE BM.GPU.GB200-v3.4.
+#
+# These templates extend the standard 2nic-aligned pattern with OKE topology
+# attribute constraints, ensuring all workers land in the same fabric domain.
+#
+# Replace the topology ID values with those from your cluster:
+#   kubectl get resourceslice -o json | python3 -c "
+#   import json, sys; data = json.load(sys.stdin)
+#   [print(d['attributes'].get('oke.dra.net/localBlockId',{}).get('string',''))
+#    for rs in data['items'] if rs['spec'].get('driver')=='dra.net'
+#    for d in rs['spec'].get('devices',[])
+#    if d.get('attributes',{}).get('oke.dra.net/localBlockId')]" | sort -u
+
+---
+# 2nic-aligned-local-block: 1 GPU + 2 NUMA-0 NICs, same local block.
+# Constrains to the tightest fabric grouping (~8-32 nodes).
+# Use this for latency-sensitive workloads requiring minimal hop count.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 2nic-aligned-local-block
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dranet.net
+          count: 2
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                device.attributes["dra.net"].virtual == false &&
+                device.attributes["dra.net"].numaNode == 0 &&
+                device.attributes["oke.dra.net"].localBlockId == "anzxsljr52tswuackr5rr3lhh6obnscn24yuo5wkdb5boasdny4vzn7fa5ma"
+---
+# 2nic-aligned-network-block: 1 GPU + 2 NUMA-0 NICs, same network block.
+# Constrains to a mid-level grouping (~64-128 nodes).
+# Use this for larger jobs that may span multiple local blocks.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 2nic-aligned-network-block
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dranet.net
+          count: 2
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                device.attributes["dra.net"].virtual == false &&
+                device.attributes["dra.net"].numaNode == 0 &&
+                device.attributes["oke.dra.net"].networkBlockId == "anzxsljr52tswuacnk6rqshabqpcetn6waf6gngmmhpvkfdugrcg4lrjhqwq"
+---
+# 2nic-aligned-gpu-fabric: 1 GPU + 2 NUMA-0 NICs, same GPU memory fabric.
+# Constrains to nodes sharing the same NVLink fabric domain (GB200/GB300 specific).
+# Use this when inter-node NVLink peer access is required.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 2nic-aligned-gpu-fabric
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dranet.net
+          count: 2
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                device.attributes["dra.net"].virtual == false &&
+                device.attributes["dra.net"].numaNode == 0 &&
+                device.attributes["oke.dra.net"].gpuMemoryFabricId == "anzxsljr52tswuacjzzisb4yoeucx6bxyhkuhxkyhonyokwxmrzlemtlxh7a"

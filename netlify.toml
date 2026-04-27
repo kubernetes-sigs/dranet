@@ -1,0 +1,21 @@
+[build]
+  base = "site"
+  publish = "public"
+  command = "npm init --yes && npm install --save-dev autoprefixer postcss-cli && hugo --gc --minify -b $URL"
+
+[build.environment]
+  GO_VERSION = "1.23.4"
+  HUGO_VERSION = "0.136.0"
+  NODE_VERSION = "20"
+
+[context.production.environment]
+  HUGO_ENV = "production"
+  HUGO_ENABLEGITINFO = "true"
+
+[context.branch-deploy.environment]
+  HUGO_ENV = "development"
+  HUGO_ENABLEGITINFO = "true"
+
+[context.deploy-preview.environment]
+  HUGO_ENV = "development"
+  HUGO_ENABLEGITINFO = "true"

@@ -1,0 +1,94 @@
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: nccl-test-dra
+spec:
+  slotsPerWorker: 1
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          containers:
+          - name: nccl
+            image: iad.ocir.io/idxzjcdglx2s/nccl-tests:cuda-13.1.1-ubuntu-24.04-nccl-2.29.3-020926.1
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              NUM_GPUS=1
+              NUM_HOSTS=$(sed -n '$=' /etc/mpi/hostfile)
+              NP=$(($NUM_HOSTS*$NUM_GPUS))
+              while ! (for host in $(awk '{print $1}' /etc/mpi/hostfile); do
+                ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $host exit 2>/dev/null || exit 1
+              done); do
+                echo "Waiting for workers to be ready..."
+                sleep 5
+              done
+              echo "All workers ready, launching NCCL test across $NUM_HOSTS nodes ($NP ranks)"
+              mpirun \
+                --allow-run-as-root \
+                --bind-to numa \
+                --mca pml ucx \
+                --mca coll ^hcoll \
+                -x LD_LIBRARY_PATH \
+                -x UCX_NET_DEVICES=eth0 \
+                -x NCCL_DEBUG=INFO \
+                -x NCCL_SOCKET_IFNAME=eth0 \
+                -x NCCL_MNNVL_ENABLE=0 \
+                -x NCCL_NET_GDR_C2C=1 \
+                -x NCCL_IB_GID_INDEX=3 \
+                -x NCCL_IB_TC=41 \
+                -x NCCL_IB_SL=0 \
+                -x NCCL_IB_TIMEOUT=22 \
+                -x RX_QUEUE_LEN=8192 \
+                -x IB_RX_QUEUE_LEN=8192 \
+                -x NCCL_MIN_NCHANNELS=8 \
+                -x NCCL_IB_QPS_PER_CONNECTION=2 \
+                -x NCCL_IB_SPLIT_DATA_ON_QPS=0 \
+                -x NCCL_BUFFSIZE=16777216 \
+                -x NCCL_DMABUF_ENABLE=1 \
+                -x NCCL_IB_DATA_DIRECT=0 \
+                -x NCCL_NET_PLUGIN=sys \
+                -x NCCL_NVLS_ENABLE=0 \
+                -x HCOLL_ENABLE_MCAST_ALL=0 \
+                -x coll_hcoll_enable=0 \
+                -np $NP \
+                /workspace/nccl-tests/build/all_reduce_perf -b 512M -e 8G -f 2 -g 1 -c 0
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    training.kubeflow.org/job-name: nccl-test-dra
+                    training.kubeflow.org/job-role: worker
+                topologyKey: kubernetes.io/hostname
+          automountServiceAccountToken: false
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 32Gi
+          resourceClaims:
+          - name: gpu-nic
+            resourceClaimTemplateName: 1nic-aligned
+          containers:
+          - name: nccl
+            image: iad.ocir.io/idxzjcdglx2s/nccl-tests:cuda-13.1.1-ubuntu-24.04-nccl-2.29.3-020926.1
+            volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            resources:
+              claims:
+              - name: gpu-nic
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"

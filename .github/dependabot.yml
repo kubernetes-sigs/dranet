@@ -8,9 +8,15 @@ updates:
       k8s-deps:
         patterns:
           - "*k8s.io*"
+      non-k8s-deps:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "*k8s.io*"
     labels:
       - "area/dependency"
       - "ok-to-test"
+      - "release-note-none"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -19,6 +25,7 @@ updates:
     labels:
       - "area/dependency"
       - "ok-to-test"
+      - "release-note-none"
 
   - package-ecosystem: "docker"
     directory: "/"
@@ -27,3 +34,4 @@ updates:
     labels:
       - "area/dependency"
       - "ok-to-test"
+      - "release-note-none"
