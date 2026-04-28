@@ -84,6 +84,7 @@ type DB struct {
 	rateLimiter     *rate.Limiter
 	maxPollInterval time.Duration
 	notifications   chan []resourceapi.Device
+	rescanCh        chan struct{}
 	hasDevices      bool
 
 	// moveIBInterfaces controls whether IPoIB network interfaces are
@@ -139,6 +140,7 @@ func New(opts ...Option) *DB {
 		deviceConfigStore: map[string]*apis.NetworkConfig{},
 		rateLimiter:       rate.NewLimiter(rate.Every(defaultMinPollInterval), defaultPollBurst),
 		notifications:     make(chan []resourceapi.Device),
+		rescanCh:          make(chan struct{}, 1),
 		maxPollInterval:   defaultMaxPollInterval,
 		moveIBInterfaces:  true,
 	}
@@ -212,6 +214,7 @@ func (db *DB) Run(ctx context.Context) error {
 			for len(nlChannel) > 0 {
 				<-nlChannel
 			}
+		case <-db.rescanCh:
 		case <-time.After(db.maxPollInterval):
 		case <-ctx.Done():
 			return ctx.Err()
@@ -250,6 +253,17 @@ func (db *DB) scan() []resourceapi.Device {
 
 func (db *DB) GetResources(ctx context.Context) <-chan []resourceapi.Device {
 	return db.notifications
+}
+
+// RequestRescan queues a non-blocking rescan of the inventory. If a rescan is
+// already pending the call is a no-op. This is used when RDMA devices may have
+// returned to the host namespace via kernel namespace cleanup rather than an
+// explicit move, so there is no NEWLINK event to trigger the normal path.
+func (db *DB) RequestRescan() {
+	select {
+	case db.rescanCh <- struct{}{}:
+	default:
+	}
 }
 
 func (db *DB) discoverPCIDevices() []resourceapi.Device {

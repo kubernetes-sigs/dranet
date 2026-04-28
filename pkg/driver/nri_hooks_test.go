@@ -462,6 +462,56 @@ func TestStopPodSandboxMetrics(t *testing.T) {
 	}
 }
 
+// TestRemovePodSandboxRequestsRescan verifies that RemovePodSandbox triggers
+// an inventory rescan so that RDMA capability re-detection does not have to
+// wait for the next periodic scan. This matters in particular for IB-only
+// RDMA devices which emit no NETLINK_ROUTE event when returned to init_net.
+func TestRemovePodSandboxRequestsRescan(t *testing.T) {
+	testCases := []struct {
+		name              string
+		setupDeviceConfig bool
+		wantRescanCalls   int32
+	}{
+		{
+			name:              "rescan requested when pod has device config",
+			setupDeviceConfig: true,
+			wantRescanCalls:   1,
+		},
+		{
+			name:              "no rescan when pod has no device config",
+			setupDeviceConfig: false,
+			wantRescanCalls:   0,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			nriPluginRequestsTotal.Reset()
+			nriPluginRequestsLatencySeconds.Reset()
+			netdb := newFakeInventoryDB()
+			np := &NetworkDriver{
+				podConfigStore: mustNewPodConfigStore(),
+				netdb:          netdb,
+			}
+			podUID := types.UID("test-pod")
+			pod := &api.PodSandbox{
+				Uid:       string(podUID),
+				Name:      "test-pod",
+				Namespace: "test-ns",
+			}
+			if tc.setupDeviceConfig {
+				np.podConfigStore.SetDeviceConfig(podUID, "eth0", DeviceConfig{})
+			}
+
+			if err := np.RemovePodSandbox(context.Background(), pod); err != nil {
+				t.Fatalf("RemovePodSandbox() error = %v", err)
+			}
+			if got := netdb.rescanCalls.Load(); got != tc.wantRescanCalls {
+				t.Errorf("RequestRescan call count = %d, want %d", got, tc.wantRescanCalls)
+			}
+		})
+	}
+}
+
 func TestRemovePodSandboxMetrics(t *testing.T) {
 	testCases := []struct {
 		name           string

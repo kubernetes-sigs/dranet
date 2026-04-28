@@ -379,16 +379,21 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		}
 	}
 	for deviceName, config := range podConfig.DeviceConfigs {
+		// Move the RDMA device back to the host namespace BEFORE the netdev.
+		// nsDetachNetdev calls LinkSetUp on the VF in the host namespace, which
+		// triggers a NEWLINK event causing the inventory to rescan. If the RDMA
+		// device is still in the pod namespace at that point it will not be
+		// detected, so it must be returned first.
+		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
+			if err := nsDetachRdmadev(ns, config.RDMADevice.LinkDev); err != nil {
+				klog.Infof("fail to return rdma device %s : %v", deviceName, err)
+			}
+		}
+
 		ifName := config.NetworkInterfaceConfigInPod.Interface.Name
 		if ifName != "" {
 			if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
 				klog.Infof("fail to return network device %s : %v", deviceName, err)
-			}
-		}
-
-		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
-			if err := nsDetachRdmadev(ns, config.RDMADevice.LinkDev); err != nil {
-				klog.Infof("fail to return rdma device %s : %v", deviceName, err)
 			}
 		}
 	}
@@ -417,6 +422,15 @@ func (np *NetworkDriver) RemovePodSandbox(ctx context.Context, pod *api.PodSandb
 
 func (np *NetworkDriver) removePodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	np.netdb.RemovePodNetNs(podKey(pod))
+	// The inventory only subscribes to NETLINK_ROUTE link events, not
+	// NETLINK_RDMA. For SR-IOV VFs the netdev's NEWLINK (emitted by
+	// nsDetachNetdev or, on failure, by kernel netns cleanup) drives the
+	// rescan that re-detects RDMA via sysfs. For IB-only RDMA devices there
+	// is no associated netdev, so no NEWLINK is ever emitted on return to
+	// init_net — neither on success nor on failure of nsDetachRdmadev.
+	// Request a rescan so RDMA capability is re-detected immediately rather
+	// than waiting up to maxPollInterval (~1 minute).
+	np.netdb.RequestRescan()
 	return nil
 }
 
