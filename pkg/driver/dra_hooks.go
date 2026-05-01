@@ -60,6 +60,7 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 		case devices := <-np.netdb.GetResources(ctx):
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(devices), formatDeviceNames(devices, 15))
 			devices = filter.FilterDevices(np.celProgram, devices)
+			devices = filter.MarkVFIOUnsafe(devices)
 			klog.V(3).Infof("After filtering, publishing %d devices in ResourceSlice(s): %s", len(devices), formatDeviceNames(devices, 15))
 
 			np.publishResourcesPrometheusMetrics(devices)
