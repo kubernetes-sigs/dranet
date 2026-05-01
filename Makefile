@@ -58,18 +58,14 @@ ensure-helm:
 		go install helm.sh/helm/v3/cmd/helm@$(HELM_VERSION_SHA); \
 	fi
 
-# get image name from directory we're building
 IMAGE_NAME=dranet
-# docker image registry, default to upstream
 REGISTRY?=gcr.io/k8s-staging-networking
-# tag based on date-sha
-TAG?=$(shell echo "$$(date +v%Y%m%d)-$$(git describe --always --dirty)")
-# the full image tag
+TAG?=$(shell git describe --tags --always --dirty)
+CHART_VERSION?=$(shell echo "$(TAG)" | sed 's/^v//')
+
 IMAGE?=$(REGISTRY)/$(IMAGE_NAME):$(TAG)
+
 CHART_REGISTRY?=$(REGISTRY)/charts
-HELM_TAG?=$(shell git describe --tags --exact-match 2>/dev/null)
-# for helm chart version strip 'v' to have valid semver (example: v0.1.0 → 0.1.0)
-CHART_VERSION=$(shell echo "$(HELM_TAG)" | sed 's/^v//')
 PLATFORMS?=linux/amd64,linux/arm64
 
 # base images (defaults are in the Dockerfile)
@@ -96,11 +92,11 @@ image-push: ensure-buildx
 		--tag="${IMAGE}" \
 		--push
 
-helm-package:
-	@test -n "$(HELM_TAG)" || (echo "ERROR: not on an exact git tag, cannot package helm chart"; exit 1)
+helm-package: ensure-helm
+	mkdir -p $(OUT_DIR)
 	helm package deployments/helm/dranet \
 		--version "$(CHART_VERSION)" \
-		--app-version "$(HELM_TAG)" \
+		--app-version "$(TAG)" \
 		--destination $(OUT_DIR)
 
 helm-push: helm-package
@@ -116,11 +112,6 @@ kind-image: image-build
 	kubectl apply -f install.yaml
 
 # The main release target, which pushes all images and helm charts.
-# Helm chart packaging and push is skipped when not on an exact git tag.
-release: image-push
-	@if [ -n "$(HELM_TAG)" ]; then \
-		echo "On tag $(HELM_TAG), packaging and pushing helm chart..."; \
-		$(MAKE) ensure-helm helm-push; \
-	else \
-		echo "Not on a tag, skipping helm chart push"; \
-	fi
+release: image-push helm-push
+
+
