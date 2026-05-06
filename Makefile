@@ -93,7 +93,6 @@ image-push: ensure-buildx
 		--push
 
 helm-package: ensure-helm
-	mkdir -p $(OUT_DIR)
 	helm package deployments/helm/dranet \
 		--version "$(CHART_VERSION)" \
 		--app-version "$(TAG)" \
