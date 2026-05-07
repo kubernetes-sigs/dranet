@@ -215,6 +215,7 @@ func (db *DB) Run(ctx context.Context) error {
 				<-nlChannel
 			}
 		case <-db.rescanCh:
+			klog.V(3).Infof("Triggering inventory rescan due to manual request")
 		case <-time.After(db.maxPollInterval):
 		case <-ctx.Done():
 			return ctx.Err()

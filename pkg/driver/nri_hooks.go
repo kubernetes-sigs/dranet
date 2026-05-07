@@ -388,7 +388,7 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		rdmaDetached := false
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
 			if err := nsDetachRdmadev(ns, config.RDMADevice.LinkDev); err != nil {
-				klog.Infof("fail to return rdma device %s : %v", deviceName, err)
+				klog.Errorf("fail to return rdma device %s : %v", deviceName, err)
 			} else {
 				rdmaDetached = true
 			}
@@ -398,7 +398,7 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		ifName := config.NetworkInterfaceConfigInPod.Interface.Name
 		if ifName != "" {
 			if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
-				klog.Infof("fail to return network device %s : %v", deviceName, err)
+				klog.Errorf("fail to return network device %s : %v", deviceName, err)
 			} else {
 				netdevDetached = true
 			}
