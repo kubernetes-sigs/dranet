@@ -88,7 +88,7 @@ func unpinBPFPrograms(ifName string) error {
 		if err != nil {
 			klog.Infof("fail to unpin bpf link %v", err)
 		} else {
-			klog.V(2).Infof("succesfully unpin bpf from link %d", linkInfo.ID)
+			klog.V(2).Infof("successfully unpin bpf from link %d", linkInfo.ID)
 		}
 		return nil
 	})
