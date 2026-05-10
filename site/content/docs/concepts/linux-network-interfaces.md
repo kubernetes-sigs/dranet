@@ -205,7 +205,7 @@ As you can see in the list above, I just moved one physical interface to a netwo
 ## Alternative Names
 
 Linux [added in 2019 the capability to set alternative names on network interfaces](https://patchwork.ozlabs.org/project/netdev/cover/20190930094820.11281-1-jiri@resnulli.us/#2269624), mainly to avoid the
-current lenght limitation
+current length limitation
 
 ```sh
  ip link property add dev DEVICE [ altname NAME .. ]
