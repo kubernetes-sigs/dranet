@@ -17,14 +17,19 @@ limitations under the License.
 package inventory
 
 import (
+	"fmt"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	"sigs.k8s.io/dranet/pkg/apis"
 
 	userns "sigs.k8s.io/dranet/internal/testutils"
 )
@@ -498,6 +503,251 @@ func addChildDummy(t *testing.T, name string, masterIndex int) netlink.Link {
 		t.Fatalf("failed to set %s up: %v", name, err)
 	}
 	return link
+}
+
+// TestAddLinkAttributesIPLengthCap covers the 64-byte DRA string-attribute
+// limit on AttrIPv4 / AttrIPv6. The kube-proxy IPVS dummy interface
+// (kube-ipvs0) accumulates every cluster ServiceIP, and if dranet joins them
+// all into a single comma-separated attribute the resulting ResourceSlice is
+// rejected by the API server with "Too long: may not be more than 64 bytes".
+// addLinkAttributes must omit the attribute when its joined value would
+// exceed the limit, without disturbing the device's other attributes or the
+// IP attribute of the other family if that one still fits.
+func TestAddLinkAttributesIPLengthCap(t *testing.T) {
+	userns.Run(t, testAddLinkAttributesIPLengthCap_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testAddLinkAttributesIPLengthCap_Namespaced(t *testing.T) {
+	if err := netlink.LinkSetUp(&netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: "lo"}}); err != nil {
+		t.Fatalf("failed to bring lo up: %v", err)
+	}
+
+	// Build IP address sets of various sizes.
+	// One IPv4 "/32" is 12 bytes (e.g. "10.96.0.1/32"); 5 of them joined by
+	// commas total 64 bytes — the boundary case. 6 of them spill over.
+	manyV4 := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		manyV4 = append(manyV4, fmt.Sprintf("10.96.0.%d/32", i+1))
+	}
+	manyV6 := make([]string, 0, 6)
+	for i := 0; i < 6; i++ {
+		// Each "fd00::N/128" is 11–12 bytes; 6 of them comfortably overflow.
+		manyV6 = append(manyV6, fmt.Sprintf("fd00::%x/128", i+1))
+	}
+
+	tests := []struct {
+		name        string
+		ipv4        []string
+		ipv6        []string
+		wantV4Set   bool
+		wantV6Set   bool
+		wantV4Value string // when wantV4Set is true and there's a single deterministic value
+		wantV6Value string
+	}{
+		{
+			name: "no IPs - neither attribute set",
+		},
+		{
+			name:        "single IPv4 - attribute set",
+			ipv4:        []string{"10.0.0.1/24"},
+			wantV4Set:   true,
+			wantV4Value: "10.0.0.1/24",
+		},
+		{
+			name:        "single IPv6 - attribute set",
+			ipv6:        []string{"fd00::1/64"},
+			wantV6Set:   true,
+			wantV6Value: "fd00::1/64",
+		},
+		{
+			name:      "many IPv4 overflow - attribute omitted",
+			ipv4:      manyV4,
+			wantV4Set: false,
+		},
+		{
+			name:      "many IPv6 overflow - attribute omitted",
+			ipv6:      manyV6,
+			wantV6Set: false,
+		},
+		{
+			// kube-ipvs0-style mix: lots of v4 ClusterIPs overflow the limit
+			// but a single v6 host address still fits — only AttrIPv4 should
+			// be dropped, AttrIPv6 must still be published.
+			name:        "v4 overflow does not drop v6",
+			ipv4:        manyV4,
+			ipv6:        []string{"fd00::1/64"},
+			wantV4Set:   false,
+			wantV6Set:   true,
+			wantV6Value: "fd00::1/64",
+		},
+	}
+
+	for i, tt := range tests {
+		tt := tt
+		ifName := fmt.Sprintf("attrcap%d", i)
+		t.Run(tt.name, func(t *testing.T) {
+			dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: ifName}}
+			if err := netlink.LinkAdd(dummy); err != nil {
+				t.Fatalf("failed to add dummy %s: %v", ifName, err)
+			}
+			t.Cleanup(func() { _ = netlink.LinkDel(dummy) })
+
+			link, err := netlink.LinkByName(ifName)
+			if err != nil {
+				t.Fatalf("failed to look up %s: %v", ifName, err)
+			}
+			// Bring the link up so global-scope addresses stay usable.
+			if err := netlink.LinkSetUp(link); err != nil {
+				t.Fatalf("failed to set %s up: %v", ifName, err)
+			}
+
+			for _, cidr := range tt.ipv4 {
+				addr, err := netlink.ParseAddr(cidr)
+				if err != nil {
+					t.Fatalf("ParseAddr(%q): %v", cidr, err)
+				}
+				if err := netlink.AddrAdd(link, addr); err != nil {
+					t.Fatalf("AddrAdd(%s, %s): %v", ifName, cidr, err)
+				}
+			}
+			for _, cidr := range tt.ipv6 {
+				addr, err := netlink.ParseAddr(cidr)
+				if err != nil {
+					t.Fatalf("ParseAddr(%q): %v", cidr, err)
+				}
+				if err := netlink.AddrAdd(link, addr); err != nil {
+					t.Fatalf("AddrAdd(%s, %s): %v", ifName, cidr, err)
+				}
+			}
+
+			// Re-fetch the link so its address list is current.
+			link, err = netlink.LinkByName(ifName)
+			if err != nil {
+				t.Fatalf("re-fetch %s: %v", ifName, err)
+			}
+
+			device := &resourceapi.Device{
+				Name:       ifName,
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+			}
+			addLinkAttributes(device, link)
+
+			// Always-set attributes — sanity check we didn't break the rest
+			// of addLinkAttributes while editing the IP block.
+			if got, ok := device.Attributes[apis.AttrInterfaceName]; !ok || got.StringValue == nil || *got.StringValue != ifName {
+				t.Errorf("AttrInterfaceName = %+v, want %q", got, ifName)
+			}
+
+			gotV4, hasV4 := device.Attributes[apis.AttrIPv4]
+			if hasV4 != tt.wantV4Set {
+				t.Errorf("AttrIPv4 present = %v, want %v (value=%+v)", hasV4, tt.wantV4Set, gotV4)
+			}
+			if hasV4 && gotV4.StringValue != nil {
+				if len(*gotV4.StringValue) > maxDeviceAttributeStringLen {
+					t.Errorf("AttrIPv4 value length %d exceeds DRA cap %d: %q",
+						len(*gotV4.StringValue), maxDeviceAttributeStringLen, *gotV4.StringValue)
+				}
+				if tt.wantV4Value != "" && *gotV4.StringValue != tt.wantV4Value {
+					t.Errorf("AttrIPv4 = %q, want %q", *gotV4.StringValue, tt.wantV4Value)
+				}
+			}
+
+			gotV6, hasV6 := device.Attributes[apis.AttrIPv6]
+			if hasV6 != tt.wantV6Set {
+				t.Errorf("AttrIPv6 present = %v, want %v (value=%+v)", hasV6, tt.wantV6Set, gotV6)
+			}
+			if hasV6 && gotV6.StringValue != nil {
+				if len(*gotV6.StringValue) > maxDeviceAttributeStringLen {
+					t.Errorf("AttrIPv6 value length %d exceeds DRA cap %d: %q",
+						len(*gotV6.StringValue), maxDeviceAttributeStringLen, *gotV6.StringValue)
+				}
+				if tt.wantV6Value != "" && *gotV6.StringValue != tt.wantV6Value {
+					t.Errorf("AttrIPv6 = %q, want %q", *gotV6.StringValue, tt.wantV6Value)
+				}
+			}
+		})
+	}
+}
+
+// TestAddLinkAttributesIPBoundaryLength exercises the exact 64-byte limit:
+// a joined string of length 64 is accepted; one of length 65 is omitted.
+func TestAddLinkAttributesIPBoundaryLength(t *testing.T) {
+	userns.Run(t, testAddLinkAttributesIPBoundaryLength_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testAddLinkAttributesIPBoundaryLength_Namespaced(t *testing.T) {
+	if err := netlink.LinkSetUp(&netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: "lo"}}); err != nil {
+		t.Fatalf("failed to bring lo up: %v", err)
+	}
+
+	// 5 × "10.96.0.N/32" (12 bytes each) joined with commas = 5*12 + 4 = 64 bytes.
+	addrsExactlyAtLimit := []string{
+		"10.96.0.1/32", "10.96.0.2/32", "10.96.0.3/32", "10.96.0.4/32", "10.96.0.5/32",
+	}
+	addrsJustOverLimit := append([]string{}, addrsExactlyAtLimit...)
+	// "10.96.0.10/32" is 13 bytes; appending it and a comma makes the join >64.
+	addrsJustOverLimit = append(addrsJustOverLimit, "10.96.0.10/32")
+
+	cases := []struct {
+		name      string
+		addrs     []string
+		wantSet   bool
+		wantBytes int // expected length of the joined attribute when set
+	}{
+		{name: "exactly at 64-byte limit", addrs: addrsExactlyAtLimit, wantSet: true, wantBytes: maxDeviceAttributeStringLen},
+		{name: "just over 64-byte limit", addrs: addrsJustOverLimit, wantSet: false},
+	}
+
+	for i, tc := range cases {
+		tc := tc
+		ifName := fmt.Sprintf("attrbnd%d", i)
+		t.Run(tc.name, func(t *testing.T) {
+			dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: ifName}}
+			if err := netlink.LinkAdd(dummy); err != nil {
+				t.Fatalf("LinkAdd %s: %v", ifName, err)
+			}
+			t.Cleanup(func() { _ = netlink.LinkDel(dummy) })
+			link, err := netlink.LinkByName(ifName)
+			if err != nil {
+				t.Fatalf("LinkByName %s: %v", ifName, err)
+			}
+			if err := netlink.LinkSetUp(link); err != nil {
+				t.Fatalf("LinkSetUp %s: %v", ifName, err)
+			}
+			for _, cidr := range tc.addrs {
+				addr, err := netlink.ParseAddr(cidr)
+				if err != nil {
+					t.Fatalf("ParseAddr(%q): %v", cidr, err)
+				}
+				if err := netlink.AddrAdd(link, addr); err != nil {
+					t.Fatalf("AddrAdd(%s,%s): %v", ifName, cidr, err)
+				}
+			}
+			link, _ = netlink.LinkByName(ifName)
+
+			device := &resourceapi.Device{
+				Name:       ifName,
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+			}
+			addLinkAttributes(device, link)
+
+			got, has := device.Attributes[apis.AttrIPv4]
+			if has != tc.wantSet {
+				t.Fatalf("AttrIPv4 present = %v, want %v", has, tc.wantSet)
+			}
+			if has && got.StringValue != nil {
+				if len(*got.StringValue) != tc.wantBytes {
+					t.Errorf("AttrIPv4 joined length = %d, want %d (value=%q)",
+						len(*got.StringValue), tc.wantBytes, *got.StringValue)
+				}
+				// Defense in depth: the value must contain a comma for the
+				// multi-address case, which proves we used Join correctly.
+				if len(tc.addrs) > 1 && !strings.Contains(*got.StringValue, ",") {
+					t.Errorf("AttrIPv4 = %q, expected comma-joined value", *got.StringValue)
+				}
+			}
+		})
+	}
 }
 
 // addChildBond creates a bond attached to masterIndex so it can itself act
