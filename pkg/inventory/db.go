@@ -53,11 +53,6 @@ const (
 	// defaultPollBurst is the default number of polls that can be run in a
 	// burst.
 	defaultPollBurst = 5
-
-	// maxDeviceAttributeStringLen is the per-attribute string-value byte limit
-	// enforced by DRA (resource.k8s.io). Values larger than this cause the
-	// API server to reject the entire ResourceSlice.
-	maxDeviceAttributeStringLen = 64
 )
 
 var (
@@ -410,6 +405,39 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []resourceapi.Device) []resou
 	return append(pciDevices, otherDevices...)
 }
 
+// buildIPList joins ips with commas, stopping before any address that would
+// push the result past maxBytes. It returns the (possibly truncated) joined
+// string and the number of addresses that were included.
+func buildIPList(ips []string, maxBytes int) (string, int) {
+	if len(ips) == 0 {
+		return "", 0
+	}
+
+	var builder strings.Builder
+	currentLength := 0
+	kept := 0
+
+	for i, ip := range ips {
+		addedLength := len(ip)
+		if i > 0 {
+			addedLength++ // comma separator
+		}
+
+		if currentLength+addedLength > maxBytes {
+			break
+		}
+
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(ip)
+		currentLength += addedLength
+		kept++
+	}
+
+	return builder.String(), kept
+}
+
 func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 	ifName := link.Attrs().Name
 	device.Attributes[apis.AttrInterfaceName] = resourceapi.DeviceAttribute{StringValue: &ifName}
@@ -434,26 +462,36 @@ func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 				v4.Insert(address.IPNet.String())
 			}
 		}
-		// DRA enforces a 64-byte limit on string attribute values. Interfaces
-		// like the kube-proxy IPVS dummy (kube-ipvs0) accumulate every cluster
+		// DRA enforces a per-attribute string limit (see
+		// resourceapi.DeviceAttributeMaxValueLength). Interfaces like the
+		// kube-proxy IPVS dummy (kube-ipvs0) accumulate every cluster
 		// ServiceIP and would overflow this limit, causing the whole slice to
-		// be rejected. Omit the attribute when the joined value would not fit.
+		// be rejected. Build the attribute incrementally and stop once the
+		// next address would push us past the cap. Until List-typed device
+		// attributes land (kubernetes/enhancements#5491) this prefix is the
+		// best we can publish; sort first so the truncation is deterministic.
 		if v4.Len() > 0 {
-			joined := strings.Join(v4.UnsortedList(), ",")
-			if len(joined) <= maxDeviceAttributeStringLen {
+			ips := v4.UnsortedList()
+			sort.Strings(ips)
+			joined, kept := buildIPList(ips, resourceapi.DeviceAttributeMaxValueLength)
+			if joined != "" {
 				device.Attributes[apis.AttrIPv4] = resourceapi.DeviceAttribute{StringValue: ptr.To(joined)}
-			} else {
-				klog.V(4).Infof("Skipping %s attribute on %s: joined length %d exceeds DRA limit of %d bytes",
-					apis.AttrIPv4, ifName, len(joined), maxDeviceAttributeStringLen)
+			}
+			if kept < len(ips) {
+				klog.V(4).Infof("Truncated %s attribute on %s: kept %d of %d addresses to stay within DRA's %d-byte limit",
+					apis.AttrIPv4, ifName, kept, len(ips), resourceapi.DeviceAttributeMaxValueLength)
 			}
 		}
 		if v6.Len() > 0 {
-			joined := strings.Join(v6.UnsortedList(), ",")
-			if len(joined) <= maxDeviceAttributeStringLen {
+			ips := v6.UnsortedList()
+			sort.Strings(ips)
+			joined, kept := buildIPList(ips, resourceapi.DeviceAttributeMaxValueLength)
+			if joined != "" {
 				device.Attributes[apis.AttrIPv6] = resourceapi.DeviceAttribute{StringValue: ptr.To(joined)}
-			} else {
-				klog.V(4).Infof("Skipping %s attribute on %s: joined length %d exceeds DRA limit of %d bytes",
-					apis.AttrIPv6, ifName, len(joined), maxDeviceAttributeStringLen)
+			}
+			if kept < len(ips) {
+				klog.V(4).Infof("Truncated %s attribute on %s: kept %d of %d addresses to stay within DRA's %d-byte limit",
+					apis.AttrIPv6, ifName, kept, len(ips), resourceapi.DeviceAttributeMaxValueLength)
 			}
 		}
 	}
