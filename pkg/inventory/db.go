@@ -414,7 +414,6 @@ func buildIPList(ips []string, maxBytes int) (string, int) {
 	}
 
 	var builder strings.Builder
-	currentLength := 0
 	kept := 0
 
 	for i, ip := range ips {
@@ -423,7 +422,7 @@ func buildIPList(ips []string, maxBytes int) (string, int) {
 			addedLength++ // comma separator
 		}
 
-		if currentLength+addedLength > maxBytes {
+		if builder.Len()+addedLength > maxBytes {
 			break
 		}
 
@@ -431,7 +430,6 @@ func buildIPList(ips []string, maxBytes int) (string, int) {
 			builder.WriteByte(',')
 		}
 		builder.WriteString(ip)
-		currentLength += addedLength
 		kept++
 	}
 
