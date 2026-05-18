@@ -154,6 +154,7 @@ func (g *GCEInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) ma
 // GetDeviceConfig fetches any infrastructure-specific network configuration
 // required by the device. Returning nil means no specific config is needed.
 func (g *GCEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
+	// POC TODO: Fetch the actual IP range assigned to this interface and return it in apis.NetworkConfig.Interface.IPRange.
 	return nil
 }
 

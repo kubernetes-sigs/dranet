@@ -48,6 +48,10 @@ type InterfaceConfig struct {
 	// to be assigned to the interface.
 	Addresses []string `json:"addresses,omitempty"`
 
+	// IPRange is the IP range (CIDR) from which to allocate an IP address
+	// for this interface.
+	IPRange string `json:"ipRange,omitempty"`
+
 	// DHCP, if true, indicates that the interface should be configured via DHCP.
 	// This is mutually exclusive with the 'addresses' field.
 	DHCP *bool `json:"dhcp,omitempty"`

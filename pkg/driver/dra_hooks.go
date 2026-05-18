@@ -275,9 +275,15 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			deviceCfg.NetworkInterfaceConfigInPod.Interface.Name = ifName
 		}
 
-		// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
-		// ... but we DO NOT apply them in the root namespace
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP != nil && *deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP {
+		// POC: experimental IPAM takes over IP allocation logic when enabled.
+		const pocIpamEnabled = true
+		podIPs := make(map[types.UID]string)
+
+		if pocIpamEnabled {
+			var ipamErrors []error
+			podIPs, ipamErrors = np.allocateIPsForPods(netconf.Interface.IPRange, podUIDs, result.Device)
+			errorList = append(errorList, ipamErrors...)
+		} else if deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP != nil && *deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP {
 			klog.V(2).Infof("trying to get network configuration via DHCP")
 			contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -398,7 +404,14 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		// TODO: support for multiple pods sharing the same device
 		// we'll create the subinterface here
 		for _, uid := range podUIDs {
-			if err := np.podConfigStore.SetDeviceConfig(uid, result.Device, deviceCfg); err != nil {
+			// Create a per-pod copy of the device config.
+			// Pods share the base device config but need their own unique IP addresses.
+			podDeviceCfg := deviceCfg
+			if ip, ok := podIPs[uid]; ok {
+				// Assign the pod-specific IP address.
+				podDeviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
+			}
+			if err := np.podConfigStore.SetDeviceConfig(uid, result.Device, podDeviceCfg); err != nil {
 				errorList = append(errorList, fmt.Errorf("failed to persist device config for pod %s device %s: %v", uid, result.Device, err))
 			}
 		}
@@ -412,6 +425,33 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 	}
 	return kubeletplugin.PrepareResult{}
+}
+
+// allocateIPsForPods allocates IPs for a list of pod UIDs from a given IP range.
+func (np *NetworkDriver) allocateIPsForPods(ipRange string, podUIDs []types.UID, deviceName string) (map[types.UID]string, []error) {
+	podIPs := make(map[types.UID]string)
+	var errorList []error
+
+	if ipRange == "" {
+		errorList = append(errorList, fmt.Errorf("POC: IP range is empty for device %s", deviceName))
+		return podIPs, errorList
+	}
+
+	dbPath := np.dbPath
+	if dbPath == "" {
+		dbPath = "ipconf.db"
+	}
+	for _, uid := range podUIDs {
+		ip, err := GetIPFromRange(ipRange, string(uid), dbPath)
+		if err != nil {
+			errorList = append(errorList, fmt.Errorf("POC: failed to allocate IP for pod %s: %v", uid, err))
+			continue
+		}
+		klog.V(2).Infof("POC: Successfully allocated IP %s for pod %s", ip.String(), uid)
+		podIPs[uid] = ip.String()
+	}
+
+	return podIPs, errorList
 }
 
 func (np *NetworkDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
