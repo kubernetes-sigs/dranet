@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nixl-kv-target
+  labels:
+    app.kubernetes.io/name: nixl-kv-transfer
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: nixl-kv-transfer
+    app.kubernetes.io/role: target
+  ports:
+  - name: nixl
+    port: 5555
+    targetPort: 5555

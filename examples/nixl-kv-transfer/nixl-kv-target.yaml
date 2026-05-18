@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-kv-target
+  labels:
+    app.kubernetes.io/name: nixl-kv-transfer
+    app.kubernetes.io/role: target
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: nixl-kv-transfer
+        topologyKey: kubernetes.io/hostname
+  resourceClaims:
+  - name: gpu-nic
+    resourceClaimTemplateName: h100-4gpu-4nic-numa-aligned
+  containers:
+  - name: bench
+    image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      capabilities:
+        add:
+        - IPC_LOCK
+    env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: UCX_LOG_LEVEL
+      value: warn
+    - name: UCX_PROTO_INFO
+      value: "y"
+    resources:
+      claims:
+      - name: gpu-nic
+      requests:
+        cpu: "8"
+        memory: 64Gi
+    volumeMounts:
+    - name: bench-script
+      mountPath: /bench
+    - name: shm
+      mountPath: /dev/shm
+    command:
+    - /bench/run_bench.sh
+    args:
+    - --mode=target
+    - --port=5555
+    - --backend=UCX
+    - --op=WRITE
+    - --block-size=1073741824
+    - --batch-size=1
+    - --iters=100
+    - --warmup-iters=20
+  volumes:
+  - name: bench-script
+    configMap:
+      name: nixl-benchmark
+      defaultMode: 0755
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule

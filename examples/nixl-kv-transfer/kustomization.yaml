@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- resource-claim-template-aligned.yaml
+- resource-claim-template-unaligned.yaml
+- nixl-kv-service.yaml
+- nixl-kv-target.yaml
+- nixl-kv-initiator.yaml
+
+configMapGenerator:
+- name: nixl-benchmark
+  files:
+  - nixl_benchmark.py
+  - run_bench.sh
+  options:
+    disableNameSuffixHash: true

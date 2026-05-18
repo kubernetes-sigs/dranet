@@ -57,9 +57,14 @@ kubectl get deviceclasses
 
 | File | Description |
 |---|---|
-| `resource-claim-template.yaml` | Two `ResourceClaimTemplate` objects for aligned and unaligned GPU/NIC placement |
-| `nixl-benchmark.yaml` | Two plain pods plus a Service; target and initiator run the NIXL transfer |
-| `nixl_microbench.py` | Python NIXL benchmark copied into the pods through a ConfigMap |
+| `resource-claim-template-aligned.yaml` | `ResourceClaimTemplate` selecting NUMA-aligned GPUs + NICs |
+| `resource-claim-template-unaligned.yaml` | `ResourceClaimTemplate` selecting cross-NUMA GPUs + NICs |
+| `nixl-kv-service.yaml` | Headless Service used for the NIXL side-channel handshake |
+| `nixl-kv-target.yaml` | Target Pod; registers GPU memory and waits for the initiator |
+| `nixl-kv-initiator.yaml` | Initiator Pod; posts the NIXL transfers and prints `RESULT` |
+| `nixl_benchmark.py` | Python NIXL benchmark mounted into the pods through a ConfigMap |
+| `run_bench.sh` | Pod entrypoint: installs `nixl` and execs the benchmark |
+| `kustomization.yaml` | Bundles the templates, pods, Service, and ConfigMap |
 
 ## ResourceClaimTemplates
 
@@ -73,35 +78,40 @@ only intended difference is whether each visible GPU reaches a same-NUMA or
 remote-NUMA NIC.
 
 If your cluster uses a different NIC `DeviceClass` name, update
-`deviceClassName: dranet.net` in `resource-claim-template.yaml`. If your GPU
-DRA driver publishes a reliable GPU NUMA attribute, you can replace the
-`pciBusID` selector with a NUMA selector.
+`deviceClassName: dranet.net` in both `resource-claim-template-aligned.yaml`
+and `resource-claim-template-unaligned.yaml`. If your GPU DRA driver publishes
+a reliable GPU NUMA attribute, you can replace the `pciBusID` selector with a
+NUMA selector.
 
 ## Run
 
-Apply the templates and create the script ConfigMap:
+Apply everything via kustomize. This creates both `ResourceClaimTemplate`s, the
+`nixl-benchmark` ConfigMap (generated from `nixl_benchmark.py` + `run_bench.sh`),
+the headless Service, and both pods:
 
 ```bash
-kubectl apply -f resource-claim-template.yaml
-kubectl create configmap nixl-microbench \
-  --from-file=nixl_microbench.py \
-  --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -k .
 ```
 
 `ResourceClaimTemplate.spec` is immutable. If you already created templates with
 the same names and need to change their selectors, delete the old templates only
 after confirming no active pods are using claims derived from them.
 
-Run each placement case three times. The manifest defaults to a 1 GiB transfer,
-20 warmup iterations, and 100 timed iterations per run.
+The pods default to the `h100-4gpu-4nic-numa-aligned` template. To run each
+placement case three times, swap the template name in the pod manifests with
+`sed` between runs. The manifest defaults to a 1 GiB transfer, 20 warmup
+iterations, and 100 timed iterations per run.
 
 ```bash
 for run in 1 2 3; do
   for tpl in h100-4gpu-4nic-numa-aligned h100-4gpu-4nic-numa-unaligned; do
     echo "=== run ${run}: ${tpl} ==="
 
-    sed "s/resourceClaimTemplateName:.*/resourceClaimTemplateName: ${tpl}/" \
-      nixl-benchmark.yaml | kubectl apply -f -
+    for pod in nixl-kv-target.yaml nixl-kv-initiator.yaml; do
+      sed "s/resourceClaimTemplateName:.*/resourceClaimTemplateName: ${tpl}/" \
+        "${pod}" | kubectl apply -f -
+    done
+    kubectl apply -f nixl-kv-service.yaml
 
     kubectl wait --for=condition=Ready \
       pod/nixl-kv-target pod/nixl-kv-initiator \
@@ -115,7 +125,8 @@ for run in 1 2 3; do
     kubectl logs pod/nixl-kv-initiator | tee "results-run${run}-${tpl}.txt"
     kubectl logs pod/nixl-kv-target >> "results-run${run}-${tpl}.txt"
 
-    kubectl delete -f nixl-benchmark.yaml --ignore-not-found --wait=true
+    kubectl delete pod/nixl-kv-target pod/nixl-kv-initiator svc/nixl-kv-target \
+      --ignore-not-found --wait=true
   done
 done
 ```
@@ -142,7 +153,7 @@ The pod logs also print `nvidia-smi topo -m`. In the aligned case, the visible
 NICs should be NODE-local to the selected GPUs. In the unaligned case, the
 visible NICs should be SYS/cross-NUMA relative to the selected GPUs.
 
-The Service in `nixl-benchmark.yaml` is headless (`clusterIP: None`) so the
+The Service in `nixl-kv-service.yaml` is headless (`clusterIP: None`) so the
 initiator resolves `nixl-kv-target` to the target pod IP. NIXL's listener should
 not use a normal ClusterIP service for this side-channel connection.
 
@@ -197,11 +208,6 @@ microbenchmark bandwidth gap becomes visible as inference tail latency.
 - The example uses `pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime` and installs
   `nixl` at pod start. This avoids UCX library mixing seen with some larger
   CUDA framework images.
-- The pip package installs both `nixl-cu12` and `nixl-cu13`. The PyTorch CUDA
-  12 runtime uses the CUDA 12 wheel at import time.
-- `ibv_devices` is printed when available, but the PyTorch image does not ship
-  it by default. Missing `ibv_devices` output is not fatal; NIXL/UCX backend
-  selection is reported in the `RESULT` JSON.
 - To test a larger simulated KV handoff, edit `--block-size` in
-  `nixl-benchmark.yaml`, for example `4294967296` for 4 GiB if GPU memory
-  headroom allows it.
+  `nixl-kv-target.yaml` and `nixl-kv-initiator.yaml`, for example `4294967296`
+  for 4 GiB if GPU memory headroom allows it.

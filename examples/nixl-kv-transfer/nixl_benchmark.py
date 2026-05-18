@@ -15,12 +15,45 @@
 # limitations under the License.
 
 import argparse
+import importlib.util
 import json
 import math
+import os
+import pathlib
 import pickle
 import socket
 import sys
 import time
+
+
+def _nixl_lib_dirs():
+    dirs = []
+    for mod_name in ("nixl_cu12", "nixl_cu13"):
+        spec = importlib.util.find_spec(mod_name)
+        if spec is None or spec.origin is None:
+            continue
+        package_dir = pathlib.Path(spec.origin).resolve().parent
+        for candidate in (
+            package_dir.parent / f"{mod_name}.libs",
+            package_dir.parent / f".{mod_name}.mesonpy.libs",
+            package_dir.parent / f".{mod_name}.mesonpy.libs" / "plugins",
+        ):
+            if candidate.exists():
+                dirs.append(str(candidate))
+    return dirs
+
+
+# nixl's bundled UCX/plugin .so files live in sibling *.libs dirs that aren't
+# on the default loader path. ld.so reads LD_LIBRARY_PATH at process start, so
+# we prepend the discovered dirs and re-exec before any nixl import.
+if not os.environ.get("_NIXL_LD_BOOTSTRAPPED"):
+    extra = ":".join(_nixl_lib_dirs())
+    if extra:
+        os.environ["LD_LIBRARY_PATH"] = (
+            f"{extra}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+        )
+    os.environ["_NIXL_LD_BOOTSTRAPPED"] = "1"
+    os.execvp(sys.executable, [sys.executable, __file__, *sys.argv[1:]])
 
 import torch
 from nixl import nixl_agent, nixl_agent_config
