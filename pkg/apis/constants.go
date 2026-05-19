@@ -33,4 +33,9 @@ const (
 	// VRFTableOffset is the offset used for VRF routing tables to avoid ID collisions
 	// with reserved tables (0, 253, 254, 255) and to identify DRANET managed tables.
 	VRFTableOffset = 1000
+
+	// IPvlan addressing strategy constants.
+	IPVlanAddrNone                    = "none"
+	IPVlanAddrStatic                  = "static"
+	IPVlanAddrParentIPv6PrefixPodIPv4 = "parentIPv6PrefixPodIPv4"
 )

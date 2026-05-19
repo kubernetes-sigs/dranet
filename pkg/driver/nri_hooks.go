@@ -173,6 +173,29 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 
 		ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 
+		// Block 0: IPvlan slaves for HPN fabrics — attach each device's slaves.
+		if len(config.IPVlanSlaves) > 0 {
+			klog.V(2).Infof("RunPodSandbox creating %d IPvlan slaves for device %s", len(config.IPVlanSlaves), deviceName)
+			ipvlanNetData, err := attachIPVlanSlaves(pod, ns, config.IPVlanSlaves)
+			if err != nil {
+				return err
+			}
+			resourceClaimStatusDevice.WithConditions(
+				metav1apply.Condition().
+					WithType("Ready").
+					WithReason("IPVlanReady").
+					WithStatus(metav1.ConditionTrue).
+					WithLastTransitionTime(metav1.Now()),
+			)
+			if ipvlanNetData != nil {
+				resourceClaimStatusDevice.WithNetworkData(resourceapply.NetworkDeviceData().
+					WithInterfaceName(ipvlanNetData.InterfaceName).
+					WithHardwareAddress(ipvlanNetData.HardwareAddress).
+					WithIPs(ipvlanNetData.IPs...),
+				)
+			}
+		}
+
 		// Block 1: netdev operations — only when a network interface is present.
 		if ifName != "" {
 			if err := attachNetdevToNS(pod, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
@@ -375,6 +398,14 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 	}
 	needsRescan := false
 	for deviceName, config := range podConfig.DeviceConfigs {
+		// IPvlan slaves live in the pod netns and are automatically destroyed
+		// by the kernel when the netns is removed. No explicit cleanup needed,
+		// but skip the netdev/RDMA detach logic since those devices were never
+		// moved out of the host namespace.
+		if len(config.IPVlanSlaves) > 0 {
+			continue
+		}
+
 		// Move the RDMA device back to the host namespace BEFORE the netdev.
 		// nsDetachNetdev calls LinkSetUp on the VF in the host namespace, which
 		// triggers a NEWLINK event causing the inventory to rescan. If the RDMA

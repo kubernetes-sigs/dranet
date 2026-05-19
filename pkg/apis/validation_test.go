@@ -567,3 +567,110 @@ func TestValidateNeighborConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateIPVlanConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfg       *IPVlanConfig
+		iface     *InterfaceConfig
+		expectErr bool
+		errCount  int
+	}{
+		{
+			name:  "valid l2 bridge with parentIPv6PrefixPodIPv4",
+			cfg:   &IPVlanConfig{Mode: "l2", Flag: "bridge", Addressing: &IPVlanAddressConfig{Type: IPVlanAddrParentIPv6PrefixPodIPv4}},
+			iface: &InterfaceConfig{},
+		},
+		{
+			name:  "valid l3 with none addressing",
+			cfg:   &IPVlanConfig{Mode: "l3", Addressing: &IPVlanAddressConfig{Type: IPVlanAddrNone}},
+			iface: &InterfaceConfig{},
+		},
+		{
+			name:  "valid l3s with none addressing",
+			cfg:   &IPVlanConfig{Mode: "l3s", Addressing: &IPVlanAddressConfig{Type: IPVlanAddrNone}},
+			iface: &InterfaceConfig{},
+		},
+		{
+			name:  "valid empty mode defaults to l2",
+			cfg:   &IPVlanConfig{},
+			iface: &InterfaceConfig{},
+		},
+		{
+			name:  "valid static with addresses",
+			cfg:   &IPVlanConfig{Mode: "l2", Addressing: &IPVlanAddressConfig{Type: IPVlanAddrStatic}},
+			iface: &InterfaceConfig{Addresses: []string{"10.0.0.1/24"}},
+		},
+		{
+			name:      "invalid mode",
+			cfg:       &IPVlanConfig{Mode: "ipv6"},
+			iface:     &InterfaceConfig{},
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid flag",
+			cfg:       &IPVlanConfig{Flag: "unknown"},
+			iface:     &InterfaceConfig{},
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "flag on l3 mode",
+			cfg:       &IPVlanConfig{Mode: "l3", Flag: "bridge"},
+			iface:     &InterfaceConfig{},
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "static without addresses",
+			cfg:       &IPVlanConfig{Addressing: &IPVlanAddressConfig{Type: IPVlanAddrStatic}},
+			iface:     &InterfaceConfig{},
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "unknown addressing type",
+			cfg:       &IPVlanConfig{Addressing: &IPVlanAddressConfig{Type: "unknown"}},
+			iface:     &InterfaceConfig{},
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "multiple errors: invalid mode + invalid flag + flag on non-l2",
+			cfg:       &IPVlanConfig{Mode: "bad", Flag: "also-bad"},
+			iface:     &InterfaceConfig{},
+			expectErr: true,
+			errCount:  3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := validateIPVlanConfig(tt.cfg, tt.iface, "interface.ipvlan")
+			if (len(errs) > 0) != tt.expectErr {
+				t.Errorf("validateIPVlanConfig() got errors: %v, want error=%v", errs, tt.expectErr)
+			}
+			if tt.expectErr && len(errs) != tt.errCount {
+				t.Errorf("validateIPVlanConfig() got %d errors (%v), want %d", len(errs), errs, tt.errCount)
+			}
+		})
+	}
+}
+
+func TestValidateRDMAOnlyConfig_RejectsIPVlan(t *testing.T) {
+	raw := newRawExtensionFromString(t, `{"interface":{"ipvlan":{"mode":"l2"}}}`)
+	errs := ValidateRDMAOnlyConfig(raw)
+	if len(errs) == 0 {
+		t.Fatal("expected error for IPvlan on RDMA-only device, got none")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "interface configuration is not supported for RDMA-only devices") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'interface configuration is not supported' error, got: %v", errs)
+	}
+}

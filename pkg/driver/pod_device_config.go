@@ -60,6 +60,13 @@ type DeviceConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+
+	// IPVlanSlaves describes IPvlan sub-interfaces to create in the Pod's
+	// network namespace. When non-empty, the driver creates IPvlan slaves
+	// from parent netdevs instead of moving the host netdev. This is used
+	// for HPN fabrics where the parent netdev must remain in the host namespace.
+	// IPvlan handling (L1) is independent of RDMA link handling (L2).
+	IPVlanSlaves []IPVlanSlaveConfig `json:"ipvlanSlaves,omitempty"`
 }
 
 // RDMAConfig contains parameters for setting up an RDMA device associated
@@ -84,6 +91,34 @@ type LinuxDevice struct {
 	FileMode uint32 `json:"fileMode"`
 	UID      uint32 `json:"uid"`
 	GID      uint32 `json:"gid"`
+}
+
+// IPVlanSlaveConfig describes a single IPvlan slave interface to be created
+// in the Pod's network namespace. The parent netdev remains in the host
+// namespace.
+type IPVlanSlaveConfig struct {
+	ParentNetdev   string `json:"parentNetdev"`
+	KernelMode     uint16 `json:"kernelMode"`
+	KernelFlag     uint16 `json:"kernelFlag"`
+	AddressingType string `json:"addressingType"`
+
+	// IPv6Prefix and PrefixLen are only populated when AddressingType == apis.IPVlanAddrParentIPv6PrefixPodIPv4.
+	IPv6Prefix [12]byte `json:"ipv6Prefix,omitempty"`
+	PrefixLen  int      `json:"prefixLen,omitempty"`
+
+	// StaticAddresses are pre-resolved addresses for AddressingType == "static".
+	StaticAddresses []string `json:"staticAddresses,omitempty"`
+
+	TargetName string `json:"targetName"`
+	TempName   string `json:"tempName"`
+
+	Routes           []apis.RouteConfig    `json:"routes,omitempty"`
+	GatewayNeighbors []apis.NeighborConfig `json:"gatewayNeighbors,omitempty"`
+
+	// ConfiguredRoutes and ConfiguredNeighbors carry user-specified routes and
+	// neighbors from the NetworkConfig. Applied after addressing for all types.
+	ConfiguredRoutes    []apis.RouteConfig    `json:"configuredRoutes,omitempty"`
+	ConfiguredNeighbors []apis.NeighborConfig `json:"configuredNeighbors,omitempty"`
 }
 
 // Checkpointer is the persistence interface for the PodConfigStore.

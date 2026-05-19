@@ -181,6 +181,42 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
 	}
 
+	if cfg.IPVlan != nil {
+		allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlan, cfg, fieldPath+".ipvlan")...)
+	}
+
+	return allErrors
+}
+
+func validateIPVlanConfig(cfg *IPVlanConfig, iface *InterfaceConfig, fieldPath string) (allErrors []error) {
+	validModes := map[string]bool{"": true, "l2": true, "l3": true, "l3s": true}
+	if !validModes[cfg.Mode] {
+		allErrors = append(allErrors, fmt.Errorf("%s.mode: unsupported value %q, must be one of: l2, l3, l3s", fieldPath, cfg.Mode))
+	}
+
+	effectiveMode := cfg.Mode
+	if effectiveMode == "" {
+		effectiveMode = "l2"
+	}
+
+	validFlags := map[string]bool{"": true, "bridge": true, "private": true, "vepa": true}
+	if !validFlags[cfg.Flag] {
+		allErrors = append(allErrors, fmt.Errorf("%s.flag: unsupported value %q, must be one of: bridge, private, vepa", fieldPath, cfg.Flag))
+	}
+	if cfg.Flag != "" && effectiveMode != "l2" {
+		allErrors = append(allErrors, fmt.Errorf("%s.flag: only valid in l2 mode, got mode=%q", fieldPath, effectiveMode))
+	}
+
+	if cfg.Addressing != nil {
+		validTypes := map[string]bool{IPVlanAddrNone: true, IPVlanAddrStatic: true, IPVlanAddrParentIPv6PrefixPodIPv4: true}
+		if !validTypes[cfg.Addressing.Type] {
+			allErrors = append(allErrors, fmt.Errorf("%s.addressing.type: unsupported value %q, must be one of: %s, %s, %s", fieldPath, cfg.Addressing.Type, IPVlanAddrNone, IPVlanAddrStatic, IPVlanAddrParentIPv6PrefixPodIPv4))
+		}
+		if cfg.Addressing.Type == IPVlanAddrStatic && len(iface.Addresses) == 0 {
+			allErrors = append(allErrors, fmt.Errorf("%s.addressing.type=static requires interface.addresses to be set", fieldPath))
+		}
+	}
+
 	return allErrors
 }
 
@@ -300,7 +336,8 @@ func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
 		config.Interface.MTU != nil || config.Interface.HardwareAddr != nil ||
 		config.Interface.DHCP != nil || config.Interface.GSOMaxSize != nil ||
 		config.Interface.GROMaxSize != nil || config.Interface.GSOIPv4MaxSize != nil ||
-		config.Interface.GROIPv4MaxSize != nil || config.Interface.DisableEBPFPrograms != nil {
+		config.Interface.GROIPv4MaxSize != nil || config.Interface.DisableEBPFPrograms != nil ||
+		config.Interface.IPVlan != nil {
 		allErrors = append(allErrors, fmt.Errorf("interface configuration is not supported for RDMA-only devices (no network interface present)"))
 	}
 	if len(config.Routes) > 0 {

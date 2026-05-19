@@ -256,6 +256,71 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			continue
 		}
 
+		// IPvlan path: cloud provider signals that the parent netdev must remain
+		// in the host namespace. Instead of moving the netdev, IPvlan slaves are
+		// created during RunPodSandbox.
+		if netconf.Interface.IPVlan != nil {
+			klog.V(2).Infof("IPvlan mode for device %s (mode=%s, flag=%s)", result.Device, netconf.Interface.IPVlan.Mode, netconf.Interface.IPVlan.Flag)
+
+			ifName, err := np.netdb.GetNetInterfaceName(result.Device)
+			if err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to get network interface name for device %s: %v", result.Device, err))
+				continue
+			}
+
+			slave, err := computeIPVlanSlave(nlHandle, ifName, netconf.Interface.IPVlan)
+			if err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to compute IPvlan slave for device %s (%s): %v", result.Device, ifName, err))
+				continue
+			}
+			if netconf.Interface.Name != "" {
+				slave.TargetName = netconf.Interface.Name
+			}
+			if slave.AddressingType == apis.IPVlanAddrStatic {
+				slave.StaticAddresses = netconf.Interface.Addresses
+			}
+			slave.ConfiguredRoutes = append(slave.ConfiguredRoutes, netconf.Routes...)
+			slave.ConfiguredNeighbors = append(slave.ConfiguredNeighbors, netconf.Neighbors...)
+			deviceCfg.IPVlanSlaves = []IPVlanSlaveConfig{*slave}
+
+			// Discover RDMA devices associated with this parent (decoupled from IPvlan).
+			link, err := nlHandle.LinkByName(ifName)
+			if err != nil {
+				klog.Warningf("failed to get link for RDMA discovery on %s: %v", ifName, err)
+			} else {
+				rdmaDevs := discoverRDMADevices(nlHandle, ifName, link.Attrs().Index)
+				if len(rdmaDevs) > 0 {
+					if !np.rdmaSharedMode {
+						errorList = append(errorList, fmt.Errorf("IPvlan device %s has RDMA but system is in exclusive RDMA mode; IPvlan requires shared mode for RDMA", result.Device))
+						continue
+					}
+					ipvlanCharDevs := sets.New[string]()
+					for _, rdmaDevName := range rdmaDevs {
+						buildRDMAConfig(rdmaDevName, ipvlanCharDevs)
+					}
+					if ipvlanCharDevs.Len() > 0 {
+						deviceCfg.RDMADevice = RDMAConfig{DevChars: make([]LinuxDevice, 0, ipvlanCharDevs.Len())}
+						for _, devpath := range ipvlanCharDevs.UnsortedList() {
+							dev, err := GetDeviceInfo(devpath)
+							if err != nil {
+								klog.Warningf("failed to get device info for %s: %v", devpath, err)
+								continue
+							}
+							deviceCfg.RDMADevice.DevChars = append(deviceCfg.RDMADevice.DevChars, dev)
+						}
+					}
+				}
+			}
+
+			for _, uid := range podUIDs {
+				if err := np.podConfigStore.SetDeviceConfig(uid, result.Device, deviceCfg); err != nil {
+					errorList = append(errorList, fmt.Errorf("failed to persist device config for pod %s device %s: %v", uid, result.Device, err))
+				}
+			}
+			klog.V(4).Infof("IPvlan claim resources for pods %v : %#v", podUIDs, deviceCfg)
+			continue
+		}
+
 		ifName, err := np.netdb.GetNetInterfaceName(result.Device)
 		if err != nil {
 			errorList = append(errorList, fmt.Errorf("failed to get network interface name for device %s: %v", result.Device, err))

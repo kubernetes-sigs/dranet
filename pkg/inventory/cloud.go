@@ -27,6 +27,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/alibaba"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/aws"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/azure"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/gce"
@@ -36,11 +37,12 @@ import (
 type CloudProviderHint string
 
 const (
-	CloudProviderHintGCE   CloudProviderHint = "GCE"
-	CloudProviderHintAWS   CloudProviderHint = "AWS"
-	CloudProviderHintAzure CloudProviderHint = "AZURE"
-	CloudProviderHintOKE   CloudProviderHint = "OKE"
-	CloudProviderHintNone  CloudProviderHint = "NONE"
+	CloudProviderHintGCE     CloudProviderHint = "GCE"
+	CloudProviderHintAWS     CloudProviderHint = "AWS"
+	CloudProviderHintAzure   CloudProviderHint = "AZURE"
+	CloudProviderHintOKE     CloudProviderHint = "OKE"
+	CloudProviderHintAlibaba CloudProviderHint = "ALIBABA"
+	CloudProviderHintNone    CloudProviderHint = "NONE"
 )
 
 func discoverCloudProvider(ctx context.Context) CloudProviderHint {
@@ -49,8 +51,9 @@ func discoverCloudProvider(ctx context.Context) CloudProviderHint {
 			return metadata.OnGCE()
 		},
 		CloudProviderHintAWS: aws.OnAWS,
-		CloudProviderHintAzure: azure.OnAzure,
-		CloudProviderHintOKE:   oke.OnOKE,
+		CloudProviderHintAzure:   azure.OnAzure,
+		CloudProviderHintOKE:     oke.OnOKE,
+		CloudProviderHintAlibaba: alibaba.OnAlibaba,
 	}
 
 	for hint, discoverer := range discoverers {
@@ -71,10 +74,11 @@ func getInstanceProperties(ctx context.Context, cloudProviderHint CloudProviderH
 	}
 
 	providers := map[CloudProviderHint]func(context.Context) (cloudprovider.CloudInstance, error){
-		CloudProviderHintGCE:   gce.GetInstance,
-		CloudProviderHintAWS:   aws.GetInstance,
-		CloudProviderHintAzure: azure.GetInstance,
-		CloudProviderHintOKE:   oke.GetInstance,
+		CloudProviderHintGCE:     gce.GetInstance,
+		CloudProviderHintAWS:     aws.GetInstance,
+		CloudProviderHintAzure:   azure.GetInstance,
+		CloudProviderHintOKE:     oke.GetInstance,
+		CloudProviderHintAlibaba: alibaba.GetInstance,
 	}
 
 	provider, ok := providers[cloudProviderHint]
