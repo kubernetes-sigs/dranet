@@ -86,6 +86,13 @@ type InterfaceConfig struct {
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.
 	VRF *VRFConfig `json:"vrf,omitempty"`
+
+	// IPVlan, when set, instructs the driver to create an IPvlan slave interface
+	// from the parent netdev instead of moving the host netdev into the Pod's
+	// network namespace. The parent netdev remains in the host namespace.
+	// This is used for HPN (High-Performance Networking) fabrics where the
+	// parent netdev must retain its identity and address on the fabric.
+	IPVlan *IPVlanConfig `json:"ipvlan,omitempty"`
 }
 
 // VRFConfig represents the configuration for a Virtual Routing and Forwarding domain.
@@ -98,6 +105,32 @@ type VRFConfig struct {
 	// If not specified, a unique table ID will be automatically assigned (typically interface index + 100).
 	// Common reserved tables: 255 (local), 254 (main), 253 (default).
 	Table *int `json:"table,omitempty"`
+}
+
+// IPVlanConfig specifies that the driver should create an IPvlan slave interface
+// rather than moving the host netdev into the Pod namespace.
+type IPVlanConfig struct {
+	// Mode is the kernel IPvlan mode: "l2" (default), "l3", or "l3s".
+	Mode string `json:"mode,omitempty"`
+	// Flag is the kernel IPvlan flag, only applicable in L2 mode:
+	// "bridge" (default for L2), "private", or "vepa".
+	Flag string `json:"flag,omitempty"`
+	// Addressing controls how IP addresses are assigned to the slave.
+	// When nil, defaults to IPVlanAddrParentIPv6PrefixPodIPv4 for backward compatibility.
+	Addressing *IPVlanAddressConfig `json:"addressing,omitempty"`
+	// CopyRoutesFromParent, when true, copies IPv6 routes from the parent
+	// interface into the pod namespace.
+	CopyRoutesFromParent *bool `json:"copyRoutesFromParent,omitempty"`
+	// CopyNeighborsFromParent, when true, pre-resolves gateway neighbors
+	// from the parent's NDP table into the pod namespace.
+	CopyNeighborsFromParent *bool `json:"copyNeighborsFromParent,omitempty"`
+}
+
+// IPVlanAddressConfig describes how IP addresses are assigned to an IPvlan slave.
+type IPVlanAddressConfig struct {
+	// Type controls the addressing strategy.
+	// Supported values: IPVlanAddrNone, IPVlanAddrStatic, IPVlanAddrParentIPv6PrefixPodIPv4.
+	Type string `json:"type"`
 }
 
 // RouteConfig represents a network route configuration.
