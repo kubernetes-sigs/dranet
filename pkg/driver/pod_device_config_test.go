@@ -22,6 +22,7 @@ import (
 	"sync"
 	"testing"
 
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/dranet/pkg/apis"
 )
@@ -405,5 +406,46 @@ func TestPodConfigStore_NoDuplicateDevices(t *testing.T) {
 	}
 	if _, ok := podConfigs.DeviceConfigs[deviceName2]; !ok {
 		t.Errorf("Device %s not found in pod configs", deviceName2)
+	}
+}
+
+func TestPodConfigStore_GetAllocatedDevices(t *testing.T) {
+	store := mustNewPodConfigStore()
+	podUID1 := types.UID("pod-1")
+	podUID2 := types.UID("pod-2")
+
+	// Set config without device snapshot
+	err := store.SetDeviceConfig(podUID1, "eth0", DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "default", Name: "claim-1"},
+	})
+	if err != nil {
+		t.Fatalf("failed to set device config: %v", err)
+	}
+
+	// Verify it returns nothing if no device snapshots are stored
+	allocated := store.GetAllocatedDevices()
+	if len(allocated) != 0 {
+		t.Errorf("expected 0 allocated devices, got %d", len(allocated))
+	}
+
+	// Set config with device snapshot
+	snapDev := resourceapi.Device{
+		Name: "0000:c0:14.0",
+	}
+	err = store.SetDeviceConfig(podUID2, "0000:c0:14.0", DeviceConfig{
+		Claim:  types.NamespacedName{Namespace: "default", Name: "claim-2"},
+		Device: &snapDev,
+	})
+	if err != nil {
+		t.Fatalf("failed to set device config: %v", err)
+	}
+
+	// Verify we get exactly the snapshot device
+	allocated = store.GetAllocatedDevices()
+	if len(allocated) != 1 {
+		t.Fatalf("expected 1 allocated device, got %d", len(allocated))
+	}
+	if allocated[0].Name != "0000:c0:14.0" {
+		t.Errorf("expected device name '0000:c0:14.0', got %s", allocated[0].Name)
 	}
 }

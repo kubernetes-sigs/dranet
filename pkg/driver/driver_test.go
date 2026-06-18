@@ -48,6 +48,7 @@ func (m *fakePluginHelper) RegistrationStatus() *registerapi.RegistrationStatus 
 type fakeInventoryDB struct {
 	resources           chan []resourcev1.Device
 	rescanCalls         atomic.Int32
+	GetDeviceFunc       func(deviceName string) (resourcev1.Device, bool)
 	GetDeviceConfigFunc func(deviceName string) (*apis.NetworkConfig, bool)
 	GetNetInterfaceNameFunc func(deviceName string) (string, error)
 	IsIBOnlyDeviceFunc      func(deviceName string) bool
@@ -65,6 +66,13 @@ func (m *fakeInventoryDB) Run(_ context.Context) error { return nil }
 
 func (m *fakeInventoryDB) GetResources(_ context.Context) <-chan []resourcev1.Device {
 	return m.resources
+}
+
+func (m *fakeInventoryDB) GetDevice(deviceName string) (resourcev1.Device, bool) {
+	if m.GetDeviceFunc != nil {
+		return m.GetDeviceFunc(deviceName)
+	}
+	return resourcev1.Device{}, false
 }
 
 func (m *fakeInventoryDB) GetNetInterfaceName(deviceName string) (string, error) {

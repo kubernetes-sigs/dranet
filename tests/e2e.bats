@@ -655,3 +655,32 @@ EOF
   run kubectl exec -it $POD_1 -- ping -I eth1 -c 1 10.10.20.1
   assert_success
 }
+
+@test "allocated device remains present in ResourceSlice" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  local DUMMY_IFACE="dummy0"
+
+  # 1. Create a dummy interface on the worker node
+  docker exec "$NODE_NAME" bash -c "ip link add $DUMMY_IFACE type dummy"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev $DUMMY_IFACE"
+
+  # 2. Wait for it to be discovered and published to the ResourceSlice
+  sleep 5
+  run kubectl get resourceslices -o jsonpath='{.items[*].spec.devices[*].name}'
+  assert_success
+  assert_output --partial "$DUMMY_IFACE"
+
+  # 3. Apply the resource claim (allocating dummy0) and start the Pod
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml
+  kubectl wait --timeout=30s --for=condition=ready pods -l app=pod
+
+  # 4. Verify that the allocated dummy0 device IS STILL visible in the published ResourceSlice
+  run kubectl get resourceslices -o jsonpath='{.items[*].spec.devices[*].name}'
+  assert_success
+  assert_output --partial "$DUMMY_IFACE"
+
+  # 5. Clean up Pod & Claim
+  kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml --ignore-not-found
+  kubectl wait --for delete pod/pod1 --timeout=30s
+}
