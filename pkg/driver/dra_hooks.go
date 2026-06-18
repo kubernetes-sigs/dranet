@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -61,13 +62,21 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 		case devices := <-np.netdb.GetResources(ctx):
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(devices), formatDeviceNames(devices, 15))
 			devices = filter.FilterDevices(np.celProgram, devices)
-			klog.V(3).Infof("After filtering, publishing %d devices in ResourceSlice(s): %s", len(devices), formatDeviceNames(devices, 15))
 
-			np.publishResourcesPrometheusMetrics(devices)
+			// Fetch allocated devices from BoltDB store and merge
+			var allocated []resourceapi.Device
+			if np.podConfigStore != nil {
+				allocated = np.podConfigStore.GetAllocatedDevices()
+			}
+			merged := mergeDevices(devices, allocated)
+
+			klog.V(3).Infof("After filtering and database merging, publishing %d devices in ResourceSlice(s): %s", len(merged), formatDeviceNames(merged, 15))
+
+			np.publishResourcesPrometheusMetrics(merged)
 
 			resources := resourceslice.DriverResources{
 				Pools: map[string]resourceslice.Pool{
-					np.nodeName: {Slices: []resourceslice.Slice{{Devices: devices}}},
+					np.nodeName: {Slices: []resourceslice.Slice{{Devices: merged}}},
 				},
 			}
 			err := np.draPlugin.PublishResources(ctx, resources)
@@ -433,6 +442,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				klog.Infof("error unpinning ebpf programs for %s : %v", ifName, err)
 			}
 		}
+		// Query the local discovery database (netdb) for the card's clean attributes
+		device, ok := np.netdb.GetDevice(result.Device)
+		if ok {
+			deviceCfg.Device = &device
+		} else {
+			klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
+		}
 
 		if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
 			errorList = append(errorList, fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err))
@@ -669,4 +685,59 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 		mergedConf = apis.MergeNetworkConfig(mergedConf, profileConf)
 	}
 	return mergedConf, nil
+}
+
+func mergeDevices(available, allocated []resourceapi.Device) []resourceapi.Device {
+	merged := make(map[string]resourceapi.Device)
+
+	// 1. Initial Load from Host Scan (Ground Truth for Hardware Presence)
+	for _, dev := range available {
+		merged[dev.Name] = dev
+	}
+
+	for _, dev := range allocated {
+		liveDev, exists := merged[dev.Name]
+
+		// 2. Safety Check for Physical Devices (PCI-based)
+		// We only merge the snapshot if the card is physically present on the bus.
+		if isPhysicalDevice(dev) {
+			// If missing from host scan, the hardware is dead or driver crashed.
+			// Do not publish a "Ghost" device.
+			if !exists {
+				continue
+			}
+
+			// If the host scan already sees a valid interface name,
+			// the device has returned to the host. Do not overwrite with
+			// a degraded record from the database.
+			if hasHostInterface(liveDev) {
+				continue
+			}
+		}
+
+		// 3. Best-Effort Merge
+		// We restore the snapshot attributes directly to the slice list.
+		merged[dev.Name] = dev
+	}
+
+	// Convert map to slice and sort by Name (PCI Address)
+	result := make([]resourceapi.Device, 0, len(merged))
+	for _, dev := range merged {
+		result = append(result, dev)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
+	return result
+}
+
+func isPhysicalDevice(dev resourceapi.Device) bool {
+	_, isPCI := dev.Attributes[apis.AttrPCIAddress]
+	return isPCI
+}
+
+func hasHostInterface(dev resourceapi.Device) bool {
+	ifAttr, ok := dev.Attributes[apis.AttrInterfaceName]
+	return ok && ifAttr.StringValue != nil && *ifAttr.StringValue != ""
 }

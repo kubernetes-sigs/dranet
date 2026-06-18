@@ -853,3 +853,110 @@ func TestGetDeviceNetworkConfigWithWebhook(t *testing.T) {
 		})
 	}
 }
+
+func TestMergeDevices(t *testing.T) {
+	mockAttr := func(val string) resourcev1.DeviceAttribute {
+		return resourcev1.DeviceAttribute{
+			StringValue: &val,
+		}
+	}
+
+	pciDev := resourcev1.Device{
+		Name: "0000:c0:14.0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			resourcev1.QualifiedName(apis.AttrPCIAddress): mockAttr("0000:c0:14.0"),
+		},
+	}
+
+	pciDevDegraded := resourcev1.Device{
+		Name: "0000:c0:14.0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			resourcev1.QualifiedName(apis.AttrPCIAddress): mockAttr("0000:c0:14.0"),
+		},
+	}
+
+	pciDevSnapshot := resourcev1.Device{
+		Name: "0000:c0:14.0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			resourcev1.QualifiedName(apis.AttrPCIAddress):    mockAttr("0000:c0:14.0"),
+			resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("eth1"),
+			resourcev1.QualifiedName(apis.AttrMTU):           mockAttr("1500"),
+		},
+	}
+
+	virtualDevSnapshot := resourcev1.Device{
+		Name: "ipvlan-dev",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("ipvlan-dev"),
+			resourcev1.QualifiedName(apis.AttrMTU):           mockAttr("1500"),
+		},
+	}
+
+	tests := []struct {
+		name      string
+		available []resourcev1.Device
+		allocated []resourcev1.Device
+		expected  []resourcev1.Device
+	}{
+		{
+			name:      "Available only",
+			available: []resourcev1.Device{pciDev},
+			allocated: nil,
+			expected:  []resourcev1.Device{pciDev},
+		},
+		{
+			name:      "Physical device merge",
+			available: []resourcev1.Device{pciDevDegraded},
+			allocated: []resourcev1.Device{pciDevSnapshot},
+			expected:  []resourcev1.Device{pciDevSnapshot},
+		},
+		{
+			name:      "Virtual device preserve",
+			available: nil,
+			allocated: []resourcev1.Device{virtualDevSnapshot},
+			expected:  []resourcev1.Device{virtualDevSnapshot},
+		},
+		{
+			name:      "Physical device missing from host (Ghost device)",
+			available: nil,
+			allocated: []resourcev1.Device{pciDevSnapshot},
+			expected:  []resourcev1.Device{},
+		},
+		{
+			name: "Physical device back on host (Zombie override)",
+			available: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    mockAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("eth1"), // back on host!
+				},
+			}},
+			allocated: []resourcev1.Device{pciDevSnapshot},
+			expected: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    mockAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("eth1"),
+				},
+			}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := mergeDevices(tc.available, tc.allocated)
+			if len(result) != len(tc.expected) {
+				t.Fatalf("expected %d devices, got %d", len(tc.expected), len(result))
+			}
+			for i, dev := range result {
+				if dev.Name != tc.expected[i].Name {
+					t.Errorf("expected device %d name to be %s, got %s", i, tc.expected[i].Name, dev.Name)
+				}
+				// Verify attributes equality
+				if len(dev.Attributes) != len(tc.expected[i].Attributes) {
+					t.Errorf("device %d attribute mismatch: expected %v, got %v", i, tc.expected[i].Attributes, dev.Attributes)
+				}
+			}
+		})
+	}
+}
