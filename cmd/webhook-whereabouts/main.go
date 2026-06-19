@@ -58,11 +58,6 @@ func (s *Server) GetDeviceConfig(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("{}"))
 }
 
-// maxCNIIfnameLen is the maximum interface-name length accepted by the CNI
-// runtime (IFNAMSIZ-1). Names longer than this are rejected by CNI's
-// interface-name validation.
-const maxCNIIfnameLen = 15
-
 // pciNamePrefix is the prefix dranet prepends to a normalized PCI address
 // (pkg/names.NormalizePCIAddress: "0000:8a:00.0" -> "pci-0000-8a-00-0").
 const pciNamePrefix = "pci-"
@@ -103,7 +98,7 @@ func cniIfname(req webhook.ProfileRequest) string {
 // interface-name validation. It mirrors github.com/containernetworking/cni
 // pkg/utils.ValidateInterfaceName.
 func isValidCNIIfname(s string) bool {
-	if len(s) == 0 || len(s) > maxCNIIfnameLen {
+	if len(s) == 0 || len(s) > apis.MaxInterfaceNameLen {
 		return false
 	}
 	if s == "." || s == ".." {
