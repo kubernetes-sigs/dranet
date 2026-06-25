@@ -48,9 +48,9 @@ type PodConfig struct {
 type DeviceConfig struct {
 	Claim types.NamespacedName `json:"claim"`
 
-	// Device contains the original discovered ResourceSlice Device structure,
+	// DeviceSnapshot contains the original discovered ResourceSlice Device structure,
 	// which includes the device's identifying attributes and capacity.
-	Device *resourceapi.Device `json:"device,omitempty"`
+	DeviceSnapshot *resourceapi.Device `json:"deviceSnapshot,omitempty"`
 
 	// NetworkInterfaceConfigInHost is the config of the network interface as
 	// seen in the host's network namespace BEFORE it was moved to the pod's
@@ -324,8 +324,8 @@ func (s *PodConfigStore) GetAllocatedDevices() []resourceapi.Device {
 	var allocated []resourceapi.Device
 	for _, podConfig := range s.configs {
 		for _, config := range podConfig.DeviceConfigs {
-			if config.Device != nil {
-				allocated = append(allocated, *config.Device)
+			if config.DeviceSnapshot != nil {
+				allocated = append(allocated, *config.DeviceSnapshot)
 			}
 		}
 	}
