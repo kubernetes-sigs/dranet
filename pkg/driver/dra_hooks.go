@@ -61,7 +61,6 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 		select {
 		case devices := <-np.netdb.GetResources(ctx):
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(devices), formatDeviceNames(devices, 15))
-			devices = filter.FilterDevices(np.celProgram, devices)
 
 			// Fetch allocated devices from BoltDB store and merge
 			var allocated []resourceapi.Device
@@ -70,13 +69,16 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 			}
 			merged := mergeDevices(devices, allocated)
 
-			klog.V(3).Infof("After filtering and database merging, publishing %d devices in ResourceSlice(s): %s", len(merged), formatDeviceNames(merged, 15))
+			// Apply filtering on the merged set of devices
+			filtered := filter.FilterDevices(np.celProgram, merged)
 
-			np.publishResourcesPrometheusMetrics(merged)
+			klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
+
+			np.publishResourcesPrometheusMetrics(filtered)
 
 			resources := resourceslice.DriverResources{
 				Pools: map[string]resourceslice.Pool{
-					np.nodeName: {Slices: []resourceslice.Slice{{Devices: merged}}},
+					np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
 				},
 			}
 			err := np.draPlugin.PublishResources(ctx, resources)
@@ -232,12 +234,21 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		netconf := *mergedConf
 
 		klog.V(4).Infof("PrepareResourceClaim %s/%s final Configuration %#v", claim.Namespace, claim.Name, netconf)
+		// Query the local discovery database (netdb) for the card's clean attributes
+		var deviceSnapshot *resourceapi.Device
+		if device, ok := np.netdb.GetDevice(result.Device); ok {
+			deviceSnapshot = &device
+		} else {
+			klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
+		}
+
 		deviceCfg := DeviceConfig{
 			Claim: types.NamespacedName{
 				Namespace: claim.Namespace,
 				Name:      claim.Name,
 			},
 			NetworkInterfaceConfigInPod: netconf,
+			DeviceSnapshot:              deviceSnapshot,
 		}
 
 		// Store early to guarantee profile cleanup on subsequent failures within this loop.
@@ -441,13 +452,6 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			if err != nil {
 				klog.Infof("error unpinning ebpf programs for %s : %v", ifName, err)
 			}
-		}
-		// Query the local discovery database (netdb) for the card's clean attributes
-		device, ok := np.netdb.GetDevice(result.Device)
-		if ok {
-			deviceCfg.Device = &device
-		} else {
-			klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
 		}
 
 		if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
@@ -690,54 +694,55 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 func mergeDevices(available, allocated []resourceapi.Device) []resourceapi.Device {
 	merged := make(map[string]resourceapi.Device)
 
-	// 1. Initial Load from Host Scan (Ground Truth for Hardware Presence)
+	// 1. Initial Load from Host Scan (Live available devices)
 	for _, dev := range available {
 		merged[dev.Name] = dev
 	}
 
+	// 2. Merge allocated devices
 	for _, dev := range allocated {
 		liveDev, exists := merged[dev.Name]
-
-		// 2. Safety Check for Physical Devices (PCI-based)
-		// We only merge the snapshot if the card is physically present on the bus.
-		if isPhysicalDevice(dev) {
-			// If missing from host scan, the hardware is dead or driver crashed.
-			// Do not publish a "Ghost" device.
-			if !exists {
-				continue
-			}
-
-			// If the host scan already sees a valid interface name,
-			// the device has returned to the host. Do not overwrite with
-			// a degraded record from the database.
-			if hasHostInterface(liveDev) {
-				continue
-			}
+		if !exists {
+			// Device is completely missing from host (e.g. virtual interface in pod namespace).
+			// Use the snapshot as-is.
+			merged[dev.Name] = dev
+			continue
 		}
 
-		// 3. Best-Effort Merge
-		// We restore the snapshot attributes directly to the slice list.
-		merged[dev.Name] = dev
+		// Device is in both (e.g. physical device). Merge them, giving precedence to liveDev.
+		merged[dev.Name] = mergeDeviceStructs(liveDev, dev)
 	}
 
-	// Convert map to slice and sort by Name (PCI Address)
+	// 3. Convert map to sorted slice
 	result := make([]resourceapi.Device, 0, len(merged))
 	for _, dev := range merged {
 		result = append(result, dev)
 	}
-
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Name < result[j].Name
 	})
 	return result
 }
 
-func isPhysicalDevice(dev resourceapi.Device) bool {
-	_, isPCI := dev.Attributes[apis.AttrPCIAddress]
-	return isPCI
-}
+func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
+	merged := snap
 
-func hasHostInterface(dev resourceapi.Device) bool {
-	ifAttr, ok := dev.Attributes[apis.AttrInterfaceName]
-	return ok && ifAttr.StringValue != nil && *ifAttr.StringValue != ""
+	if merged.Attributes == nil {
+		merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
+	}
+	if merged.Capacity == nil {
+		merged.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity)
+	}
+
+	// Overwrite with live attributes (precedence to live data)
+	for k, v := range live.Attributes {
+		merged.Attributes[k] = v
+	}
+
+	// Overwrite with live capacities (precedence to live data)
+	for k, v := range live.Capacity {
+		merged.Capacity[k] = v
+	}
+
+	return merged
 }

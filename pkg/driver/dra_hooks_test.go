@@ -920,7 +920,7 @@ func TestMergeDevices(t *testing.T) {
 			name:      "Physical device missing from host (Ghost device)",
 			available: nil,
 			allocated: []resourcev1.Device{pciDevSnapshot},
-			expected:  []resourcev1.Device{},
+			expected:  []resourcev1.Device{pciDevSnapshot},
 		},
 		{
 			name: "Physical device back on host (Zombie override)",
@@ -932,13 +932,7 @@ func TestMergeDevices(t *testing.T) {
 				},
 			}},
 			allocated: []resourcev1.Device{pciDevSnapshot},
-			expected: []resourcev1.Device{{
-				Name: "0000:c0:14.0",
-				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-					resourcev1.QualifiedName(apis.AttrPCIAddress):    mockAttr("0000:c0:14.0"),
-					resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("eth1"),
-				},
-			}},
+			expected:  []resourcev1.Device{pciDevSnapshot},
 		},
 	}
 

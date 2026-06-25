@@ -434,7 +434,7 @@ func TestPodConfigStore_GetAllocatedDevices(t *testing.T) {
 	}
 	err = store.SetDeviceConfig(podUID2, "0000:c0:14.0", DeviceConfig{
 		Claim:  types.NamespacedName{Namespace: "default", Name: "claim-2"},
-		Device: &snapDev,
+		DeviceSnapshot: &snapDev,
 	})
 	if err != nil {
 		t.Fatalf("failed to set device config: %v", err)
