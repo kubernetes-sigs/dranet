@@ -21,11 +21,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"unicode"
 
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	types100 "github.com/containernetworking/cni/pkg/types/100"
@@ -55,6 +58,60 @@ func (s *Server) GetDeviceConfig(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("{}"))
 }
 
+// pciNamePrefix is the prefix dranet prepends to a normalized PCI address
+// (pkg/names.NormalizePCIAddress: "0000:8a:00.0" -> "pci-0000-8a-00-0").
+const pciNamePrefix = "pci-"
+
+// cniIfname returns the CNI_IFNAME to pass to the whereabouts IPAM plugin.
+//
+// whereabouts matches a reservation for release on (CNI_CONTAINERID, CNI_IFNAME)
+// but never creates an interface from it, so the value just needs to be (1) a
+// valid CNI interface name and (2) identical at ADD and DEL, else the DEL fails
+// to match and the IP leaks. We derive it from the stable Device.Name rather
+// than the kernel ifName (which is mutable across netns moves) so (2) holds by
+// construction, and keep it human-readable so leaked reservations can be traced
+// back during manual pool cleanup:
+//
+//   - already valid (short, non-PCI names): used verbatim;
+//   - PCI names exceed IFNAMSIZ only due to the "pci-" prefix, so we strip it
+//     ("pci-0000-27-00-2" -> "0000-27-00-2"), re-validating the result;
+//   - anything still invalid (e.g. base32-encoded names, already unreadable):
+//     a deterministic hash.
+func cniIfname(req webhook.ProfileRequest) string {
+	name := req.Device.Name
+	if isValidCNIIfname(name) {
+		return name
+	}
+	// Re-validate after stripping: never emit an over-length name on the
+	// assumption that dropping the prefix made it fit.
+	if trimmed := strings.TrimPrefix(name, pciNamePrefix); trimmed != name && isValidCNIIfname(trimmed) {
+		return trimmed
+	}
+	// "dra" + 8 hex digits (FNV-1a/32) = 11 bytes: always valid, deterministic
+	// for a given device identifier, and distinct per device within a claim.
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	return fmt.Sprintf("dra%08x", h.Sum32())
+}
+
+// isValidCNIIfname reports whether s would be accepted by the CNI runtime's
+// interface-name validation. It mirrors github.com/containernetworking/cni
+// pkg/utils.ValidateInterfaceName.
+func isValidCNIIfname(s string) bool {
+	if len(s) == 0 || len(s) > apis.MaxInterfaceNameLen {
+		return false
+	}
+	if s == "." || s == ".." {
+		return false
+	}
+	for _, r := range s {
+		if r == '/' || r == ':' || unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 	var req webhook.ProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -78,7 +135,7 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 		"CNI_COMMAND=ADD",
 		"CNI_CONTAINERID=" + string(req.ClaimUID),
 		"CNI_NETNS=/dev/null", // IPAM plugins don't need network namespaces
-		"CNI_IFNAME=" + req.Device.Name,
+		"CNI_IFNAME=" + cniIfname(req),
 		"CNI_PATH=" + s.binDir,
 		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=default;K8S_POD_NAME=pod-whereabouts;K8S_POD_INFRA_CONTAINER_ID=" + string(req.ClaimUID),
 	}
@@ -145,7 +202,7 @@ func (s *Server) ReleaseProfileConfig(w http.ResponseWriter, r *http.Request) {
 		"CNI_COMMAND=DEL",
 		"CNI_CONTAINERID=" + string(req.ClaimUID),
 		"CNI_NETNS=/dev/null",
-		"CNI_IFNAME=" + req.Device.Name,
+		"CNI_IFNAME=" + cniIfname(req),
 		"CNI_PATH=" + s.binDir,
 		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=default;K8S_POD_NAME=pod-whereabouts;K8S_POD_INFRA_CONTAINER_ID=" + string(req.ClaimUID),
 	}
