@@ -53,6 +53,32 @@ attaches Azure-specific attributes to every device it publishes in the node's
 |---|---|---|
 | `azure.dra.net/placementGroupId` | IMDS `compute/placementGroupId` | `c6c749e8-a38b-470e-8c94-2a7d00001bf0` |
 | `azure.dra.net/vmSize` | IMDS `compute/vmSize` | `Standard_ND128isr_GB300_v6` |
+| `azure.dra.net/interconnectGroupId` | IMDS `compute/interconnectGroupId` | `2deed8b4-d1e9-42be-a40a-9882201aa9f5` |
+| `azure.dra.net/interconnectSubgroupId` | IMDS `compute/interconnectSubgroupId` | `0f0ba375-aaf1-4ac8-a579-a3b180d47de5` |
+
+### InterconnectGroup (ICG) and InterconnectBlock (ICB)
+
+Azure organizes GPU VMs with InfiniBand into a two-level topology:
+
+- **InterconnectGroup (ICG)** (`Microsoft.Network/interconnectGroups`) —
+  defines the overall IB connectivity scope and contains one or more
+  subgroups. Its `resourceGuid` is exposed via IMDS as
+  `compute/interconnectGroupId`.
+- **Subgroup** — each subgroup maps to a single InterconnectBlock. VMs in the
+  same subgroup share the same physical IB fabric. The subgroup's
+  `internalSubgroupId` is exposed via IMDS as `compute/interconnectSubgroupId`.
+- **InterconnectBlock (ICB)** (`Microsoft.Compute/interconnectBlocks`) — the
+  Compute-side resource representing a fixed-capacity block of VMs (e.g. 18
+  for `Standard_ND128isr_GB300_v6`) wired to the same IB fabric.
+
+Use `interconnectSubgroupId` in CEL selectors to pin a multi-node job to a
+single IB fabric:
+
+```yaml
+- cel:
+    expression: >-
+      device.attributes["azure.dra.net"]["interconnectSubgroupId"] == "0f0ba375-aaf1-4ac8-a579-a3b180d47de5"
+```
 
 VMs in **different placement groups do not share an InfiniBand fabric** —
 cross-placement-group RDMA traffic fails with transport errors. This is not

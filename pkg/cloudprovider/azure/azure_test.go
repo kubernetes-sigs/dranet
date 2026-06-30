@@ -88,6 +88,34 @@ func TestGetDeviceAttributes(t *testing.T) {
 				AttrAzureVMSize:           {StringValue: ptr.To("Standard_ND128isr_GB300_v6")},
 			},
 		},
+		{
+			name: "instance with interconnect group and subgroup IDs",
+			instance: &AzureInstance{
+				PlacementGroupID:       "42d64506-b0a6-4308-911e-38982951ce42",
+				VMSize:                 "Standard_ND128isr_GB300_v6",
+				InterconnectGroupID:    "2deed8b4-d1e9-42be-a40a-9882201aa9f5",
+				InterconnectSubgroupID: "0f0ba375-aaf1-4ac8-a579-a3b180d47de5",
+			},
+			id: cloudprovider.DeviceIdentifiers{Name: "dev1"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				AttrAzurePlacementGroupID:       {StringValue: ptr.To("42d64506-b0a6-4308-911e-38982951ce42")},
+				AttrAzureVMSize:                 {StringValue: ptr.To("Standard_ND128isr_GB300_v6")},
+				AttrAzureInterconnectGroupID:    {StringValue: ptr.To("2deed8b4-d1e9-42be-a40a-9882201aa9f5")},
+				AttrAzureInterconnectSubgroupID: {StringValue: ptr.To("0f0ba375-aaf1-4ac8-a579-a3b180d47de5")},
+			},
+		},
+		{
+			name: "instance with only interconnect group, no subgroup",
+			instance: &AzureInstance{
+				VMSize:              "Standard_ND128isr_GB300_v6",
+				InterconnectGroupID: "2deed8b4-d1e9-42be-a40a-9882201aa9f5",
+			},
+			id: cloudprovider.DeviceIdentifiers{Name: "dev1"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				AttrAzureVMSize:              {StringValue: ptr.To("Standard_ND128isr_GB300_v6")},
+				AttrAzureInterconnectGroupID: {StringValue: ptr.To("2deed8b4-d1e9-42be-a40a-9882201aa9f5")},
+			},
+		},
 	}
 
 	for _, tt := range tests {

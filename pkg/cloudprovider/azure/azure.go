@@ -41,13 +41,15 @@ import (
 const (
 	AzureAttrPrefix = "azure.dra.net"
 
-	AttrAzurePlacementGroupID = AzureAttrPrefix + "/" + "placementGroupId"
-	AttrAzureVMSize           = AzureAttrPrefix + "/" + "vmSize"
+	AttrAzurePlacementGroupID       = AzureAttrPrefix + "/" + "placementGroupId"
+	AttrAzureVMSize                 = AzureAttrPrefix + "/" + "vmSize"
+	AttrAzureInterconnectGroupID    = AzureAttrPrefix + "/" + "interconnectGroupId"
+	AttrAzureInterconnectSubgroupID = AzureAttrPrefix + "/" + "interconnectSubgroupId"
 
 	// imdsEndpoint is the Azure Instance Metadata Service endpoint.
 	imdsEndpoint = "http://169.254.169.254/metadata/instance"
 	// imdsAPIVersion is the API version used for IMDS queries.
-	imdsAPIVersion = "2021-02-01"
+	imdsAPIVersion = "2025-11-11"
 	// imdsPathCompute is the IMDS path for compute metadata.
 	imdsPathCompute = "compute"
 	// imdsPathNetwork is the IMDS path for network metadata.
@@ -57,8 +59,10 @@ const (
 // imdsComputeMetadata contains the fields we care about from the Azure IMDS
 // compute metadata response.
 type imdsComputeMetadata struct {
-	PlacementGroupID string `json:"placementGroupId"`
-	VMSize           string `json:"vmSize"`
+	PlacementGroupID       string `json:"placementGroupId"`
+	VMSize                 string `json:"vmSize"`
+	InterconnectGroupID    string `json:"interconnectGroupId"`
+	InterconnectSubgroupID string `json:"interconnectSubgroupId"`
 }
 
 // imdsResponse represents the top-level IMDS response structure.
@@ -110,9 +114,11 @@ var _ cloudprovider.CloudInstance = (*AzureInstance)(nil)
 
 // AzureInstance holds Azure-specific instance data retrieved from IMDS.
 type AzureInstance struct {
-	PlacementGroupID string
-	VMSize           string
-	Interfaces       []networkInterface
+	PlacementGroupID       string
+	VMSize                 string
+	InterconnectGroupID    string
+	InterconnectSubgroupID string
+	Interfaces             []networkInterface
 }
 
 // GetDeviceAttributes returns Azure-specific attributes for a device.
@@ -127,6 +133,14 @@ func (a *AzureInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) 
 
 	if a.PlacementGroupID != "" {
 		attributes[AttrAzurePlacementGroupID] = resourceapi.DeviceAttribute{StringValue: &a.PlacementGroupID}
+	}
+
+	if a.InterconnectGroupID != "" {
+		attributes[AttrAzureInterconnectGroupID] = resourceapi.DeviceAttribute{StringValue: &a.InterconnectGroupID}
+	}
+
+	if a.InterconnectSubgroupID != "" {
+		attributes[AttrAzureInterconnectSubgroupID] = resourceapi.DeviceAttribute{StringValue: &a.InterconnectSubgroupID}
 	}
 
 	return attributes
@@ -352,10 +366,13 @@ func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
 	}
 
 	instance := &AzureInstance{
-		PlacementGroupID: computeMetadata.PlacementGroupID,
-		VMSize:           computeMetadata.VMSize,
+		PlacementGroupID:       computeMetadata.PlacementGroupID,
+		VMSize:                 computeMetadata.VMSize,
+		InterconnectGroupID:    computeMetadata.InterconnectGroupID,
+		InterconnectSubgroupID: computeMetadata.InterconnectSubgroupID,
 	}
-	klog.Infof("Azure IMDS: vmSize=%s, placementGroupId=%s", instance.VMSize, instance.PlacementGroupID)
+	klog.Infof("Azure IMDS: vmSize=%s, placementGroupId=%s, interconnectGroupId=%s, interconnectSubgroupId=%s",
+		instance.VMSize, instance.PlacementGroupID, instance.InterconnectGroupID, instance.InterconnectSubgroupID)
 
 	// Fetch network interface metadata in a separate call.
 	var networkResp imdsNetworkResponse
