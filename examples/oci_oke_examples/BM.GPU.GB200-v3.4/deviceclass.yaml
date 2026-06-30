@@ -1,0 +1,11 @@
+# DeviceClass that matches all DRANET-managed network devices.
+# Required for DRA to resolve the `deviceClassName: dranet.net` references in
+# the ResourceClaimTemplates in this directory.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dranet.net
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.net"

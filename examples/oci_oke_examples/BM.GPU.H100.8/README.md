@@ -13,7 +13,7 @@ Each node has:
 | Resource | Count | Detail |
 |---|---|---|
 | GPU | 8 x NVIDIA H100 | 80 GB HBM3, Hopper architecture, NVLink/NVSwitch all-to-all |
-| NIC | 16 x Mellanox ConnectX-7 (8 dual-port cards) | 400 Gb/s RoCEv2 per port |
+| NIC | 16 x Mellanox ConnectX-7 (8 dual-port cards) | RoCEv2, 3,200 Gbps RDMA cluster network per node |
 | NUMA nodes | 2 | 4 GPUs + 8 NICs per NUMA node |
 
 ### NIC layout
@@ -131,23 +131,9 @@ launcher=$(kubectl get pods \
 kubectl logs -f "${launcher}"
 ```
 
-## Recovering orphaned RDMA NICs
+## Device lifecycle
 
-When a pod is deleted, DRANET may not return the RDMA NIC from the pod namespace
-to the host namespace (see [#137](https://github.com/kubernetes-sigs/dranet/issues/137)).
-
-**Symptoms:** Workers stuck in `Pending` with `cannot allocate all claims`.
-
-**Recover via PCI rebind** (requires a privileged debug pod on each GPU node):
-
-```bash
-kubectl debug node/<node-name> --image=busybox -it -- sh
-chroot /host
-# Replace with the actual PCI address of the orphaned NIC
-echo "0000:0c:00.0" > /sys/bus/pci/drivers/mlx5_core/unbind
-sleep 2
-echo "0000:0c:00.0" > /sys/bus/pci/drivers/mlx5_core/bind
-```
-
-Wait ~15 seconds for DRANET to rescan, then verify the NIC reappears in the
-ResourceSlice.
+When a worker pod is deleted, DRANET returns its RDMA NIC(s) from the pod
+network namespace to the host and the device reappears in the node's
+ResourceSlice within one inventory poll interval — no manual intervention is
+required between runs.
