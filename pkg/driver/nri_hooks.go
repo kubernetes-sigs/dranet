@@ -170,7 +170,16 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 
 		// Block 1: netdev operations — only when a network interface is present.
 		if ifName != "" {
-			if err := attachNetdevToNS(pod, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+			if config.NetworkInterfaceConfigInPod.Interface.SubInterface != nil {
+				// If subinterface is configured, create the subinterface based on
+				// the current interface.
+				if err := createSubinterfaceInNS(pod, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceCreateFailed",
+						"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
+					return err
+				}
+			} else if err := attachNetdevToNS(pod, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+				// Otherwise, move the interface into the pod network namespace.
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
 					"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
 				return err
@@ -269,8 +278,42 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 		WithIPs(networkData.IPs...),
 	) // End of WithNetworkData
 
-	// The interface name inside the container's namespace.
-	ifNameInNs := networkData.InterfaceName
+	// Configure the moved device (ethtool, vrf, routes, neighbors, rules)
+	return configureNetdevInNS(pod, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice)
+}
+
+// createSubinterfaceInNS creates a subinterface in the pod network namespace,
+// applies all associated configurations, and records the status conditions.
+func createSubinterfaceInNS(pod *api.PodSandbox, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+	hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
+	klog.V(2).Infof("RunPodSandbox creating subinterface on parent device: %s", hostIfName)
+
+	networkData, err := nsCreateSubinterface(hostIfName, ns, config.NetworkInterfaceConfigInPod.Interface)
+	if err != nil {
+		klog.Infof("RunPodSandbox error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)
+		return fmt.Errorf("error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)
+	}
+
+	resourceClaimStatusDevice.WithConditions(
+		metav1apply.Condition().
+			WithType("Ready").
+			WithReason("NetworkDeviceReady").
+			WithStatus(metav1.ConditionTrue).
+			WithLastTransitionTime(metav1.Now()),
+	).WithNetworkData(resourceapply.NetworkDeviceData().
+		WithInterfaceName(networkData.InterfaceName).
+		WithHardwareAddress(networkData.HardwareAddress).
+		WithIPs(networkData.IPs...),
+	)
+
+	// Configure the subinterface (ethtool, vrf, routes, neighbors, rules)
+	return configureNetdevInNS(pod, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice)
+}
+
+// configureNetdevInNS applies common L3 configurations (ethtool, eBPF, VRF, routes, rules, and neighbors)
+// to a network interface inside the container's network namespace and marks the claim status as NetworkReady.
+func configureNetdevInNS(pod *api.PodSandbox, ns, deviceName string, config DeviceConfig, ifNameInNs string, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+	var err error
 
 	// Apply Ethtool configurations
 	if config.NetworkInterfaceConfigInPod.Ethtool != nil {
@@ -284,7 +327,7 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 	// Check if the ebpf programs should be disabled
 	if config.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms != nil &&
 		*config.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms {
-		err := detachEBPFPrograms(ns, ifNameInNs)
+		err = detachEBPFPrograms(ns, ifNameInNs)
 		if err != nil {
 			klog.Infof("error disabling ebpf programs for %s in ns %s: %v", ifNameInNs, ns, err)
 			return fmt.Errorf("error disabling ebpf programs for %s in ns %s: %v", ifNameInNs, ns, err)
@@ -391,10 +434,16 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		netdevDetached := false
 		ifName := config.NetworkInterfaceConfigInPod.Interface.Name
 		if ifName != "" {
-			if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
-				klog.Errorf("fail to return network device %s : %v", deviceName, err)
+			if config.NetworkInterfaceConfigInPod.Interface.SubInterface != nil {
+				if err := nsDeleteSubinterface(ns, ifName); err != nil {
+					klog.Errorf("fail to delete subinterface %s for device %s: %v", ifName, deviceName, err)
+				}
 			} else {
-				netdevDetached = true
+				if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
+					klog.Errorf("fail to return network device %s : %v", deviceName, err)
+				} else {
+					netdevDetached = true
+				}
 			}
 		}
 

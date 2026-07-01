@@ -33,4 +33,7 @@ const (
 	// VRFTableOffset is the offset used for VRF routing tables to avoid ID collisions
 	// with reserved tables (0, 253, 254, 255) and to identify DRANET managed tables.
 	VRFTableOffset = 1000
+
+	// SubInterfaceTypeIPVlan indicates that the subinterface should be created in IPVlan type.
+	SubInterfaceTypeIPVlan	= "ipvlan"
 )

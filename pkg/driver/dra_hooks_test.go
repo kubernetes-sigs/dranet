@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -849,6 +850,161 @@ func TestGetDeviceNetworkConfigWithWebhook(t *testing.T) {
 				}
 			} else if mergedConf.Profile != "" {
 				t.Errorf("Expected empty profile, got %s", mergedConf.Profile)
+			}
+		})
+	}
+}
+
+func TestGetIPFromRange(t *testing.T) {
+	type testCase struct {
+		name          string
+		ipRange       string
+		initIPAM      bool
+		checkContains bool
+		wantErr       string
+	}
+
+	tests := []testCase{
+		{
+			name:     "IPAM database not initialized",
+			ipRange:  "192.168.1.0/24",
+			initIPAM: false,
+			wantErr:  "IPAM database not initialized",
+		},
+		{
+			name:     "invalid IP range",
+			ipRange:  "invalid-cidr",
+			initIPAM: true,
+			wantErr:  "invalid IP range",
+		},
+		{
+			name:          "successful allocation",
+			ipRange:       "2001:db8::/64",
+			initIPAM:      true,
+			checkContains: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := mustNewPodConfigStore()
+			var localIPAM *LocalIPAM
+			if tc.initIPAM {
+				localIPAM = newLocalIPAM(store)
+			}
+			np := &NetworkDriver{
+				localIPAM:      localIPAM,
+				podConfigStore: store,
+			}
+
+			ipWithMask, err := np.getIPFromRange(tc.ipRange, "pod-test", "eth0")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("Expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("getIPFromRange() unexpected error: %v", err)
+			}
+
+			if tc.checkContains {
+				cidr, err := netip.ParsePrefix(tc.ipRange)
+				if err != nil {
+					t.Fatalf("Failed to parse tc.ipRange %q: %v", tc.ipRange, err)
+				}
+				prefix, err := netip.ParsePrefix(ipWithMask)
+				if err != nil {
+					t.Fatalf("Failed to parse returned IP prefix %q: %v", ipWithMask, err)
+				}
+				if !cidr.Contains(prefix.Addr()) {
+					t.Errorf("Expected returned IP %s to be within CIDR %s", prefix.Addr(), cidr)
+				}
+			}
+		})
+	}
+}
+
+func TestAddSourceBasedRoutingRule(t *testing.T) {
+	tests := []struct {
+		name      string
+		deviceCfg DeviceConfig
+		wantRules []apis.RuleConfig
+	}{
+		{
+			name: "No default route, rules should not change",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						Addresses: []string{"2001:db8::3/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "2001:db8::/64", Table: 100},
+					},
+				},
+			},
+			wantRules: nil,
+		},
+		{
+			name: "Default route with Table=0, rules should not change",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						Addresses: []string{"2001:db8::3/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "::/0", Table: 0},
+					},
+				},
+			},
+			wantRules: nil,
+		},
+		{
+			name: "Default route IPv6 with custom Table, rule should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						Addresses: []string{"2001:db8::3/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "::/0", Table: 100},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "2001:db8::3/128", Table: 100, Priority: 32000},
+			},
+		},
+		{
+			name: "Default route IPv4 with custom Table, rule should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						Addresses: []string{"192.168.1.3/32"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "0.0.0.0/0", Table: 101},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "192.168.1.3/32", Table: 101, Priority: 32000},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addSourceBasedRoutingRule(&tt.deviceCfg)
+			gotRules := tt.deviceCfg.NetworkInterfaceConfigInPod.Rules
+			if len(gotRules) != len(tt.wantRules) {
+				t.Fatalf("Expected %d rules, got %d", len(tt.wantRules), len(gotRules))
+			}
+			for i := range gotRules {
+				if gotRules[i].Source != tt.wantRules[i].Source || gotRules[i].Table != tt.wantRules[i].Table || gotRules[i].Priority != tt.wantRules[i].Priority {
+					t.Errorf("gotRules[%d] = %+v, want %+v", i, gotRules[i], tt.wantRules[i])
+				}
 			}
 		})
 	}

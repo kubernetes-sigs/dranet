@@ -130,6 +130,53 @@ func TestMergeNetworkConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "subinterface: user does not request, cloud config is discarded",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Name: "eth0",
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					SubInterface: &SubInterfaceConfig{
+						IPRange: "10.24.3.0/24",
+					},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Name: "eth0",
+				},
+			},
+		},
+		{
+			name: "subinterface: user requests, cloud config is merged",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Name: "eth0",
+					SubInterface: &SubInterfaceConfig{
+						Type: "ipvlan",
+					},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					SubInterface: &SubInterfaceConfig{
+						IPRange: "10.24.3.0/24",
+					},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Name: "eth0",
+					SubInterface: &SubInterfaceConfig{
+						Type:    "ipvlan",
+						IPRange: "10.24.3.0/24",
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {

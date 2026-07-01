@@ -111,6 +111,7 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+	localIPAM      *LocalIPAM
 	dbPath         string // path for persistent bbolt database; empty means in-memory
 
 	clock clock.WithTicker // Injectable clock for testing
@@ -164,6 +165,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		return nil, fmt.Errorf("failed to initialize pod config store: %v", err)
 	}
 	plugin.podConfigStore = store
+	plugin.localIPAM = newLocalIPAM(store)
 
 	driverPluginPath := filepath.Join(kubeletPluginPath, driverName)
 	err = os.MkdirAll(driverPluginPath, 0750)

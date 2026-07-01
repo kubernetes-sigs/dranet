@@ -189,6 +189,60 @@ func TestRunPodSandboxUsesPersistedConfigAfterRestart(t *testing.T) {
 	}
 }
 
+func TestRunPodSandboxSubinterfacePath(t *testing.T) {
+	podUID := types.UID("test-pod-subinterface")
+	store := mustNewPodConfigStore()
+
+	deviceCfg := DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "nonexistent-parent"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Name: "ipvlan-eth0",
+				SubInterface: &apis.SubInterfaceConfig{
+					Type: apis.SubInterfaceTypeIPVlan,
+					IPRange: "2001:db8::/64",
+				},
+				Addresses: []string{"2001:db8::10/64"},
+			},
+		},
+	}
+
+	if err := store.SetDeviceConfig(podUID, "eth0", deviceCfg); err != nil {
+		t.Fatalf("SetDeviceConfig() error: %v", err)
+	}
+
+	np := &NetworkDriver{
+		podConfigStore: store,
+		netdb:          inventory.New(),
+		eventRecorder:  record.NewFakeRecorder(100),
+	}
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "test-pod-subinterface",
+		Namespace: "test-ns",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: "/proc/self/ns/net"},
+			},
+		},
+	}
+
+	// Verify that the subinterface creation path is called by passing a non-existent parent interface
+	// and asserting that the call fails with a "could not find parent interface on host" error.
+	err := np.RunPodSandbox(context.Background(), pod)
+	if err == nil {
+		t.Fatal("expected RunPodSandbox to error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "could not find parent interface nonexistent-parent on host") {
+		t.Errorf("expected error to contain 'could not find parent interface nonexistent-parent on host', got: %v", err)
+	}
+}
+
+
 
 func TestSynchronizeStoresNetNSOnlyForConfiguredPods(t *testing.T) {
 	store := mustNewPodConfigStore()
@@ -569,6 +623,21 @@ func TestStopPodSandboxRescanGating(t *testing.T) {
 			name:              "exclusive RDMA + fake netns: detach fails, no rescan",
 			setupDeviceConfig: true,
 			deviceConfig:      DeviceConfig{RDMADevice: RDMAConfig{LinkDev: "mlx5_0"}},
+			setupNetNs:        true,
+		},
+		{
+			name:              "subinterface configured: no rescan triggered",
+			setupDeviceConfig: true,
+			deviceConfig: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						Name: "ipvlan-eth0",
+						SubInterface: &apis.SubInterfaceConfig{
+							Type: apis.SubInterfaceTypeIPVlan,
+						},
+					},
+				},
+			},
 			setupNetNs:        true,
 		},
 	}

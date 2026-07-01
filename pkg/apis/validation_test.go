@@ -313,6 +313,33 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			fieldPath: "iface",
 			expectErr: false, // Function should handle nil gracefully
 		},
+		{
+			name:      "valid subinterface config",
+			cfg:       &InterfaceConfig{Name: "eth0", SubInterface: &SubInterfaceConfig{Type: SubInterfaceTypeIPVlan, IPRange: "2001:db8::/64", IPVlanConfig: &IPVlanConfig{Mode: "l2", Flag: "bridge"}}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "invalid subinterface ip range",
+			cfg:       &InterfaceConfig{Name: "eth0", SubInterface: &SubInterfaceConfig{Type: SubInterfaceTypeIPVlan, IPRange: "invalid-range"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid subinterface mode",
+			cfg:       &InterfaceConfig{Name: "eth0", SubInterface: &SubInterfaceConfig{Type: SubInterfaceTypeIPVlan, IPRange: "2001:db8::/64", IPVlanConfig: &IPVlanConfig{Mode: "l3", Flag: "bridge"}}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid subinterface flag",
+			cfg:       &InterfaceConfig{Name: "eth0", SubInterface: &SubInterfaceConfig{Type: SubInterfaceTypeIPVlan, IPRange: "2001:db8::/64", IPVlanConfig: &IPVlanConfig{Mode: "l2", Flag: "private"}}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

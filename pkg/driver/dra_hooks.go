@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -289,8 +290,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 
 		if deviceCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
 			// If the interface name was not explicitly overridden, use the same
-			// interface name within the pod's network namespace.
-			deviceCfg.NetworkInterfaceConfigInPod.Interface.Name = ifName
+			// interface name within the pod's network namespace (prefixed for subinterfaces).
+			if deviceCfg.NetworkInterfaceConfigInPod.Interface.SubInterface != nil {
+				subInterfaceType := deviceCfg.NetworkInterfaceConfigInPod.Interface.SubInterface.Type
+				deviceCfg.NetworkInterfaceConfigInPod.Interface.Name = string(subInterfaceType) + "-" + ifName
+			} else {
+				deviceCfg.NetworkInterfaceConfigInPod.Interface.Name = ifName
+			}
 		}
 
 		// For SR-IOV VFs, the requested MTU must not exceed the parent PF's MTU.
@@ -314,9 +320,23 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			}
 		}
 
-		// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
-		// ... but we DO NOT apply them in the root namespace
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP != nil && *deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP {
+		// If the subinterface is enabled and no IP address is provided, get an IP from the IPRange.
+		if deviceCfg.NetworkInterfaceConfigInPod.Interface.SubInterface != nil &&
+			len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
+			ipRange := deviceCfg.NetworkInterfaceConfigInPod.Interface.SubInterface.IPRange
+			if ipRange == "" {
+				errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s, no IPRange specified", ifName))
+				continue
+			}
+			ip, err := np.getIPFromRange(ipRange, podUID, ifName)
+			if err != nil {
+				errorList = append(errorList, err)
+				continue
+			}
+			deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
+		} else if deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP != nil && *deviceCfg.NetworkInterfaceConfigInPod.Interface.DHCP {
+			// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
+			// ... but we DO NOT apply them in the root namespace
 			klog.V(2).Infof("trying to get network configuration via DHCP")
 			contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -394,6 +414,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 					// Avoid adding the same rule twice
 					delete(rulesByTable, table)
 				}
+			}
+		}
+
+		// For subinterface, add source-based routing rule for the allocated IP.
+		if deviceCfg.NetworkInterfaceConfigInPod.Interface.SubInterface != nil {
+			if len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) != 0 {
+				addSourceBasedRoutingRule(&deviceCfg)
 			}
 		}
 
@@ -669,4 +696,60 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 		mergedConf = apis.MergeNetworkConfig(mergedConf, profileConf)
 	}
 	return mergedConf, nil
+}
+
+// getIPFromRange allocates a free IP address from the specified CIDR range for
+// a pod using the driver's LocalIPAM. It returns the allocated IP as a string.
+func (np *NetworkDriver) getIPFromRange(ipRange string, podUID types.UID, deviceName string) (string, error) {
+	cidr, err := netip.ParsePrefix(ipRange)
+	if err != nil {
+		return "", fmt.Errorf("invalid IP range %s: %v", ipRange, err)
+	}
+
+	if np.localIPAM == nil {
+		return "", fmt.Errorf("IPAM database not initialized")
+	}
+	rawIP, err := np.localIPAM.Allocate(podUID, cidr)
+	if err != nil {
+		return "", fmt.Errorf("Failed to allocate IP for pod %s: %v", podUID, err)
+	}
+	prefix := netip.PrefixFrom(rawIP, cidr.Bits())
+	klog.V(2).Infof("Successfully allocated IP %s for pod %s", prefix.String(), podUID)
+	return prefix.String(), nil
+}
+
+// addSourceBasedRoutingRule adds a source-based routing rule to the
+// DeviceConfig if a default route with a custom table ID is found.
+func addSourceBasedRoutingRule(deviceCfg *DeviceConfig) {
+	ipStr := deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses[0]
+	prefix, err := netip.ParsePrefix(ipStr)
+	if err != nil {
+		klog.Warningf("Failed to parse prefix %q for source-based routing: %v", ipStr, err)
+		return
+	}
+	ipRaw := prefix.Addr().String()
+
+	var tableID int
+	var mask string
+	for _, r := range deviceCfg.NetworkInterfaceConfigInPod.Routes {
+		if r.Table == 0 {
+			continue
+		}
+		if r.Destination == "::/0" {
+			tableID = r.Table
+			mask = "/128"
+			break
+		} else if r.Destination == "0.0.0.0/0" {
+			tableID = r.Table
+			mask = "/32"
+			break
+		}
+	}
+	if tableID != 0 {
+		deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, apis.RuleConfig{
+			Source:   ipRaw + mask,
+			Table:    tableID,
+			Priority: 32000,
+		})
+	}
 }

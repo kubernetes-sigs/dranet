@@ -20,7 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +43,16 @@ const (
 	GPUDirectTCPX  GPUDirectSupport = "GPUDirect-TCPX"
 	GPUDirectTCPXO GPUDirectSupport = "GPUDirect-TCPXO"
 	GPUDirectRDMA  GPUDirectSupport = "GPUDirect-RDMA"
+)
+
+const (
+	// routingTableBase is the offset for routing table ID.
+	// Each interface derives its own table: routingTableBase + ifaceIndex.
+	routingTableBase = 100
+
+	// defaultBMGatewayMAC is the virtual gateway MAC address
+	// hardcoded for policy routing on GCE bare-metal machines.
+	defaultBMGatewayMAC = "02:32:00:00:00:00"
 )
 
 const (
@@ -82,6 +94,7 @@ type gceNetworkInterface struct {
 	MTU       int      `json:"mtu,omitempty"`
 	Network   string   `json:"network,omitempty"`
 	IPAliases []string `json:"ipAliases,omitempty"`
+	Gateway   string   `json:"gateway,omitempty"`
 }
 
 var _ cloudprovider.CloudInstance = (*GCEInstance)(nil)
@@ -154,7 +167,69 @@ func (g *GCEInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) ma
 // GetDeviceConfig fetches any infrastructure-specific network configuration
 // required by the device. Returning nil means no specific config is needed.
 func (g *GCEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
-	return nil
+	if id.MAC == "" {
+		return nil
+	}
+
+	var interfaceForMac *gceNetworkInterface
+	interfaceIndex := -1
+	for index, cloudInterface := range g.Interfaces {
+		if cloudInterface.Mac == id.MAC {
+			interfaceForMac = &g.Interfaces[index]
+			interfaceIndex = index
+			break
+		}
+	}
+	if interfaceForMac == nil {
+		klog.V(4).Infof("No cloud metadata found for device with mac %q; it is possible this device has no associated cloud provider metadata", id.MAC)
+		return nil
+	}
+
+	deviceConfig := &apis.NetworkConfig{}
+
+	// Calculate the IP range as metadata for subinterface.
+	// The config_merge layer will decide whether to keep or discard
+	// the configuration based on the user's request for subinterface.
+	var ipRange string
+
+	// For IPv6, compute the IPRange from the base IP.
+	if len(interfaceForMac.IPv6) > 0 {
+		var err error
+		ipRange, err = getIPv6Range(interfaceForMac.IPv6[0])
+		if err != nil {
+			klog.Warningf("Failed to calculate IPv6 range for base IP %q: %v", interfaceForMac.IPv6[0], err)
+		}
+
+	// For IPv4, retrieve the IPRange from the first Alias IP Range if available.
+	} else if len(interfaceForMac.IPAliases) > 0 {
+		ipRange = interfaceForMac.IPAliases[0]
+	}
+	if ipRange != "" {
+		deviceConfig.Interface.SubInterface = &apis.SubInterfaceConfig{
+			IPRange: ipRange,
+		}
+	}
+
+	// Configure routes and permanent neighbor for GCE Bare Metal machines.
+	if strings.HasSuffix(g.Type, "-metal") {
+		tableID := routingTableBase + interfaceIndex
+		gateway := interfaceForMac.Gateway
+		if gateway == "" {
+			klog.Warningf("Gateway not found for device with mac %q", id.MAC)
+		} else {
+			deviceConfig.Routes = append(deviceConfig.Routes, apis.RouteConfig{
+				Destination: "::/0",
+				Gateway:     gateway,
+				Table:       tableID,
+			})
+			deviceConfig.Neighbors = append(deviceConfig.Neighbors, apis.NeighborConfig{
+				Destination:  gateway,
+				HardwareAddr: defaultBMGatewayMAC,
+			})
+		}
+	}
+
+	return deviceConfig
 }
 
 // GetInstance retrieves GCE instance properties by querying the metadata server.
@@ -211,4 +286,38 @@ func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
 		return nil, err
 	}
 	return instance, nil
+}
+
+// getIPv6Range calculates the subinterface IPv6 range by appending 0xC0DE marker to the base range.
+func getIPv6Range(baseIPStr string) (string, error) {
+	const workerMarker = 0xC0DE
+
+	_, ipnet, err := net.ParseCIDR(baseIPStr)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse CIDR %q: %v", baseIPStr, err)
+	}
+	prefixLen, _ := ipnet.Mask.Size()
+	baseIP := ipnet.IP
+
+	if baseIP.To4() != nil {
+		return "", fmt.Errorf("IP %q is an IPv4 address, expected IPv6", baseIPStr)
+	}
+	ip16 := baseIP.To16()
+	if ip16 == nil {
+		return "", fmt.Errorf("IP %q is not a valid IPv6 address", baseIPStr)
+	}
+
+	workerIP := make(net.IP, 16)
+	numBaseBytes := prefixLen / 8
+
+	if numBaseBytes >= 14 {
+		return "", fmt.Errorf("prefix length %d is too large to append %x", prefixLen, workerMarker)
+	}
+
+	copy(workerIP[0:numBaseBytes], ip16[0:numBaseBytes])
+	workerIP[numBaseBytes] = byte(workerMarker >> 8)
+	workerIP[numBaseBytes+1] = byte(workerMarker & 0xFF)
+	newPrefixLen := (numBaseBytes + 2) * 8
+
+	return workerIP.String() + "/" + strconv.Itoa(newPrefixLen), nil
 }

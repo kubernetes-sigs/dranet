@@ -181,6 +181,38 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
 	}
 
+	if cfg.SubInterface != nil {
+		allErrors = append(allErrors, validateSubInterfaceConfig(cfg.SubInterface, fieldPath+".subInterface")...)
+	}
+
+	return allErrors
+}
+
+func validateSubInterfaceConfig(cfg *SubInterfaceConfig, fieldPath string) (allErrors []error) {
+	if cfg.IPRange != "" {
+		if _, err := netip.ParsePrefix(cfg.IPRange); err != nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.ipRange: invalid IP CIDR format '%s': %w", fieldPath, cfg.IPRange, err))
+		}
+	}
+
+	if cfg.Type == SubInterfaceType(SubInterfaceTypeIPVlan) {
+		if cfg.IPVlanConfig != nil {
+			allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlanConfig, fieldPath+".ipvlan")...)
+		}
+	}
+
+	return allErrors
+}
+
+func validateIPVlanConfig(cfg *IPVlanConfig, fieldPath string) (allErrors []error) {
+	// For now, only support mode "l2" and flag "bridge"
+	if cfg.Mode != "l2" {
+		allErrors = append(allErrors, fmt.Errorf("%s.mode: unsupported mode '%s', only 'l2' is supported", fieldPath, cfg.Mode))
+	}
+	if cfg.Flag != "bridge" {
+		allErrors = append(allErrors, fmt.Errorf("%s.flag: unsupported flag '%s', only 'bridge' is supported", fieldPath, cfg.Flag))
+	}
+
 	return allErrors
 }
 

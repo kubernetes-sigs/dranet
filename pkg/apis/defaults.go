@@ -9,6 +9,9 @@ func (c *NetworkConfig) Default() {
 	if c.Interface.VRF != nil {
 		c.Interface.VRF.Default()
 	}
+	if c.Interface.SubInterface != nil {
+		c.Interface.SubInterface.Default()
+	}
 }
 
 // Default applies default values to the VRFConfig.
@@ -21,5 +24,23 @@ func (c *VRFConfig) Default() {
 		// Use the constant from this package
 		tableID := int((h.Sum32() % 1000) + VRFTableOffset)
 		c.Table = &tableID
+	}
+}
+
+// Default applies default values to the SubInterfaceConfig.
+func (c *SubInterfaceConfig) Default() {
+	if c.Type == "" {
+		c.Type = SubInterfaceTypeIPVlan
+	}
+	if c.Type == SubInterfaceTypeIPVlan {
+		if c.IPVlanConfig == nil {
+			c.IPVlanConfig = &IPVlanConfig{}
+		}
+		if c.IPVlanConfig.Mode == "" {
+			c.IPVlanConfig.Mode = "l2"
+		}
+		if c.IPVlanConfig.Flag == "" {
+			c.IPVlanConfig.Flag = "bridge"
+		}
 	}
 }

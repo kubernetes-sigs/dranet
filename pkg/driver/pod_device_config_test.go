@@ -18,6 +18,7 @@ package driver
 
 import (
 	"fmt"
+	"net/netip"
 	"reflect"
 	"sync"
 	"testing"
@@ -42,6 +43,9 @@ func TestNewPodConfigStore(t *testing.T) {
 	}
 	if store.configs == nil {
 		t.Error("mustNewPodConfigStore() did not initialize configs map")
+	}
+	if store.allocatedIPs == nil {
+		t.Error("mustNewPodConfigStore() did not initialize allocatedIPs map")
 	}
 }
 
@@ -405,5 +409,97 @@ func TestPodConfigStore_NoDuplicateDevices(t *testing.T) {
 	}
 	if _, ok := podConfigs.DeviceConfigs[deviceName2]; !ok {
 		t.Errorf("Device %s not found in pod configs", deviceName2)
+	}
+}
+
+// TestPodConfigStore_AllocatedIPs validates the lifecycle of allocated IP addresses
+// managed by the store, including empty initialization, registration of IPv4/IPv6 via
+// SetDeviceConfig, IP retrieving via GetAllocatedIPs, and cleanups via DeleteClaim.
+func TestPodConfigStore_AllocatedIPs(t *testing.T) {
+	store := mustNewPodConfigStore()
+	podUID1 := types.UID("pod-1")
+	podUID2 := types.UID("pod-2")
+	claim1 := types.NamespacedName{Namespace: "ns1", Name: "claim1"}
+	claim2 := types.NamespacedName{Namespace: "ns1", Name: "claim2"}
+
+	// 1. Verify the list is initially empty.
+	ips := store.GetAllocatedIPs()
+	if len(ips) != 0 {
+		t.Errorf("Expected 0 allocated IPs initially, got %d", len(ips))
+	}
+
+	// 2. Set Device Config with IPv6 prefix address.
+	config1 := DeviceConfig{
+		Claim: claim1,
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Addresses: []string{"2001:db8::3/128"},
+			},
+		},
+	}
+	if err := store.SetDeviceConfig(podUID1, "eth0", config1); err != nil {
+		t.Fatalf("SetDeviceConfig failed: %v", err)
+	}
+
+	// 3. Set Device Config with IPv4 raw address.
+	config2 := DeviceConfig{
+		Claim: claim2,
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Addresses: []string{"192.168.1.100"},
+			},
+		},
+	}
+	if err := store.SetDeviceConfig(podUID2, "eth0", config2); err != nil {
+		t.Fatalf("SetDeviceConfig failed: %v", err)
+	}
+
+	// 4. Get allocated IPs and verify the existance.
+	ips = store.GetAllocatedIPs()
+	if len(ips) != 2 {
+		t.Errorf("Expected 2 allocated IPs, got %d", len(ips))
+	}
+
+	addr1 := netip.MustParseAddr("2001:db8::3")
+	if uid, exists := ips[addr1]; !exists || uid != podUID1 {
+		t.Errorf("Expected %s to be allocated to %s, got existence=%t uid=%s", addr1, podUID1, exists, uid)
+	}
+
+	addr2 := netip.MustParseAddr("192.168.1.100")
+	if uid, exists := ips[addr2]; !exists || uid != podUID2 {
+		t.Errorf("Expected %s to be allocated to %s, got existence=%t uid=%s", addr2, podUID2, exists, uid)
+	}
+
+	// 5. Overwrite device config for podUID2 with a different IP and verify the old IP is released.
+	config2New := DeviceConfig{
+		Claim: claim2,
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Addresses: []string{"192.168.1.101"},
+			},
+		},
+	}
+	if err := store.SetDeviceConfig(podUID2, "eth0", config2New); err != nil {
+		t.Fatalf("SetDeviceConfig overwrite failed: %v", err)
+	}
+
+	ips = store.GetAllocatedIPs()
+	if uid, exists := ips[addr2]; exists {
+		t.Errorf("Expected old IP %s to be released after overwrite, but still owned by %s", addr2, uid)
+	}
+	addr2New := netip.MustParseAddr("192.168.1.101")
+	if uid, exists := ips[addr2New]; !exists || uid != podUID2 {
+		t.Errorf("Expected new IP %s to be allocated to %s, got existence=%t uid=%s", addr2New, podUID2, exists, uid)
+	}
+
+	// 6. DeleteClaim should free associated IP matched to the deleted claim but keep other IPs remain.
+	store.DeleteClaim(claim1)
+	ips = store.GetAllocatedIPs()
+
+	if uid, exists := ips[addr1]; exists {
+		t.Errorf("Expected %s to be deleted, but it still exists with uid=%s", addr1, uid)
+	}
+	if uid, exists := ips[addr2New]; !exists || uid != podUID2 {
+		t.Errorf("Expected %s to be allocated to %s, got existence=%t uid=%s", addr2New, podUID2, exists, uid)
 	}
 }
