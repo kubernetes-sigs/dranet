@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -60,14 +61,24 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 		select {
 		case devices := <-np.netdb.GetResources(ctx):
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(devices), formatDeviceNames(devices, 15))
-			devices = filter.FilterDevices(np.celProgram, devices)
-			klog.V(3).Infof("After filtering, publishing %d devices in ResourceSlice(s): %s", len(devices), formatDeviceNames(devices, 15))
 
-			np.publishResourcesPrometheusMetrics(devices)
+			// Fetch allocated devices from BoltDB store and merge
+			var allocated []resourceapi.Device
+			if np.podConfigStore != nil {
+				allocated = np.podConfigStore.GetAllocatedDevices()
+			}
+			merged := mergeDevices(devices, allocated)
+
+			// Apply filtering on the merged set of devices
+			filtered := filter.FilterDevices(np.celProgram, merged)
+
+			klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
+
+			np.publishResourcesPrometheusMetrics(filtered)
 
 			resources := resourceslice.DriverResources{
 				Pools: map[string]resourceslice.Pool{
-					np.nodeName: {Slices: []resourceslice.Slice{{Devices: devices}}},
+					np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
 				},
 			}
 			err := np.draPlugin.PublishResources(ctx, resources)
@@ -223,12 +234,21 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		netconf := *mergedConf
 
 		klog.V(4).Infof("PrepareResourceClaim %s/%s final Configuration %#v", claim.Namespace, claim.Name, netconf)
+		// Query the local discovery database (netdb) for the card's clean attributes
+		var deviceSnapshot *resourceapi.Device
+		if device, ok := np.netdb.GetDevice(result.Device); ok {
+			deviceSnapshot = &device
+		} else {
+			klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
+		}
+
 		deviceCfg := DeviceConfig{
 			Claim: types.NamespacedName{
 				Namespace: claim.Namespace,
 				Name:      claim.Name,
 			},
 			NetworkInterfaceConfigInPod: netconf,
+			DeviceSnapshot:              deviceSnapshot,
 		}
 
 		// Store early to guarantee profile cleanup on subsequent failures within this loop.
@@ -669,4 +689,60 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 		mergedConf = apis.MergeNetworkConfig(mergedConf, profileConf)
 	}
 	return mergedConf, nil
+}
+
+func mergeDevices(available, allocated []resourceapi.Device) []resourceapi.Device {
+	merged := make(map[string]resourceapi.Device)
+
+	// 1. Initial Load from Host Scan (Live available devices)
+	for _, dev := range available {
+		merged[dev.Name] = dev
+	}
+
+	// 2. Merge allocated devices
+	for _, dev := range allocated {
+		liveDev, exists := merged[dev.Name]
+		if !exists {
+			// Device is completely missing from host (e.g. virtual interface in pod namespace).
+			// Use the snapshot as-is.
+			merged[dev.Name] = dev
+			continue
+		}
+
+		// Device is in both (e.g. physical device). Merge them, giving precedence to liveDev.
+		merged[dev.Name] = mergeDeviceStructs(liveDev, dev)
+	}
+
+	// 3. Convert map to sorted slice
+	result := make([]resourceapi.Device, 0, len(merged))
+	for _, dev := range merged {
+		result = append(result, dev)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
+	return result
+}
+
+func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
+	merged := snap
+
+	if merged.Attributes == nil {
+		merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
+	}
+	if merged.Capacity == nil {
+		merged.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity)
+	}
+
+	// Overwrite with live attributes (precedence to live data)
+	for k, v := range live.Attributes {
+		merged.Attributes[k] = v
+	}
+
+	// Overwrite with live capacities (precedence to live data)
+	for k, v := range live.Capacity {
+		merged.Capacity[k] = v
+	}
+
+	return merged
 }

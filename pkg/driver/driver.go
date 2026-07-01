@@ -65,6 +65,7 @@ type pluginHelper interface {
 type inventoryDB interface {
 	Run(context.Context) error
 	GetResources(context.Context) <-chan []resourceapi.Device
+	GetDevice(deviceName string) (resourceapi.Device, bool)
 	GetNetInterfaceName(string) (string, error)
 	IsIBOnlyDevice(deviceName string) bool
 	GetRDMADeviceName(deviceName string) (string, error)
