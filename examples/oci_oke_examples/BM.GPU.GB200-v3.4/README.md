@@ -85,26 +85,19 @@ each RDMA NIC receives a globally-routable IPv6 address via Router Advertisement
 This address populates a routable GID in the NIC's GID table, which NCCL uses
 for inter-node communication (`NCCL_IB_GID_INDEX=3`).
 
-**Challenge:** In single-stack IPv4 Kubernetes clusters, the container runtime
-sets `net.ipv6.conf.all.disable_ipv6=1` in pod namespaces. This prevents the
-RA-assigned IPv6 address from being applied to RDMA NICs in the pod, leaving
-only link-local GIDs (which are not routable on the OKE fabric).
-
-**DRANET fix:** The OKE cloud provider returns `EnableIPv6: true` for RDMA
-devices on GPU fabric shapes. When set, DRANET:
-
-1. Soft-fails the initial IPv6 address application (EACCES due to disabled IPv6)
-2. Enables IPv6 per-interface via `net.ipv6.conf.<ifname>.disable_ipv6=0`
-3. Re-applies the IPv6 address, populating the routable GID at index 3
+For NCCL to use the routable GID, the RDMA NICs in the pod must carry the
+RA-assigned IPv6 address (not just a link-local GID). Ensure your cluster /
+node configuration leaves IPv6 enabled on the RDMA interfaces inside pods.
 
 **NCCL configuration note:** Set `NCCL_IB_DATA_DIRECT=0` to prevent NCCL from
 selecting the Data Direct DMA interface (`mlx5_N_dma`) and instead use the
-standard IB verbs path, which correctly uses the GID configured by DRANET.
+standard IB verbs path, which correctly uses the routable GID.
 
 ## Files
 
 | File | Description |
 |---|---|
+| `deviceclass.yaml` | `dranet.net` `DeviceClass` matching all DRANET NIC devices (referenced by the templates) |
 | `resource-claim-template.yaml` | `ResourceClaimTemplate` objects: `1nic-aligned`, `1nic-unaligned`, `2nic-aligned`, `4nic-aligned`, `4gpu-8nic` |
 | `mpi-job.yaml` | `MPIJob` running `all_reduce_perf` across 2 workers (per-node benchmarks) |
 | `multinode-mpi-job.yaml` | `MPIJob` running `all_reduce_perf` across 16 workers with `4gpu-8nic` + ComputeDomain |
@@ -119,6 +112,9 @@ standard IB verbs path, which correctly uses the GID configured by DRANET.
 ```bash
 # Install MPI Operator (if not already installed)
 kubectl apply --server-side -k "https://github.com/kubeflow/mpi-operator/manifests/overlays/standalone?ref=v0.7.0"
+
+# Create the dranet.net DeviceClass (required by the ResourceClaimTemplates)
+kubectl apply -f deviceclass.yaml
 
 # Apply ResourceClaimTemplates
 kubectl apply -f resource-claim-template.yaml
@@ -187,7 +183,9 @@ by NCCL; expect lower bandwidth due to cross-NUMA memory traffic.
 ## Running the full test suite
 
 Each test requires deleting the previous MPIJob since the resource claims are
-immutable. Between tests, orphaned NICs may need PCI rebinding (see next section).
+immutable. When a worker pod is deleted, DRANET returns its NIC(s) to the host
+namespace and the device reappears in the node's ResourceSlice within one poll
+interval, so the next test can reallocate them.
 
 ```bash
 # --- Test 1: 1nic-aligned ---
@@ -206,58 +204,6 @@ kubectl delete mpijob nccl-test-dra
 kubectl apply -f mpi-job.yaml
 kubectl delete mpijob nccl-test-dra
 ```
-
-## Recovering orphaned RDMA NICs
-
-When a pod is deleted, DRANET may not return the RDMA NIC from the pod namespace
-to the host namespace. The NIC disappears from both the host and the ResourceSlice.
-This is a known DRANET bug. [This issue](https://github.com/kubernetes-sigs/dranet/issues/137) tracks the DRANET progress, while [this PR](https://github.com/containerd/nri/pull/286) addresses the upstream NRI changes.
-
-**Symptoms:** Workers stuck in `Pending` with `cannot allocate all claims`.
-
-**Check which NICs are missing:**
-
-```bash
-kubectl get resourceslice -o json | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for rs in data['items']:
-    if rs['spec'].get('driver') != 'dra.net': continue
-    node = rs['spec']['nodeName']
-    for d in rs['spec'].get('devices', []):
-        attrs = d.get('attributes', {})
-        if attrs.get('dra.net/rdma', {}).get('bool') and \
-           not attrs.get('dra.net/virtual', {}).get('bool', True) and \
-           not attrs.get('dra.net/ifName', {}).get('string', ''):
-            pci = attrs.get('dra.net/pciAddress', {}).get('string', '?')
-            print(f'{node}: {d[\"name\"]} pci={pci}')
-"
-```
-
-**Recover via PCI rebind** (requires a privileged pod on each affected GPU node):
-
-```bash
-kubectl debug node/<node-ip> --image=<any-cached-image> -it -- bash
-# Inside the debug pod:
-chroot /host
-echo "0000:03:00.0" > /sys/bus/pci/drivers/mlx5_core/unbind && sleep 1
-echo "0000:03:00.0" > /sys/bus/pci/drivers/mlx5_core/bind
-```
-
-Common PCI addresses on BM.GPU.GB200-v3.4:
-
-| ifName | PCI Address | NUMA |
-|---|---|---|
-| rdma0 | 0000:03:00.0 | 0 |
-| rdma1 | 0000:03:00.1 | 0 |
-| rdma2 | 0002:03:00.0 | 0 |
-| rdma3 | 0002:03:00.1 | 0 |
-| rdma4 | 0010:03:00.0 | 1 |
-| rdma5 | 0010:03:00.1 | 1 |
-| rdma6 | 0012:03:00.0 | 1 |
-| rdma7 | 0012:03:00.1 | 1 |
-
-Wait ~15 seconds for DRANET to rescan, then verify the NIC reappears in the ResourceSlice.
 
 ## Benchmark Results
 
@@ -332,7 +278,7 @@ idiomatic DRA approach for multi-device allocation from a homogeneous pool.
 **~92–96% of theoretical at 2 nodes:**
 Peak single-NIC bandwidth is 400 Gb/s = 50 GB/s. The 1nic-aligned result
 (~46 GB/s) achieves ~92% of theoretical, demonstrating that DRANET's DRA-based
-NIC injection and IPv6 GID configuration adds negligible overhead.
+NIC injection adds negligible overhead.
 
 **Channel × QPS equivalence at 16 nodes (1-GPU mode):**
 At scale, total QP fanout governs throughput. `NCCL_MIN_NCHANNELS=8` with
