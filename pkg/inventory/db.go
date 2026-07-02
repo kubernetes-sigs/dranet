@@ -195,9 +195,22 @@ func (db *DB) Run(ctx context.Context) error {
 // It discovers PCI, network, and RDMA devices, adds cloud attributes,
 // filters out default interfaces, and updates the device store.
 func (db *DB) scan() []resourceapi.Device {
-	devices := db.discoverPCIDevices()
+	pciInfo, err := ghw.PCI(
+		ghw.WithDisableTools(),
+	)
+	if err != nil {
+		klog.Errorf("Could not get PCI devices: %v", err)
+	}
+
+	// Phase 1: Discovery — find devices, set identity attributes only
+	// (PCIAddress, RDMADevice, ifName, MAC, …).
+	devices := db.discoverPCIDevices(pciInfo)
 	devices = db.discoverStandaloneRDMADevices(devices)
 	devices = db.discoverNetworkInterfaces(devices)
+
+	// Phase 2: Enrichment — set derived PCI and RDMA attributes uniformly
+	// for all devices, regardless of which discovery path found them.
+	devices = db.addPCIAttributes(devices, pciInfo)
 	devices = db.addRDMAAttributes(devices)
 	devices = db.addCloudAttributes(devices)
 
@@ -236,18 +249,14 @@ func (db *DB) RequestRescan() {
 	}
 }
 
-func (db *DB) discoverPCIDevices() []resourceapi.Device {
+func (db *DB) discoverPCIDevices(pciInfo *ghw.PCIInfo) []resourceapi.Device {
 	devices := []resourceapi.Device{}
 
-	pci, err := ghw.PCI(
-		ghw.WithDisableTools(),
-	)
-	if err != nil {
-		klog.Errorf("Could not get PCI devices: %v", err)
+	if pciInfo == nil {
 		return devices
 	}
 
-	for _, pciDev := range pci.Devices {
+	for _, pciDev := range pciInfo.Devices {
 		if !isNetworkDevice(pciDev) {
 			continue
 		}
@@ -261,26 +270,6 @@ func (db *DB) discoverPCIDevices() []resourceapi.Device {
 			Capacity:   make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity),
 		}
 		device.Attributes[apis.AttrPCIAddress] = resourceapi.DeviceAttribute{StringValue: &pciDev.Address}
-		if pciDev.Vendor != nil {
-			device.Attributes[apis.AttrPCIVendor] = resourceapi.DeviceAttribute{StringValue: &pciDev.Vendor.Name}
-		}
-		if pciDev.Product != nil {
-			device.Attributes[apis.AttrPCIDevice] = resourceapi.DeviceAttribute{StringValue: &pciDev.Product.Name}
-		}
-		if pciDev.Subsystem != nil {
-			device.Attributes[apis.AttrPCISubsystem] = resourceapi.DeviceAttribute{StringValue: &pciDev.Subsystem.ID}
-		}
-
-		if pciDev.Node != nil {
-			device.Attributes[apis.AttrNUMANode] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(pciDev.Node.ID))}
-		}
-
-		pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(pciDev.Address)
-		if err != nil {
-			klog.Infof("Could not get pci root attribute: %v", err)
-		} else {
-			device.Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
-		}
 		devices = append(devices, device)
 	}
 	return devices
@@ -505,12 +494,18 @@ func (db *DB) addRDMAAttributes(devices []resourceapi.Device) []resourceapi.Devi
 				isRDMA = isRdmaDeviceInSysfs(*ifName)
 			}
 		} else if pciAddr := devices[i].Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil && *pciAddr != "" {
-			rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)
-			isRDMA = len(rdmaDevices) != 0
-			if isRDMA {
-				// IB-only device: has RDMA capability but no netdev interface.
-				rdmaDevName := rdmaDevices[0]
-				devices[i].Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: &rdmaDevName}
+			// IB-only device: has RDMA capability but no netdev interface.
+			// If AttrRDMADevice was already set (e.g., by discoverStandaloneRDMADevices),
+			// trust it directly; otherwise look it up via rdmamap.
+			if rdmaDevAttr, ok := devices[i].Attributes[apis.AttrRDMADevice]; ok && rdmaDevAttr.StringValue != nil && *rdmaDevAttr.StringValue != "" {
+				isRDMA = true
+			} else {
+				rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)
+				isRDMA = len(rdmaDevices) != 0
+				if isRDMA {
+					rdmaDevName := rdmaDevices[0]
+					devices[i].Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: &rdmaDevName}
+				}
 			}
 		}
 		devices[i].Attributes[apis.AttrRDMA] = resourceapi.DeviceAttribute{BoolValue: &isRDMA}
@@ -751,6 +746,10 @@ func isAllocatableNetworkDevice(dev *ghw.PCIDevice) bool {
 // the standard network device class. Each standalone RDMA device is exposed as
 // an IB-only device (no netdev) with its RDMA device name.
 //
+// Only identity attributes (PCIAddress, RDMADevice) are set here; PCI
+// attributes like NUMA node, vendor, and product are populated uniformly by
+// enrichPCIDeviceAttributes in the enrichment phase.
+//
 // Unlike /sys/class/net, /sys/class/infiniband entries are not netns-tagged:
 // they remain visible from the host even after the device is allocated to a pod,
 // so this scan is stable across the full device lifecycle.
@@ -783,16 +782,64 @@ func (db *DB) discoverStandaloneRDMADevices(devices []resourceapi.Device) []reso
 		device.Attributes[apis.AttrPCIAddress] = resourceapi.DeviceAttribute{StringValue: ptr.To(pciAddr.String())}
 		device.Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: ptr.To(rdmaDevName)}
 
-		pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(pciAddr.String())
-		if err != nil {
-			klog.V(4).Infof("Could not get PCIe root for standalone RDMA device %s: %v", rdmaDevName, err)
-		} else {
-			device.Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
-		}
-
 		devices = append(devices, device)
 		knownPCIAddresses.Insert(normalizedAddr)
 	}
 
+	return devices
+}
+
+// addPCIAttributes sets PCI-related attributes (NUMA node, vendor, product,
+// subsystem, PCIe root) for every device that has a PCI address. This runs
+// after all discovery steps so that attributes are populated uniformly
+// regardless of which discovery path found the device.
+//
+// ghw is the sole data source: it reads vendor/product from pcidb and NUMA
+// from /sys/bus/pci/devices/<BDF>/numa_node for all PCI devices regardless of
+// class. If a device is not found in ghw (e.g., modalias parsing failure),
+// its PCI attributes are simply left unset — the device is still published
+// with its identity attributes from discovery.
+func (db *DB) addPCIAttributes(devices []resourceapi.Device, pciInfo *ghw.PCIInfo) []resourceapi.Device {
+	pciMap := make(map[string]*ghw.PCIDevice)
+	if pciInfo != nil {
+		for _, d := range pciInfo.Devices {
+			pciMap[names.NormalizePCIAddress(d.Address)] = d
+		}
+	}
+
+	for i := range devices {
+		pciAddrAttr, ok := devices[i].Attributes[apis.AttrPCIAddress]
+		if !ok || pciAddrAttr.StringValue == nil {
+			continue
+		}
+		normalizedAddr := names.NormalizePCIAddress(*pciAddrAttr.StringValue)
+
+		pciDev, inGhw := pciMap[normalizedAddr]
+		if !inGhw {
+			continue
+		}
+
+		if _, hasAttr := devices[i].Attributes[apis.AttrNUMANode]; !hasAttr && pciDev.Node != nil {
+			devices[i].Attributes[apis.AttrNUMANode] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(pciDev.Node.ID))}
+		}
+		if _, hasAttr := devices[i].Attributes[apis.AttrPCIVendor]; !hasAttr && pciDev.Vendor != nil {
+			devices[i].Attributes[apis.AttrPCIVendor] = resourceapi.DeviceAttribute{StringValue: &pciDev.Vendor.Name}
+		}
+		if _, hasAttr := devices[i].Attributes[apis.AttrPCIDevice]; !hasAttr && pciDev.Product != nil {
+			devices[i].Attributes[apis.AttrPCIDevice] = resourceapi.DeviceAttribute{StringValue: &pciDev.Product.Name}
+		}
+		if _, hasAttr := devices[i].Attributes[apis.AttrPCISubsystem]; !hasAttr && pciDev.Subsystem != nil {
+			devices[i].Attributes[apis.AttrPCISubsystem] = resourceapi.DeviceAttribute{StringValue: &pciDev.Subsystem.ID}
+		}
+
+		if _, hasAttr := devices[i].Attributes[deviceattribute.StandardDeviceAttributePCIeRoot]; !hasAttr {
+			pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(*pciAddrAttr.StringValue)
+			if err != nil {
+				klog.V(4).Infof("Could not get PCIe root for PCI device %s: %v", normalizedAddr, err)
+			} else {
+				devices[i].Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
+			}
+		}
+	}
 	return devices
 }
