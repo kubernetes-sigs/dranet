@@ -855,7 +855,7 @@ func TestGetDeviceNetworkConfigWithWebhook(t *testing.T) {
 }
 
 func TestMergeDevices(t *testing.T) {
-	mockAttr := func(val string) resourcev1.DeviceAttribute {
+	stringAttr := func(val string) resourcev1.DeviceAttribute {
 		return resourcev1.DeviceAttribute{
 			StringValue: &val,
 		}
@@ -864,31 +864,16 @@ func TestMergeDevices(t *testing.T) {
 	pciDev := resourcev1.Device{
 		Name: "0000:c0:14.0",
 		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-			resourcev1.QualifiedName(apis.AttrPCIAddress): mockAttr("0000:c0:14.0"),
-		},
-	}
-
-	pciDevDegraded := resourcev1.Device{
-		Name: "0000:c0:14.0",
-		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-			resourcev1.QualifiedName(apis.AttrPCIAddress): mockAttr("0000:c0:14.0"),
+			resourcev1.QualifiedName(apis.AttrPCIAddress): stringAttr("0000:c0:14.0"),
 		},
 	}
 
 	pciDevSnapshot := resourcev1.Device{
 		Name: "0000:c0:14.0",
 		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-			resourcev1.QualifiedName(apis.AttrPCIAddress):    mockAttr("0000:c0:14.0"),
-			resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("eth1"),
-			resourcev1.QualifiedName(apis.AttrMTU):           mockAttr("1500"),
-		},
-	}
-
-	virtualDevSnapshot := resourcev1.Device{
-		Name: "ipvlan-dev",
-		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-			resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("ipvlan-dev"),
-			resourcev1.QualifiedName(apis.AttrMTU):           mockAttr("1500"),
+			resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+			resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+			resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
 		},
 	}
 
@@ -905,30 +890,24 @@ func TestMergeDevices(t *testing.T) {
 			expected:  []resourcev1.Device{pciDev},
 		},
 		{
-			name:      "Physical device merge",
-			available: []resourcev1.Device{pciDevDegraded},
+			name:      "Device merge",
+			available: []resourcev1.Device{pciDev},
 			allocated: []resourcev1.Device{pciDevSnapshot},
 			expected:  []resourcev1.Device{pciDevSnapshot},
 		},
 		{
-			name:      "Virtual device preserve",
-			available: nil,
-			allocated: []resourcev1.Device{virtualDevSnapshot},
-			expected:  []resourcev1.Device{virtualDevSnapshot},
-		},
-		{
-			name:      "Physical device missing from host (Ghost device)",
+			name:      "Allocated device missing from host (Ghost device)",
 			available: nil,
 			allocated: []resourcev1.Device{pciDevSnapshot},
 			expected:  []resourcev1.Device{pciDevSnapshot},
 		},
 		{
-			name: "Physical device back on host (Zombie override)",
+			name: "Device back on host (Zombie override)",
 			available: []resourcev1.Device{{
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-					resourcev1.QualifiedName(apis.AttrPCIAddress):    mockAttr("0000:c0:14.0"),
-					resourcev1.QualifiedName(apis.AttrInterfaceName): mockAttr("eth1"), // back on host!
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"), // back on host!
 				},
 			}},
 			allocated: []resourcev1.Device{pciDevSnapshot},

@@ -65,7 +65,7 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 			// Fetch allocated devices from BoltDB store and merge
 			var allocated []resourceapi.Device
 			if np.podConfigStore != nil {
-				allocated = np.podConfigStore.GetAllocatedDevices()
+				allocated = np.podConfigStore.GetAllocatedDeviceSnapshots()
 			}
 			merged := mergeDevices(devices, allocated)
 
@@ -725,23 +725,32 @@ func mergeDevices(available, allocated []resourceapi.Device) []resourceapi.Devic
 }
 
 func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
-	merged := snap
+	merged := live
 
-	if merged.Attributes == nil {
-		merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
-	}
-	if merged.Capacity == nil {
-		merged.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity)
-	}
-
-	// Overwrite with live attributes (precedence to live data)
+	// Deep-copy live attributes
+	merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
 	for k, v := range live.Attributes {
 		merged.Attributes[k] = v
 	}
 
-	// Overwrite with live capacities (precedence to live data)
+	// Layer snapshot attributes on top if they are missing in live
+	for k, v := range snap.Attributes {
+		if _, exists := merged.Attributes[k]; !exists {
+			merged.Attributes[k] = v
+		}
+	}
+
+	// Deep-copy live capacities
+	merged.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity)
 	for k, v := range live.Capacity {
 		merged.Capacity[k] = v
+	}
+
+	// Layer snapshot capacities on top if they are missing in live
+	for k, v := range snap.Capacity {
+		if _, exists := merged.Capacity[k]; !exists {
+			merged.Capacity[k] = v
+		}
 	}
 
 	return merged

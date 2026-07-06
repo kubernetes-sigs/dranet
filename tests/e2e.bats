@@ -656,7 +656,7 @@ EOF
   assert_success
 }
 
-@test "allocated device attributes are persisted in ResourceSlice across daemon restart" {
+@test "allocated device in ResourceSlice remains unchanged" {
   local NODE_NAME="$CLUSTER_NAME"-worker
   local DUMMY_IFACE="dummy0"
 
@@ -671,20 +671,11 @@ EOF
   assert_output --partial "$DUMMY_IFACE"
 
   # Retrieve its original attributes before allocation
-  local MAC_ADDR
-  MAC_ADDR=$(kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/mac.string}")
-  local MTU
-  MTU=$(kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/mtu.int}")
-  local TYPE
-  TYPE=$(kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/type.string}")
-  local ENCAP
-  ENCAP=$(kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/encapsulation.string}")
+  local ORIGINAL_ATTRIBUTES
+  ORIGINAL_ATTRIBUTES=$(kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes}")
 
   # Ensure the retrieved values are not empty
-  [ -n "$MAC_ADDR" ]
-  [ -n "$MTU" ]
-  [ -n "$TYPE" ]
-  [ -n "$ENCAP" ]
+  [ -n "$ORIGINAL_ATTRIBUTES" ]
 
   # 3. Apply the resource claim (allocating dummy0) and start the Pod
   kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
@@ -692,42 +683,18 @@ EOF
   kubectl wait --timeout=30s --for=condition=ready pods -l app=pod
 
   # 4. Verify that the allocated dummy0 device attributes are still present and correct
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/mac.string}"
+  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes}"
   assert_success
-  assert_output "$MAC_ADDR"
-
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/mtu.int}"
-  assert_success
-  assert_output "$MTU"
-
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/type.string}"
-  assert_success
-  assert_output "$TYPE"
-
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/encapsulation.string}"
-  assert_success
-  assert_output "$ENCAP"
+  assert_output "$ORIGINAL_ATTRIBUTES"
 
   # 5. Restart the DRANET daemonset to test persistence
   kubectl rollout restart -n kube-system daemonset/dranet
   kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
 
   # 6. Verify that the allocated device attributes are still correct after daemon restart
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/mac.string}"
+  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes}"
   assert_success
-  assert_output "$MAC_ADDR"
-
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/mtu.int}"
-  assert_success
-  assert_output "$MTU"
-
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/type.string}"
-  assert_success
-  assert_output "$TYPE"
-
-  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes.dra\\.net\\/encapsulation.string}"
-  assert_success
-  assert_output "$ENCAP"
+  assert_output "$ORIGINAL_ATTRIBUTES"
 
   # 7. Clean up Pod, Claim and Interface
   kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml --ignore-not-found

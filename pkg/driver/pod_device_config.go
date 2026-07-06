@@ -315,9 +315,9 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
 	return podsToDelete
 }
 
-// GetAllocatedDevices returns all devices currently allocated to active pods
+// GetAllocatedDeviceSnapshots returns all devices currently allocated to active pods
 // that have a valid device attributes snapshot stored in BoltDB.
-func (s *PodConfigStore) GetAllocatedDevices() []resourceapi.Device {
+func (s *PodConfigStore) GetAllocatedDeviceSnapshots() []resourceapi.Device {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

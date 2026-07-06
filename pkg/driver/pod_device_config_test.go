@@ -22,8 +22,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/dranet/pkg/apis"
 )
 
@@ -409,7 +412,7 @@ func TestPodConfigStore_NoDuplicateDevices(t *testing.T) {
 	}
 }
 
-func TestPodConfigStore_GetAllocatedDevices(t *testing.T) {
+func TestPodConfigStore_GetAllocatedDeviceSnapshots(t *testing.T) {
 	store := mustNewPodConfigStore()
 	podUID1 := types.UID("pod-1")
 	podUID2 := types.UID("pod-2")
@@ -423,7 +426,7 @@ func TestPodConfigStore_GetAllocatedDevices(t *testing.T) {
 	}
 
 	// Verify it returns nothing if no device snapshots are stored
-	allocated := store.GetAllocatedDevices()
+	allocated := store.GetAllocatedDeviceSnapshots()
 	if len(allocated) != 0 {
 		t.Errorf("expected 0 allocated devices, got %d", len(allocated))
 	}
@@ -431,6 +434,16 @@ func TestPodConfigStore_GetAllocatedDevices(t *testing.T) {
 	// Set config with device snapshot
 	snapDev := resourceapi.Device{
 		Name: "0000:c0:14.0",
+		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			apis.AttrPCIAddress: {
+				StringValue: ptr.To("0000:c0:14.0"),
+			},
+		},
+		Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+			resourceapi.QualifiedName("some-capacity"): {
+				Value: resource.MustParse("10G"),
+			},
+		},
 	}
 	err = store.SetDeviceConfig(podUID2, "0000:c0:14.0", DeviceConfig{
 		Claim:  types.NamespacedName{Namespace: "default", Name: "claim-2"},
@@ -441,11 +454,11 @@ func TestPodConfigStore_GetAllocatedDevices(t *testing.T) {
 	}
 
 	// Verify we get exactly the snapshot device
-	allocated = store.GetAllocatedDevices()
+	allocated = store.GetAllocatedDeviceSnapshots()
 	if len(allocated) != 1 {
 		t.Fatalf("expected 1 allocated device, got %d", len(allocated))
 	}
-	if allocated[0].Name != "0000:c0:14.0" {
-		t.Errorf("expected device name '0000:c0:14.0', got %s", allocated[0].Name)
+	if diff := cmp.Diff(snapDev, allocated[0]); diff != "" {
+		t.Errorf("allocated device snapshot mismatch (-want +got):\n%s", diff)
 	}
 }
