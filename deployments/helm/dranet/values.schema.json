@@ -107,6 +107,9 @@
         }
       }
     },
+    "global": {
+      "type": "object"
+    },
     "serviceAccount": {
       "type": "object",
       "additionalProperties": false,
