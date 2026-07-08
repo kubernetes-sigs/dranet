@@ -67,6 +67,8 @@ var (
 	profileProvider   string
 	webhookURL        string
 
+	kubeletRootDir string
+
 	ready atomic.Bool
 )
 
@@ -83,6 +85,7 @@ func init() {
 	flag.StringVar(&cloudProviderHint, "cloud-provider-hint", "", "Hint for the cloud provider that will be used to select the appropriate provider plugin. Supported values: (AWS, GCE, AZURE, OKE, ALIBABA, webhook, NONE). If left unset, the cloud provider is auto-detected.")
 	flag.StringVar(&profileProvider, "profile-provider", "cloud", "Provides user intent (cloud, webhook, none). 'cloud' falls back to the cloud-provider's native implementation.")
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
+	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -157,6 +160,8 @@ func main() {
 	if dbPath != "" {
 		opts = append(opts, driver.WithDBPath(dbPath))
 	}
+
+	opts = append(opts, driver.WithKubeletRootDir(kubeletRootDir))
 
 	if celExpression != "" {
 		env, err := cel.NewEnv(

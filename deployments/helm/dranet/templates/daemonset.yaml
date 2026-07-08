@@ -72,6 +72,7 @@ spec:
             {{- if .Values.args.cloudProviderHint }}
             - --cloud-provider-hint={{ .Values.args.cloudProviderHint }}
             {{- end }}
+            - --kubelet-root-dir={{ .Values.kubeletRootDir }}
           env:
             - name: NODE_NAME
               valueFrom:
@@ -98,9 +99,9 @@ spec:
               port: {{ .Values.metricsPort | default 9177 }}
           volumeMounts:
             - name: device-plugin
-              mountPath: /var/lib/kubelet/plugins
+              mountPath: {{ .Values.kubeletRootDir }}/plugins
             - name: plugin-registry
-              mountPath: /var/lib/kubelet/plugins_registry
+              mountPath: {{ .Values.kubeletRootDir }}/plugins_registry
             - name: nri-plugin
               mountPath: /var/run/nri
             - name: netns
@@ -115,10 +116,10 @@ spec:
       volumes:
         - name: device-plugin
           hostPath:
-            path: /var/lib/kubelet/plugins
+            path: {{ .Values.kubeletRootDir }}/plugins
         - name: plugin-registry
           hostPath:
-            path: /var/lib/kubelet/plugins_registry
+            path: {{ .Values.kubeletRootDir }}/plugins_registry
         - name: nri-plugin
           hostPath:
             path: /var/run/nri

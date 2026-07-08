@@ -46,10 +46,6 @@ import (
 )
 
 const (
-	kubeletPluginPath = "/var/lib/kubelet/plugins"
-)
-
-const (
 	// maxAttempts indicates the number of times the driver will try to recover itself before failing
 	maxAttempts = 5
 )
@@ -96,6 +92,16 @@ func WithDBPath(path string) Option {
 	}
 }
 
+// WithKubeletRootDir sets the kubelet data directory (its --root-dir). The
+// driver's registration socket lives under <dir>/plugins_registry and its
+// dra.sock under <dir>/plugins. Set this when the kubelet runs with a
+// non-default --root-dir.
+func WithKubeletRootDir(dir string) Option {
+	return func(o *NetworkDriver) {
+		o.kubeletRootDir = dir
+	}
+}
+
 type NetworkDriver struct {
 	draPlugin     pluginHelper
 	driverName    string
@@ -112,6 +118,10 @@ type NetworkDriver struct {
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
 	dbPath         string // path for persistent bbolt database; empty means in-memory
+
+	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
+	// kubelet runs with a non-default --root-dir.
+	kubeletRootDir string
 
 	clock clock.WithTicker // Injectable clock for testing
 }
@@ -165,16 +175,22 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	}
 	plugin.podConfigStore = store
 
-	driverPluginPath := filepath.Join(kubeletPluginPath, driverName)
+	driverPluginPath := filepath.Join(plugin.kubeletRootDir, "plugins", driverName)
 	err = os.MkdirAll(driverPluginPath, 0750)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create plugin path %s: %v", driverPluginPath, err)
 	}
 
+	// Derive the registration and plugin data directories from the kubelet root
+	// dir so they are correct when the kubelet uses a non-default --root-dir. At
+	// the default this matches the kubeletplugin defaults, so existing deployments
+	// are unaffected.
 	kubeletOpts := []kubeletplugin.Option{
 		kubeletplugin.DriverName(driverName),
 		kubeletplugin.NodeName(nodeName),
 		kubeletplugin.KubeClient(kubeClient),
+		kubeletplugin.RegistrarDirectoryPath(filepath.Join(plugin.kubeletRootDir, "plugins_registry")),
+		kubeletplugin.PluginDataDirectoryPath(driverPluginPath),
 	}
 	d, err := kubeletplugin.Start(ctx, plugin, kubeletOpts...)
 	if err != nil {
