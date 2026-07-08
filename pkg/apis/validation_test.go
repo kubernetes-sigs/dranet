@@ -108,7 +108,7 @@ func TestValidateConfig(t *testing.T) {
 			raw:         newRawExtension(t, invalidRouteConf),
 			expectErr:   true,
 			expectedCfg: &invalidRouteConf,
-			errContains: []string{"routes[0].destination: invalid CIDR format 'invalid-cidr'"},
+			errContains: []string{"routes[0].destination: invalid CIDR format 'invalid-cidr' (host routes use /32 or /128)"},
 		},
 		{
 			name:        "config with rule validation error",
