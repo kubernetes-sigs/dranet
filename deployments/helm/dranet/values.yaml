@@ -28,6 +28,14 @@ args: {}
 #  moveIBInterfaces: true
 #  cloudProviderHint: ""
 
+# kubeletRootDir is the kubelet data directory (its --root-dir). The driver's
+# registration socket lives under <kubeletRootDir>/plugins_registry (which the
+# kubelet watches) and its dra.sock under <kubeletRootDir>/plugins. The same path
+# is used for the hostPath and the mountPath so it is identical inside and outside
+# the container, as the kubeletplugin library requires. Set this to match the
+# kubelet --root-dir on clusters that relocate it; the default suits a standard kubelet.
+kubeletRootDir: /var/lib/kubelet
+
 nodeSelector: {}
 
 affinity: {}

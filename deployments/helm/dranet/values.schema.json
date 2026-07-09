@@ -55,6 +55,10 @@
       "type": "integer",
       "minimum": 0
     },
+    "kubeletRootDir": {
+      "type": "string",
+      "description": "Kubelet data directory (its --root-dir); the driver's plugin and registration sockets live under it"
+    },
     "args": {
       "type": "object",
       "additionalProperties": false,
