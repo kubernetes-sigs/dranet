@@ -202,16 +202,29 @@ func validateVRFConfig(cfg *VRFConfig, fieldPath string) (allErrors []error) {
 	return allErrors
 }
 
+// sameIPFamily reports whether a and b are both IPv4 or both IPv6.
+func sameIPFamily(a, b net.IP) bool {
+	return (a.To4() != nil) == (b.To4() != nil)
+}
+
 // validateRoutes validates a slice of RouteConfig.
 func validateRoutes(routes []RouteConfig, fieldPath string) (allErrors []error) {
 	for i, route := range routes {
 		currentFieldPath := fmt.Sprintf("%s[%d]", fieldPath, i)
 
+		// dstIP is retained so the gateway and source can be checked against the
+		// destination's IP family. The kernel (via netlink RouteAdd) rejects a
+		// route whose gateway or source is a different family than the destination,
+		// so validation rejects the mismatch here rather than letting it fail at
+		// apply time.
+		var dstIP net.IP
 		if route.Destination == "" {
 			allErrors = append(allErrors, fmt.Errorf("%s.destination: cannot be empty", currentFieldPath))
 		} else {
-			if _, _, err := net.ParseCIDR(route.Destination); err != nil {
+			if ip, _, err := net.ParseCIDR(route.Destination); err != nil {
 				allErrors = append(allErrors, fmt.Errorf("%s.destination: invalid CIDR format '%s' (host routes use /32 or /128)", currentFieldPath, route.Destination))
+			} else {
+				dstIP = ip
 			}
 		}
 
@@ -224,16 +237,22 @@ func validateRoutes(routes []RouteConfig, fieldPath string) (allErrors []error) 
 		}
 
 		if route.Gateway != "" {
-			if net.ParseIP(route.Gateway) == nil {
+			gwIP := net.ParseIP(route.Gateway)
+			if gwIP == nil {
 				allErrors = append(allErrors, fmt.Errorf("%s.gateway: invalid IP address format '%s'", currentFieldPath, route.Gateway))
+			} else if dstIP != nil && !sameIPFamily(dstIP, gwIP) {
+				allErrors = append(allErrors, fmt.Errorf("%s.gateway: '%s' must be the same IP family as destination '%s'", currentFieldPath, route.Gateway, route.Destination))
 			}
 		} else if !scopeIsLink { // Gateway is required if scope is Universe
 			allErrors = append(allErrors, fmt.Errorf("%s.gateway: must be specified for Universe scope routes", currentFieldPath))
 		}
 
 		if route.Source != "" {
-			if net.ParseIP(route.Source) == nil {
+			srcIP := net.ParseIP(route.Source)
+			if srcIP == nil {
 				allErrors = append(allErrors, fmt.Errorf("%s.source: invalid IP address format '%s'", currentFieldPath, route.Source))
+			} else if dstIP != nil && !sameIPFamily(dstIP, srcIP) {
+				allErrors = append(allErrors, fmt.Errorf("%s.source: '%s' must be the same IP family as destination '%s'", currentFieldPath, route.Source, route.Destination))
 			}
 		}
 
@@ -257,16 +276,28 @@ func validateRules(rules []RuleConfig, fieldPath string) (allErrors []error) {
 			allErrors = append(allErrors, fmt.Errorf("%s.table: must be a non-negative integer, got %d", currentFieldPath, rule.Table))
 		}
 
+		var srcIP, dstIP net.IP
 		if rule.Source != "" {
-			if _, _, err := net.ParseCIDR(rule.Source); err != nil {
+			if ip, _, err := net.ParseCIDR(rule.Source); err != nil {
 				allErrors = append(allErrors, fmt.Errorf("%s.source: invalid CIDR format '%s'", currentFieldPath, rule.Source))
+			} else {
+				srcIP = ip
 			}
 		}
 
 		if rule.Destination != "" {
-			if _, _, err := net.ParseCIDR(rule.Destination); err != nil {
+			if ip, _, err := net.ParseCIDR(rule.Destination); err != nil {
 				allErrors = append(allErrors, fmt.Errorf("%s.destination: invalid CIDR format '%s'", currentFieldPath, rule.Destination))
+			} else {
+				dstIP = ip
 			}
+		}
+
+		// The kernel (via netlink RuleAdd) rejects a rule whose source and
+		// destination are different IP families, so reject it here rather than
+		// letting it fail at apply time.
+		if srcIP != nil && dstIP != nil && !sameIPFamily(srcIP, dstIP) {
+			allErrors = append(allErrors, fmt.Errorf("%s: source '%s' and destination '%s' must be the same IP family", currentFieldPath, rule.Source, rule.Destination))
 		}
 	}
 	return allErrors

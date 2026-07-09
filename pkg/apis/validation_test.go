@@ -433,6 +433,39 @@ func TestValidateRoutes(t *testing.T) {
 			expectErr: true,
 			errCount:  1,
 		},
+		{
+			name:      "valid IPv6 route with IPv6 gateway",
+			routes:    []RouteConfig{{Destination: "2001:db8:1::/64", Gateway: "2001:db8::1", Scope: scopeUniverse}},
+			fieldPath: "routes",
+			expectErr: false,
+		},
+		{
+			name:      "valid route with matching gateway and source",
+			routes:    []RouteConfig{{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Source: "192.168.1.2", Scope: scopeUniverse}},
+			fieldPath: "routes",
+			expectErr: false,
+		},
+		{
+			name:      "gateway family mismatch (IPv4 destination, IPv6 gateway)",
+			routes:    []RouteConfig{{Destination: "10.0.0.0/8", Gateway: "2001:db8::1", Scope: scopeUniverse}},
+			fieldPath: "routes",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "gateway family mismatch (IPv6 destination, IPv4 gateway)",
+			routes:    []RouteConfig{{Destination: "2001:db8::/64", Gateway: "192.168.1.1", Scope: scopeUniverse}},
+			fieldPath: "routes",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "source family mismatch (IPv4 destination, IPv6 source)",
+			routes:    []RouteConfig{{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Source: "2001:db8::2"}},
+			fieldPath: "routes",
+			expectErr: true,
+			errCount:  1,
+		},
 	}
 
 	for _, tt := range tests {
@@ -505,6 +538,19 @@ func TestValidateRules(t *testing.T) {
 		{
 			name:      "invalid destination CIDR",
 			rules:     []RuleConfig{{Destination: "invalid-cidr"}},
+			fieldPath: "rules",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "valid rule with matching IPv6 source and destination",
+			rules:     []RuleConfig{{Source: "2001:db8::/64", Destination: "2001:db8:1::/64", Table: 100}},
+			fieldPath: "rules",
+			expectErr: false,
+		},
+		{
+			name:      "source and destination family mismatch",
+			rules:     []RuleConfig{{Source: "10.0.0.0/8", Destination: "2001:db8::/32", Table: 100}},
 			fieldPath: "rules",
 			expectErr: true,
 			errCount:  1,
