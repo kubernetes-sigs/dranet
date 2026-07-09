@@ -108,7 +108,7 @@ func TestValidateConfig(t *testing.T) {
 			raw:         newRawExtension(t, invalidRouteConf),
 			expectErr:   true,
 			expectedCfg: &invalidRouteConf,
-			errContains: []string{"routes[0].destination: invalid IP or CIDR format 'invalid-cidr'"},
+			errContains: []string{"routes[0].destination: invalid CIDR format 'invalid-cidr' (host routes use /32 or /128)"},
 		},
 		{
 			name:        "config with rule validation error",
@@ -374,6 +374,26 @@ func TestValidateRoutes(t *testing.T) {
 		{
 			name:      "invalid destination CIDR",
 			routes:    []RouteConfig{{Destination: "10.0.0/24", Gateway: "192.168.1.1"}},
+			fieldPath: "routes",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "valid host route as /32",
+			routes:    []RouteConfig{{Destination: "192.168.1.1/32", Gateway: "192.168.1.254", Scope: scopeUniverse}},
+			fieldPath: "routes",
+			expectErr: false,
+		},
+		{
+			name:      "bare IPv4 destination rejected",
+			routes:    []RouteConfig{{Destination: "192.168.1.1", Gateway: "192.168.1.254"}},
+			fieldPath: "routes",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "bare IPv6 destination rejected",
+			routes:    []RouteConfig{{Destination: "2001:db8::1", Scope: scopeLink}},
 			fieldPath: "routes",
 			expectErr: true,
 			errCount:  1,

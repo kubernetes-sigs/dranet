@@ -211,9 +211,7 @@ func validateRoutes(routes []RouteConfig, fieldPath string) (allErrors []error) 
 			allErrors = append(allErrors, fmt.Errorf("%s.destination: cannot be empty", currentFieldPath))
 		} else {
 			if _, _, err := net.ParseCIDR(route.Destination); err != nil {
-				if net.ParseIP(route.Destination) == nil {
-					allErrors = append(allErrors, fmt.Errorf("%s.destination: invalid IP or CIDR format '%s'", currentFieldPath, route.Destination))
-				}
+				allErrors = append(allErrors, fmt.Errorf("%s.destination: invalid CIDR format '%s' (host routes use /32 or /128)", currentFieldPath, route.Destination))
 			}
 		}
 
