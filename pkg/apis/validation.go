@@ -65,6 +65,9 @@ func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
 	// Validate InterfaceConfig
 	allErrors = append(allErrors, validateInterfaceConfig(&config.Interface, "interface")...)
 
+	// Validate SubInterfaceConfig
+	allErrors = append(allErrors, validateSubInterfaceConfig(config.SubInterface, "subInterface")...)
+
 	// Validate Routes
 	if len(config.Routes) > 0 {
 		allErrors = append(allErrors, validateRoutes(config.Routes, "routes")...)
@@ -179,6 +182,45 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 
 	if cfg.VRF != nil {
 		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
+	}
+
+	return allErrors
+}
+
+func validateSubInterfaceConfig(cfg *SubInterfaceConfig, fieldPath string) (allErrors []error) {
+	if cfg == nil {
+		return
+	}
+
+	for i, addr := range cfg.Addresses {
+		if _, err := netip.ParsePrefix(addr); err != nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: invalid IP CIDR format '%s': %w", fieldPath, i, addr, err))
+		}
+	}
+
+	if cfg.IPRange != "" {
+		if _, err := netip.ParsePrefix(cfg.IPRange); err != nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.ipRange: invalid IP CIDR format '%s': %w", fieldPath, cfg.IPRange, err))
+		}
+	}
+
+	if cfg.Type == SubInterfaceTypeIPVlan {
+		if cfg.IPVlanConfig != nil {
+			allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlanConfig, fieldPath+".ipvlan")...)
+		}
+	} else {
+		allErrors = append(allErrors, fmt.Errorf("%s.type: '%s' is not supported", fieldPath, cfg.Type))
+	}
+
+	return allErrors
+}
+
+func validateIPVlanConfig(cfg *IPVlanConfig, fieldPath string) (allErrors []error) {
+	if cfg.Mode != "l2" {
+		allErrors = append(allErrors, fmt.Errorf("%s.mode: '%s' is not supported", fieldPath, cfg.Mode))
+	}
+	if cfg.Flag != "bridge" {
+		allErrors = append(allErrors, fmt.Errorf("%s.flag: '%s' is not supported", fieldPath, cfg.Flag))
 	}
 
 	return allErrors

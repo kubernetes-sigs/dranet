@@ -327,6 +327,68 @@ func TestValidateInterfaceConfig(t *testing.T) {
 	}
 }
 
+func TestValidateSubInterfaceConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfg       *SubInterfaceConfig
+		fieldPath string
+		expectErr bool
+		errCount  int
+	}{
+		{
+			name:      "valid subinterface config",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", IPRange: "2001:db8::/64", IPVlanConfig: &IPVlanConfig{Mode: "l2", Flag: "bridge"}},
+			fieldPath: "subInterface",
+			expectErr: false,
+		},
+		{
+			name:      "nil config",
+			cfg:       nil,
+			fieldPath: "subInterface",
+			expectErr: false,
+		},
+		{
+			name:      "unsupported subinterface type",
+			cfg:       &SubInterfaceConfig{Type: "macvlan", IPRange: "2001:db8::/64"},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid subinterface addresses",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", Addresses: []string{"invalid-address"}},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid subinterface ip range",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", IPRange: "invalid-range"},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "unsupported subinterface mode and flag",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", IPRange: "2001:db8::/64", IPVlanConfig: &IPVlanConfig{Mode: "l3", Flag: "private"}},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := validateSubInterfaceConfig(tt.cfg, tt.fieldPath)
+			if (len(errs) > 0) != tt.expectErr {
+				t.Errorf("validateSubInterfaceConfig() expectErr %v, got errors: %v", tt.expectErr, errs)
+			}
+			if tt.expectErr && len(errs) != tt.errCount {
+				t.Errorf("validateSubInterfaceConfig() expected %d errors, got %d. Errors: %v", tt.errCount, len(errs), errs)
+			}
+		})
+	}
+}
+
 func TestValidateRoutes(t *testing.T) {
 	scopeLink := uint8(unix.RT_SCOPE_LINK)
 	scopeUniverse := uint8(unix.RT_SCOPE_UNIVERSE)

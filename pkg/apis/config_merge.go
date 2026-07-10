@@ -48,6 +48,14 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 	// Deduplicate slices where order or uniqueness matters.
 	// For addresses, we just unique them.
 	merged.Interface.Addresses = deduplicateStrings(merged.Interface.Addresses)
+	if merged.SubInterface != nil {
+		merged.SubInterface.Addresses = deduplicateStrings(merged.SubInterface.Addresses)
+	}
+
+	// Subinterface creation is activated only when Type is set; otherwise, discard the subinterface config.
+	if merged.SubInterface != nil && merged.SubInterface.Type == "" {
+		merged.SubInterface = nil
+	}
 
 	// For Routes, deduplicate by destination (user wins, which were appended last, so we iterate backwards).
 	merged.Routes = deduplicateRoutes(merged.Routes)
