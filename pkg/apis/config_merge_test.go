@@ -173,6 +173,76 @@ func TestMergeNetworkConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "subinterface: user requests IPVlan type subinterface, keep the configuration",
+			user: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type: "ipvlan",
+				},
+			},
+			cloud: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}},
+				},
+			},
+			want: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:     "ipvlan",
+					IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}},
+				},
+			},
+		},
+		{
+			name: "subinterface: cloud provider requests IPVlan type subinterface, keep the configuration",
+			user: &NetworkConfig{},
+			cloud: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:     "ipvlan",
+					IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}},
+				},
+			},
+			want: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:     "ipvlan",
+					IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}},
+				},
+			},
+		},
+		{
+			name: "subinterface: IPRanges from user and cloud are combined user-first and deduplicated",
+			user: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:     "ipvlan",
+					IPRanges: []IPRangeConfig{{CIDR: "10.1.0.0/24"}, {CIDR: "10.24.3.0/24"}},
+				},
+			},
+			cloud: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:     "ipvlan",
+					IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}, {CIDR: "10.2.0.0/24"}},
+				},
+			},
+			want: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:     "ipvlan",
+					IPRanges: []IPRangeConfig{{CIDR: "10.1.0.0/24"}, {CIDR: "10.24.3.0/24"}, {CIDR: "10.2.0.0/24"}},
+				},
+			},
+		},
+		{
+			name: "subinterface: Type is not specified, discard the configuration",
+			user: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Name: "eth0",
+				},
+			},
+			cloud: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}},
+				},
+			},
+			want: &NetworkConfig{},
+		},
 	}
 
 	for _, tt := range tests {

@@ -23,9 +23,15 @@ type NetworkConfig struct {
 	// parameters resolved by the provider plugin (e.g., dynamic IPAM).
 	// This separates user intent from infrastructure implementation.
 	Profile string `json:"profile,omitempty"`
+
 	// Interface defines core properties of the network interface.
 	// Settings here are typically managed by `ip link` commands.
 	Interface InterfaceConfig `json:"interface"`
+
+	// SubInterface defines the properties of the subinterfaces created on the network interface.
+	// When specified, new subinterfaces will be created in the pod namespace based
+	// on this config, while the original interface stays in the host namespace.
+	SubInterface *SubInterfaceConfig `json:"subInterface,omitempty"`
 
 	// Routes defines static routes to be configured for this interface.
 	Routes []RouteConfig `json:"routes,omitempty"`
@@ -102,6 +108,85 @@ type VRFConfig struct {
 	// If not specified, a unique table ID will be automatically assigned (typically interface index + 100).
 	// Common reserved tables: 255 (local), 254 (main), 253 (default).
 	Table *int `json:"table,omitempty"`
+}
+
+// SubInterfaceConfig describes a virtual subinterface (e.g. IPVLAN) to create
+// in the Pod on top of a shared host network interface. A valid Type field
+// activates it and triggers creation of the subinterface.
+type SubInterfaceConfig struct {
+	// Type indicates the network type of the subinterface.
+	// A valid Type activates the configuration and creation of
+	// the subinterface. It can either be populated by the cloud
+	// provider or explicitly requested in the user's ResourceClaim.
+	// For now, we only support type "ipvlan".
+	Type SubInterfaceType `json:"type,omitempty"`
+
+	// Name is the desired logical name of the subinterface inside the Pod.
+	// If not specified, it will be derived by adding a type prefix to the parent interface name.
+	// e.g. for ipvlan type, Name will be "ipvlan-<parent_interface_name>"
+	Name string `json:"name,omitempty"`
+
+	// Addresses is a list of IP addresses in CIDR format assigned to the subinterface.
+	// It is normally populated dynamically by node-local IPAM from IPRanges; if set
+	// explicitly, those addresses are used as-is and IPAM allocation is skipped.
+	// If no custom routes or rules are specified, automatic source-based routing is
+	// configured for these addresses on the subinterface.
+	Addresses []string `json:"addresses,omitempty"`
+
+	// IPRanges is a list of IP address ranges from which the node-local IPAM
+	// generates IP addresses for the subinterface. It may be provided by the cloud
+	// provider in GetDeviceConfig and/or by the user. Exactly one IP address is
+	// generated per IP family present in the list.
+	IPRanges []IPRangeConfig `json:"ipRanges,omitempty"`
+
+	// IPVlan holds IPVLAN-specific settings (mode and flag); it applies only
+	// when Type is "ipvlan".
+	IPVlan *IPVlanConfig `json:"ipvlan,omitempty"`
+}
+
+// IPRangeConfig describes an allocatable IP address range for node-local IPAM.
+//
+// A range can be specified in one of two ways:
+//  1. Explicit boundaries: both StartIP and EndIP are set (CIDR may be omitted).
+//     The driver validates that both are valid IP addresses of the same family
+//     and that StartIP <= EndIP.
+//  2. CIDR: only CIDR is set (StartIP and EndIP omitted). The driver validates
+//     the CIDR and derives the allocatable boundaries from it, spanning every
+//     address except the network (base) address and the broadcast (last) address.
+//
+// If all three fields are set, StartIP/EndIP take priority (when valid) and CIDR
+// is used only to sanity-check that the boundaries fall within it.
+type IPRangeConfig struct {
+	// CIDR is the network range in CIDR notation.
+	// It is optional when both StartIP and EndIP are provided.
+	CIDR string `json:"cidr,omitempty"`
+	// StartIP is the first IP address that can be allocated from the range.
+	// If empty, the driver derives it from CIDR as the first address after the network address.
+	StartIP string `json:"startIP,omitempty"`
+	// EndIP is the last IP address that can be allocated from the range.
+	// If empty, the driver derives it from CIDR as the last address before the broadcast address.
+	EndIP string `json:"endIP,omitempty"`
+}
+
+// SubInterfaceType specifies the available subinterface network types.
+// Currently the supported type is "ipvlan".
+type SubInterfaceType string
+
+const (
+	SubInterfaceTypeIPVlan SubInterfaceType = "ipvlan"
+)
+
+// IPVlanConfig holds the mode and flag of an IPVLAN subinterface.
+// Currently only "l2" mode with the "bridge" flag is supported.
+type IPVlanConfig struct {
+	// Mode defines how traffic is routed to the IPVlan child interfaces.
+	// Currently the supported mode is:
+	// - "l2": child interfaces handle their own L2 protocols like ARP.
+	Mode string `json:"mode,omitempty"`
+	// Flag defines the link behavior of the IPVlan child interfaces.
+	// Currently the supported flag is:
+	// - "bridge": child interfaces can talk directly to each other internally.
+	Flag string `json:"flag,omitempty"`
 }
 
 // RouteConfig represents a network route configuration.

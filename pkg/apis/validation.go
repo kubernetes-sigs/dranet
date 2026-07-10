@@ -65,6 +65,9 @@ func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
 	// Validate InterfaceConfig
 	allErrors = append(allErrors, validateInterfaceConfig(&config.Interface, "interface")...)
 
+	// Validate SubInterfaceConfig
+	allErrors = append(allErrors, validateSubInterfaceConfig(config.SubInterface, "subInterface")...)
+
 	// Validate Routes
 	if len(config.Routes) > 0 {
 		allErrors = append(allErrors, validateRoutes(config.Routes, "routes")...)
@@ -179,6 +182,96 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 
 	if cfg.VRF != nil {
 		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
+	}
+
+	return allErrors
+}
+
+// Validate reports whether the IPRangeConfig is well-formed. It is exported as a
+// method so the same range check is reused both when validating user-provided
+// config and when the node-local IPAM validates the merged ranges before allocation.
+//
+// A range may be specified in one of two ways:
+//
+//  1. Explicit startIP and endIP (both required). They must be valid IP addresses
+//     of the same family with startIP <= endIP. If cidr is also set, both must
+//     fall within it.
+//  2. Only cidr range. It must be a valid CIDR.
+func (r IPRangeConfig) Validate() error {
+	if r.StartIP != "" || r.EndIP != "" {
+		if r.StartIP == "" || r.EndIP == "" {
+			return fmt.Errorf("startIP and endIP must be provided together")
+		}
+		start, err := netip.ParseAddr(r.StartIP)
+		if err != nil {
+			return fmt.Errorf("invalid startIP %q: %w", r.StartIP, err)
+		}
+		end, err := netip.ParseAddr(r.EndIP)
+		if err != nil {
+			return fmt.Errorf("invalid endIP %q: %w", r.EndIP, err)
+		}
+		if start.BitLen() != end.BitLen() {
+			return fmt.Errorf("startIP %s and endIP %s belong to different IP families", r.StartIP, r.EndIP)
+		}
+		if start.Compare(end) > 0 {
+			return fmt.Errorf("startIP %s is after endIP %s", r.StartIP, r.EndIP)
+		}
+		if r.CIDR != "" {
+			cidr, err := netip.ParsePrefix(r.CIDR)
+			if err != nil {
+				return fmt.Errorf("invalid cidr %q: %w", r.CIDR, err)
+			}
+			if !cidr.Contains(start) || !cidr.Contains(end) {
+				return fmt.Errorf("range [%s, %s] is not within cidr %s", r.StartIP, r.EndIP, r.CIDR)
+			}
+		}
+		return nil
+	}
+
+	if r.CIDR != "" {
+		if _, err := netip.ParsePrefix(r.CIDR); err != nil {
+			return fmt.Errorf("invalid cidr %q: %w", r.CIDR, err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("must specify either cidr or both startIP and endIP")
+}
+
+func validateSubInterfaceConfig(cfg *SubInterfaceConfig, fieldPath string) (allErrors []error) {
+	if cfg == nil {
+		return
+	}
+
+	for i, addr := range cfg.Addresses {
+		if _, err := netip.ParsePrefix(addr); err != nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: invalid IP CIDR format '%s': %w", fieldPath, i, addr, err))
+		}
+	}
+
+	for i, r := range cfg.IPRanges {
+		if err := r.Validate(); err != nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.ipRanges[%d]: %w", fieldPath, i, err))
+		}
+	}
+
+	if cfg.Type == SubInterfaceTypeIPVlan {
+		if cfg.IPVlan != nil {
+			allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlan, fieldPath+".ipvlan")...)
+		}
+	} else {
+		allErrors = append(allErrors, fmt.Errorf("%s.type: '%s' is not supported", fieldPath, cfg.Type))
+	}
+
+	return allErrors
+}
+
+func validateIPVlanConfig(cfg *IPVlanConfig, fieldPath string) (allErrors []error) {
+	if cfg.Mode != "l2" {
+		allErrors = append(allErrors, fmt.Errorf("%s.mode: '%s' is not supported", fieldPath, cfg.Mode))
+	}
+	if cfg.Flag != "bridge" {
+		allErrors = append(allErrors, fmt.Errorf("%s.flag: '%s' is not supported", fieldPath, cfg.Flag))
 	}
 
 	return allErrors
