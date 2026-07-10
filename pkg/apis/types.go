@@ -23,6 +23,7 @@ type NetworkConfig struct {
 	// parameters resolved by the provider plugin (e.g., dynamic IPAM).
 	// This separates user intent from infrastructure implementation.
 	Profile string `json:"profile,omitempty"`
+
 	// Interface defines core properties of the network interface.
 	// Settings here are typically managed by `ip link` commands.
 	Interface InterfaceConfig `json:"interface"`
@@ -47,6 +48,15 @@ type InterfaceConfig struct {
 	// Name is the desired logical name of the interface inside the Pod (e.g., "net0", "eth_app").
 	// If not specified, DraNet may use or derive a name from the original interface.
 	Name string `json:"name,omitempty"`
+
+	// Type selects how the allocated device is presented to the Pod:
+	//   - "passthrough" (default): the network device itself is moved into the
+	//     Pod's network namespace.
+	//   - "ipvlan": the device stays in the host namespace and an IPVLAN
+	//     subinterface is created on top of it inside the Pod.
+	// It may be set by the cloud provider or in the user's ResourceClaim.
+	// If empty, it is treated as "passthrough".
+	Type InterfaceType `json:"type,omitempty"`
 
 	// Addresses is a list of IP addresses in CIDR format (e.g., "192.168.1.10/24")
 	// to be assigned to the interface.
@@ -104,6 +114,9 @@ type InterfaceConfig struct {
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.
 	VRF *VRFConfig `json:"vrf,omitempty"`
+
+	// IPVlan holds IPVLAN-specific settings (mode and flag). Applies only when Type is "ipvlan".
+	IPVlan *IPVlanConfig `json:"ipvlan,omitempty"`
 }
 
 // VRFConfig represents the configuration for a Virtual Routing and Forwarding domain.
@@ -116,6 +129,29 @@ type VRFConfig struct {
 	// If not specified, a unique table ID will be automatically assigned (typically interface index + 100).
 	// Common reserved tables: 255 (local), 254 (main), 253 (default).
 	Table *int `json:"table,omitempty"`
+}
+
+// InterfaceType specifies how an allocated network device is presented to the Pod.
+type InterfaceType string
+
+const (
+	// InterfaceTypePassthrough moves the network device into the Pod's namespace. This is the default.
+	InterfaceTypePassthrough InterfaceType = "passthrough"
+	// InterfaceTypeIPVlan creates an IPVLAN subinterface in the Pod on top of the host device.
+	InterfaceTypeIPVlan InterfaceType = "ipvlan"
+)
+
+// IPVlanConfig holds the mode and flag of an IPVLAN subinterface.
+// Currently only "l2" mode with the "bridge" flag is supported.
+type IPVlanConfig struct {
+	// Mode defines how traffic is routed to the IPVlan child interfaces.
+	// Currently the supported mode is:
+	// - "l2": child interfaces handle their own L2 protocols like ARP.
+	Mode string `json:"mode,omitempty"`
+	// Flag defines the link behavior of the IPVlan child interfaces.
+	// Currently the supported flag is:
+	// - "bridge": child interfaces can talk directly to each other internally.
+	Flag string `json:"flag,omitempty"`
 }
 
 // RouteConfig represents a network route configuration.

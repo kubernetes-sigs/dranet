@@ -381,9 +381,47 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			fieldPath: "iface",
 			expectErr: false, // Function should handle nil gracefully
 		},
+		{
+			name:      "explicit passthrough type",
+			cfg:       &InterfaceConfig{Type: "passthrough", Name: "eth0"},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "ipvlan type without ipvlan config",
+			cfg:       &InterfaceConfig{Type: "ipvlan", Name: "eth0"},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "ipvlan type with unsupported mode and flag",
+			cfg:       &InterfaceConfig{Type: "ipvlan", Name: "eth0", IPVlan: &IPVlanConfig{Mode: "l3", Flag: "private"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  2,
+		},
+		{
+			name:      "passthrough type with ipvlan config",
+			cfg:       &InterfaceConfig{Type: "passthrough", Name: "eth0", IPVlan: &IPVlanConfig{Mode: "l2", Flag: "bridge"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "unsupported type",
+			cfg:       &InterfaceConfig{Type: "macvlan", Name: "eth0"},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.cfg != nil {
+				nc := &NetworkConfig{Interface: *tt.cfg}
+				nc.Default()
+				tt.cfg = &nc.Interface
+			}
 			errs := validateInterfaceConfig(tt.cfg, tt.fieldPath)
 			if (len(errs) > 0) != tt.expectErr {
 				t.Errorf("validateInterfaceConfig() expectErr %v, got errors: %v", tt.expectErr, errs)

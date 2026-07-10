@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -137,6 +138,10 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		return
 	}
 
+	if !slices.Contains([]InterfaceType{"", InterfaceTypePassthrough, InterfaceTypeIPVlan}, cfg.Type) {
+		allErrors = append(allErrors, fmt.Errorf("%s.type: '%s' is not supported", fieldPath, cfg.Type))
+	}
+
 	allErrors = append(allErrors, isValidLinuxInterfaceName(cfg.Name, fieldPath+".name")...)
 
 	for i, addr := range cfg.Addresses {
@@ -189,6 +194,15 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
 	}
 
+	if cfg.IPVlan != nil {
+		// Surface an error for the misconfiguration instead of silently dropping it.
+		if cfg.Type != InterfaceTypeIPVlan {
+			allErrors = append(allErrors, fmt.Errorf("%s.ipvlan: configuration invalid for non-ipvlan interface type", fieldPath))
+		} else {
+			allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlan, fieldPath+".ipvlan")...)
+		}
+	}
+
 	return allErrors
 }
 
@@ -205,6 +219,17 @@ func validateVRFConfig(cfg *VRFConfig, fieldPath string) (allErrors []error) {
 		if *cfg.Table == 253 || *cfg.Table == 254 || *cfg.Table == 255 {
 			allErrors = append(allErrors, fmt.Errorf("%s.table: cannot use reserved table ID %d", fieldPath, *cfg.Table))
 		}
+	}
+
+	return allErrors
+}
+
+func validateIPVlanConfig(cfg *IPVlanConfig, fieldPath string) (allErrors []error) {
+	if cfg.Mode != "l2" {
+		allErrors = append(allErrors, fmt.Errorf("%s.mode: '%s' is not supported", fieldPath, cfg.Mode))
+	}
+	if cfg.Flag != "bridge" {
+		allErrors = append(allErrors, fmt.Errorf("%s.flag: '%s' is not supported", fieldPath, cfg.Flag))
 	}
 
 	return allErrors
