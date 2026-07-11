@@ -29,18 +29,18 @@ import (
 	"sigs.k8s.io/dranet/pkg/apis"
 )
 
-func newTestBoltCheckpointer(t *testing.T) *boltCheckpointer {
+func newTestBoltCheckpointer(t *testing.T) *BoltCheckpointer {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	cp, err := newBoltCheckpointer(dbPath)
+	cp, err := NewBoltCheckpointer(dbPath)
 	if err != nil {
-		t.Fatalf("newBoltCheckpointer() error: %v", err)
+		t.Fatalf("NewBoltCheckpointer() error: %v", err)
 	}
 	t.Cleanup(func() { cp.Close() })
 	return cp
 }
 
-func newTestStoreWithBolt(t *testing.T) (*PodConfigStore, *boltCheckpointer) {
+func newTestStoreWithBolt(t *testing.T) (*PodConfigStore, *BoltCheckpointer) {
 	t.Helper()
 	cp := newTestBoltCheckpointer(t)
 	store, err := NewPodConfigStore(cp)
@@ -167,9 +167,9 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 	}
 
 	// Write data via PodConfigStore and close.
-	cp1, err := newBoltCheckpointer(dbPath)
+	cp1, err := NewBoltCheckpointer(dbPath)
 	if err != nil {
-		t.Fatalf("newBoltCheckpointer() error: %v", err)
+		t.Fatalf("NewBoltCheckpointer() error: %v", err)
 	}
 	store1, err := NewPodConfigStore(cp1)
 	if err != nil {
@@ -180,9 +180,9 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 	store1.Close()
 
 	// Reopen and verify data was restored from checkpoint.
-	cp2, err := newBoltCheckpointer(dbPath)
+	cp2, err := NewBoltCheckpointer(dbPath)
 	if err != nil {
-		t.Fatalf("newBoltCheckpointer() reopen error: %v", err)
+		t.Fatalf("NewBoltCheckpointer() reopen error: %v", err)
 	}
 	store2, err := NewPodConfigStore(cp2)
 	if err != nil {
@@ -280,9 +280,9 @@ func TestBoltCheckpointer_Errors(t *testing.T) {
 	t.Run("creates missing parent directory", func(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "nested", "path", "test.db")
 
-		cp, err := newBoltCheckpointer(dbPath)
+		cp, err := NewBoltCheckpointer(dbPath)
 		if err != nil {
-			t.Fatalf("newBoltCheckpointer() error: %v", err)
+			t.Fatalf("NewBoltCheckpointer() error: %v", err)
 		}
 		defer cp.Close()
 
@@ -297,7 +297,7 @@ func TestBoltCheckpointer_Errors(t *testing.T) {
 		if err := os.Mkdir(invalidDbPath, 0755); err != nil {
 			t.Fatalf("failed to mkdir: %v", err)
 		}
-		_, err := newBoltCheckpointer(invalidDbPath)
+		_, err := NewBoltCheckpointer(invalidDbPath)
 		if err == nil {
 			t.Fatal("expected error when opening a directory as bolt db")
 		}

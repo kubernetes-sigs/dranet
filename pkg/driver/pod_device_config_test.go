@@ -19,6 +19,7 @@ package driver
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 
@@ -460,5 +461,91 @@ func TestPodConfigStore_GetAllocatedDeviceSnapshots(t *testing.T) {
 	}
 	if diff := cmp.Diff(snapDev, allocated[0]); diff != "" {
 		t.Errorf("allocated device snapshot mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestPodConfigStore_GetAllocatedIPs verifies GetAllocatedIPs collects sub-interface
+// IPs (primary interface addresses are ignored). It is called once at startup, so we
+// test it statelessly.
+func TestPodConfigStore_GetAllocatedIPs(t *testing.T) {
+	type deviceEntry struct {
+		podUID     types.UID
+		deviceName string
+		netConfig  apis.NetworkConfig
+	}
+	tests := []struct {
+		name     string
+		devices  []deviceEntry
+		expected []string
+	}{
+		{
+			name:     "empty store",
+			devices:  nil,
+			expected: []string{},
+		},
+		{
+			name: "only collect sub-interface IP",
+			devices: []deviceEntry{
+				{
+					podUID:     "pod-1",
+					deviceName: "eth0",
+					netConfig:  apis.NetworkConfig{Interface: apis.InterfaceConfig{Addresses: []string{"2001:db8::2/128"}}},
+				},
+				{
+					podUID:     "pod-1",
+					deviceName: "eth1",
+					netConfig:  apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVlan, Addresses: []string{"2001:db8::3/128"}}},
+				},
+			},
+			expected: []string{"2001:db8::3/128"},
+		},
+		{
+			name: "multiple devices on one pod",
+			devices: []deviceEntry{
+				{
+					podUID:     "pod-1",
+					deviceName: "eth0",
+					netConfig:  apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVlan, Addresses: []string{"192.168.1.100/24"}}},
+				},
+				{
+					podUID:     "pod-1",
+					deviceName: "eth1",
+					netConfig:  apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVlan, Addresses: []string{"192.168.2.100/24"}}},
+				},
+			},
+			expected: []string{"192.168.1.100/24", "192.168.2.100/24"},
+		},
+		{
+			name: "device configuration without IPs",
+			devices: []deviceEntry{{
+				podUID:     "pod-1",
+				deviceName: "eth0",
+				netConfig:  apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVlan, Addresses: nil}},
+			}},
+			expected: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := mustNewPodConfigStore()
+			for _, d := range tt.devices {
+				if err := store.SetDeviceConfig(d.podUID, d.deviceName, DeviceConfig{
+					NetworkInterfaceConfigInPod: d.netConfig,
+				}); err != nil {
+					t.Fatalf("SetDeviceConfig(%s, %s) failed: %v", d.podUID, d.deviceName, err)
+				}
+			}
+			got := store.GetAllocatedIPs()
+			sort.Strings(got)
+			sort.Strings(tt.expected)
+			if len(got) == 0 && len(tt.expected) == 0 {
+				// avoid nil vs empty slice issues in DeepEqual
+				return
+			}
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Errorf("GetAllocatedIPs() = %+v, want %+v", got, tt.expected)
+			}
+		})
 	}
 }

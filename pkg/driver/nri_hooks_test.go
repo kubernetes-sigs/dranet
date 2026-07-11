@@ -80,9 +80,9 @@ func TestCreateContainerUsesPersistedConfigAfterRestart(t *testing.T) {
 	}
 
 	// Simulate NodePrepareResource storing config before the driver restarts.
-	cp1, err := newBoltCheckpointer(dbPath)
+	cp1, err := NewBoltCheckpointer(dbPath)
 	if err != nil {
-		t.Fatalf("newBoltCheckpointer() error: %v", err)
+		t.Fatalf("NewBoltCheckpointer() error: %v", err)
 	}
 	store1, err := NewPodConfigStore(cp1)
 	if err != nil {
@@ -93,9 +93,9 @@ func TestCreateContainerUsesPersistedConfigAfterRestart(t *testing.T) {
 		t.Fatalf("Close() error: %v", err)
 	}
 
-	cp2, err := newBoltCheckpointer(dbPath)
+	cp2, err := NewBoltCheckpointer(dbPath)
 	if err != nil {
-		t.Fatalf("newBoltCheckpointer() after restart error: %v", err)
+		t.Fatalf("NewBoltCheckpointer() after restart error: %v", err)
 	}
 	storeAfterRestart, err := NewPodConfigStore(cp2)
 	if err != nil {
@@ -138,9 +138,9 @@ func TestRunPodSandboxUsesPersistedConfigAfterRestart(t *testing.T) {
 	}
 
 	// Simulate NodePrepareResource storing config before the driver restarts.
-	cp1, err := newBoltCheckpointer(dbPath)
+	cp1, err := NewBoltCheckpointer(dbPath)
 	if err != nil {
-		t.Fatalf("newBoltCheckpointer() error: %v", err)
+		t.Fatalf("NewBoltCheckpointer() error: %v", err)
 	}
 	store1, err := NewPodConfigStore(cp1)
 	if err != nil {
@@ -154,9 +154,9 @@ func TestRunPodSandboxUsesPersistedConfigAfterRestart(t *testing.T) {
 	}
 
 	// Reopen store to simulate driver restart.
-	cp2, err := newBoltCheckpointer(dbPath)
+	cp2, err := NewBoltCheckpointer(dbPath)
 	if err != nil {
-		t.Fatalf("newBoltCheckpointer() after restart error: %v", err)
+		t.Fatalf("NewBoltCheckpointer() after restart error: %v", err)
 	}
 	storeAfterRestart, err := NewPodConfigStore(cp2)
 	if err != nil {

@@ -166,9 +166,25 @@ func main() {
 
 	opts := []driver.Option{}
 
+	// Build the pod config store with optional bbolt checkpoint backend.
+	// If the dbPath for persistence is not provided, the store will be in-memory only.
+	var checkpointer driver.Checkpointer
 	if dbPath != "" {
-		opts = append(opts, driver.WithDBPath(dbPath))
+		cp, err := driver.NewBoltCheckpointer(dbPath)
+		if err != nil {
+			klog.Fatalf("failed to open pod config database at %s: %v", dbPath, err)
+		}
+		checkpointer = cp
 	}
+	store, err := driver.NewPodConfigStore(checkpointer)
+	if err != nil {
+		if checkpointer != nil {
+			checkpointer.Close()
+		}
+		klog.Fatalf("failed to initialize pod config store: %v", err)
+	}
+	defer store.Close()
+	opts = append(opts, driver.WithPodConfigStore(store))
 
 	opts = append(opts, driver.WithKubeletRootDir(kubeletRootDir))
 
