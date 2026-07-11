@@ -220,9 +220,9 @@ func (s *PodConfigStore) GetDeviceConfig(podUID types.UID, deviceName string) (D
 // regardless of checkpoint outcome. This asymmetry with SetDeviceConfig
 // (which aborts on checkpoint failure) is intentional:
 //   - A failed Set leaving stale RAM would silently lose config on restart (#89).
-//   - A failed Delete leaving a stale checkpoint is harmless: Synchronize()
-//     prunes orphaned checkpoint entries on the next startup by diffing
-//     against live pods from the container runtime.
+//   - A failed Delete leaving a stale checkpoint is harmless: Kubelet's DRA manager
+//     is guaranteed to retry UnprepareResourceClaims (which triggers DeletePod)
+//     until it succeeds, ensuring that the checkpoint is eventually cleaned up.
 //
 // Skipping the RAM delete would be worse — the driver would keep processing
 // a pod that the runtime has already removed.
@@ -287,8 +287,8 @@ func (s *PodConfigStore) SetPodNetNs(podUID types.UID, netns string) {
 	s.configs[podUID] = podCfg
 }
 
-// DeleteClaim removes all configurations associated with a given claim and
-// returns the list of Pod UIDs that were associated with it.
+// DeleteClaim removes all configurations and allocated IPs associated with a given
+// claim and returns the list of Pod UIDs that were associated with it.
 // Like DeletePod, checkpoint failures do not prevent in-memory cleanup.
 // See DeletePod for rationale on this intentional asymmetry with SetDeviceConfig.
 func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
@@ -330,4 +330,21 @@ func (s *PodConfigStore) GetAllocatedDeviceSnapshots() []resourceapi.Device {
 		}
 	}
 	return allocated
+}
+
+// GetAllocatedIPs returns all currently allocated IP addresses from the stored configs.
+// This is used at driver startup to populate the IPAM database.
+func (s *PodConfigStore) GetAllocatedIPs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var ips []string
+	for _, podCfg := range s.configs {
+		for _, devCfg := range podCfg.DeviceConfigs {
+			if devCfg.NetworkInterfaceConfigInPod.SubInterface != nil {
+				ips = append(ips, devCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses...)
+			}
+		}
+	}
+	return ips
 }
