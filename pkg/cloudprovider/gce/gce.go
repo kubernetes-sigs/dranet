@@ -20,7 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +84,7 @@ type gceNetworkInterface struct {
 	MTU       int      `json:"mtu,omitempty"`
 	Network   string   `json:"network,omitempty"`
 	IPAliases []string `json:"ipAliases,omitempty"`
+	Gateway   string   `json:"gateway,omitempty"`
 }
 
 var _ cloudprovider.CloudInstance = (*GCEInstance)(nil)
@@ -154,7 +157,50 @@ func (g *GCEInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) ma
 // GetDeviceConfig fetches any infrastructure-specific network configuration
 // required by the device. Returning nil means no specific config is needed.
 func (g *GCEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
-	return nil
+	if id.MAC == "" {
+		return nil
+	}
+
+	interfaceForMacFound := false
+	var interfaceForMac gceNetworkInterface
+	for _, cloudInterface := range g.Interfaces {
+		if cloudInterface.Mac == id.MAC {
+			interfaceForMacFound = true
+			interfaceForMac = cloudInterface
+			break
+		}
+	}
+	if !interfaceForMacFound {
+		klog.V(4).Infof("No cloud metadata found for device with mac %q; it is possible this device has no associated cloud provider metadata", id.MAC)
+		return nil
+	}
+
+	deviceConfig := &apis.NetworkConfig{}
+
+	// Calculate the IP range as metadata for subinterface.
+	// The config_merge layer will decide whether to keep or discard
+	// the configuration based on the user's request for subinterface.
+	var ipRange string
+
+	// For IPv6, compute the IPRange from the base IP.
+	if len(interfaceForMac.IPv6) > 0 {
+		var err error
+		ipRange, err = getIPv6Range(interfaceForMac.IPv6[0])
+		if err != nil {
+			klog.Warningf("Failed to calculate IPv6 range for base IP %q: %v", interfaceForMac.IPv6[0], err)
+		}
+
+		// For IPv4, retrieve the IPRange from the first Alias IP Range if available.
+	} else if len(interfaceForMac.IPAliases) > 0 {
+		ipRange = interfaceForMac.IPAliases[0]
+	}
+	if ipRange != "" {
+		deviceConfig.SubInterface = &apis.SubInterfaceConfig{
+			IPRange: ipRange,
+		}
+	}
+
+	return deviceConfig
 }
 
 // GetInstance retrieves GCE instance properties by querying the metadata server.
@@ -211,4 +257,38 @@ func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
 		return nil, err
 	}
 	return instance, nil
+}
+
+// getIPv6Range calculates the subinterface IPv6 range by appending 0xC0DE marker to the base range.
+func getIPv6Range(baseIPStr string) (string, error) {
+	const workerMarker = 0xC0DE
+
+	_, ipnet, err := net.ParseCIDR(baseIPStr)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse CIDR %q: %v", baseIPStr, err)
+	}
+	prefixLen, _ := ipnet.Mask.Size()
+	baseIP := ipnet.IP
+
+	if baseIP.To4() != nil {
+		return "", fmt.Errorf("IP %q is an IPv4 address, expected IPv6", baseIPStr)
+	}
+	ip16 := baseIP.To16()
+	if ip16 == nil {
+		return "", fmt.Errorf("IP %q is not a valid IPv6 address", baseIPStr)
+	}
+
+	workerIP := make(net.IP, 16)
+	numBaseBytes := prefixLen / 8
+
+	if numBaseBytes >= 14 {
+		return "", fmt.Errorf("prefix length %d is too large to append %x", prefixLen, workerMarker)
+	}
+
+	copy(workerIP[0:numBaseBytes], ip16[0:numBaseBytes])
+	workerIP[numBaseBytes] = byte(workerMarker >> 8)
+	workerIP[numBaseBytes+1] = byte(workerMarker & 0xFF)
+	newPrefixLen := (numBaseBytes + 2) * 8
+
+	return workerIP.String() + "/" + strconv.Itoa(newPrefixLen), nil
 }
