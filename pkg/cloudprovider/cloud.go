@@ -53,3 +53,11 @@ type ProfileProvider interface {
 	// previously allocated for the given claim and profile.
 	ReleaseProfileConfig(id DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error
 }
+
+// InstanceOptions carries optional construction-time inputs for cloud providers.
+// Each provider consumes only the fields relevant to it.
+type InstanceOptions struct {
+	// AllocatedIPs seeds a provider's node-local IP allocator with addresses
+	// already allocated (recovered from persistent storage at startup).
+	AllocatedIPs []string
+}
