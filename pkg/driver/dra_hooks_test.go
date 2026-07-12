@@ -904,7 +904,7 @@ func TestMergeDevices(t *testing.T) {
 			expected: []resourcev1.Device{pciDevSnapshot},
 		},
 		{
-			name:      "Live device attribute takes precedence over snapshot",
+			name: "Live device attribute takes precedence over snapshot",
 			live: []resourcev1.Device{{
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
@@ -926,7 +926,7 @@ func TestMergeDevices(t *testing.T) {
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"network-bandwidth": qtyCap("1G"),
-					"other-capacity":     qtyCap("50"),
+					"other-capacity":    qtyCap("50"),
 				},
 			}},
 			expected: []resourcev1.Device{{
@@ -939,7 +939,7 @@ func TestMergeDevices(t *testing.T) {
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"network-bandwidth": qtyCap("10G"),
-					"other-capacity":     qtyCap("50"),
+					"other-capacity":    qtyCap("50"),
 				},
 			}},
 		},
@@ -950,6 +950,148 @@ func TestMergeDevices(t *testing.T) {
 			result := mergeDevices(tc.live, tc.snapshot)
 			if diff := cmp.Diff(tc.expected, result); diff != "" {
 				t.Errorf("mergeDevices result mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAddSourceBasedRoutingRule(t *testing.T) {
+	tests := []struct {
+		name       string
+		deviceCfg  DeviceConfig
+		wantRules  []apis.RuleConfig
+		wantRoutes []apis.RouteConfig
+	}{
+		{
+			name: "IPv4 no route containing gateway, source-based routing should not be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"192.168.1.3/32"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "192.168.1.0/24", Table: 0},
+					},
+				},
+			},
+			wantRules: nil,
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "192.168.1.0/24", Table: 0},
+			},
+		},
+		{
+			name: "IPv6 default route in main table, source-based routing should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"2001:db8::3/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "::/0", Gateway: "fe80::1", Table: 0},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "2001:db8::3/128", Table: 101, Priority: 32000},
+			},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "fe80::1/128", Table: 101, Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1", Table: 101},
+			},
+		},
+		{
+			name: "dual-stack routes with gateways, both IPv4 and IPv6 routes and rules should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"192.168.1.3/32", "2001:db8::3/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "192.168.1.0/24", Gateway: "192.168.1.1", Table: 100},
+						{Destination: "2001:db8::/64", Gateway: "fe80::1", Table: 0},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "192.168.1.3/32", Table: 101, Priority: 32000},
+				{Source: "2001:db8::3/128", Table: 101, Priority: 32000},
+			},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "192.168.1.1/32", Table: 101, Scope: 253},
+				{Destination: "0.0.0.0/0", Gateway: "192.168.1.1", Table: 101},
+				{Destination: "fe80::1/128", Table: 101, Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1", Table: 101},
+			},
+		},
+		{
+			name: "multiple IPv6 addresses with the default route, two rules and one set of custom table routes should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"2001:db8::3/128", "2001:db8::4/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "::/0", Gateway: "fe80::1", Table: 0},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "2001:db8::3/128", Table: 101, Priority: 32000},
+				{Source: "2001:db8::4/128", Table: 101, Priority: 32000},
+			},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "fe80::1/128", Table: 101, Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1", Table: 101},
+			},
+		},
+		{
+			name: "family present but no matching gateway, source-based routing should not be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"2001:db8::3/128"}, // IPv6 address
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "0.0.0.0/0", Gateway: "192.168.1.1", Table: 0}, // only an IPv4 gateway
+					},
+				},
+			},
+			wantRules:  nil,
+			wantRoutes: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addSourceBasedRouting(&tt.deviceCfg, 1)
+			gotRules := tt.deviceCfg.NetworkInterfaceConfigInPod.Rules
+			if len(gotRules) != len(tt.wantRules) {
+				t.Fatalf("Expected %d rules, got %d", len(tt.wantRules), len(gotRules))
+			}
+			for i := range gotRules {
+				if gotRules[i].Source != tt.wantRules[i].Source || gotRules[i].Table != tt.wantRules[i].Table || gotRules[i].Priority != tt.wantRules[i].Priority {
+					t.Errorf("gotRules[%d] = %+v, want %+v", i, gotRules[i], tt.wantRules[i])
+				}
+			}
+
+			gotRoutes := tt.deviceCfg.NetworkInterfaceConfigInPod.Routes
+			if len(gotRoutes) != len(tt.wantRoutes) {
+				t.Fatalf("Expected %d routes, got %d", len(tt.wantRoutes), len(gotRoutes))
+			}
+			for i := range gotRoutes {
+				if gotRoutes[i].Destination != tt.wantRoutes[i].Destination || gotRoutes[i].Gateway != tt.wantRoutes[i].Gateway || gotRoutes[i].Table != tt.wantRoutes[i].Table || gotRoutes[i].Scope != tt.wantRoutes[i].Scope {
+					t.Errorf("gotRoutes[%d] = %+v, want %+v", i, gotRoutes[i], tt.wantRoutes[i])
+				}
 			}
 		})
 	}

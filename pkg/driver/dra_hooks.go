@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
@@ -398,6 +399,19 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			deviceCfg.NetworkInterfaceConfigInPod.Ethtool.Features = ethtoolFeatures
 		}
 
+		// Preserve custom routes and rules, if existing,
+		// before appending the host network namespace routes and rules.
+		var customRoutes []apis.RouteConfig
+		if len(deviceCfg.NetworkInterfaceConfigInPod.Routes) > 0 {
+			customRoutes = make([]apis.RouteConfig, len(deviceCfg.NetworkInterfaceConfigInPod.Routes))
+			copy(customRoutes, deviceCfg.NetworkInterfaceConfigInPod.Routes)
+		}
+		var customRules []apis.RuleConfig
+		if len(deviceCfg.NetworkInterfaceConfigInPod.Rules) > 0 {
+			customRules = make([]apis.RuleConfig, len(deviceCfg.NetworkInterfaceConfigInPod.Rules))
+			copy(customRules, deviceCfg.NetworkInterfaceConfigInPod.Rules)
+		}
+
 		// Obtain the routes and rules associated with the interface.
 		routes, tables, err := getRouteInfo(nlHandle, ifName, link)
 		if err != nil {
@@ -437,6 +451,46 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				HardwareAddr: neigh.HardwareAddr.String(),
 			}
 			deviceCfg.NetworkInterfaceConfigInPod.Neighbors = append(deviceCfg.NetworkInterfaceConfigInPod.Neighbors, neighCfg)
+		}
+
+		// If subinterface is enabled, configure the subinterface properties,
+		// including interface name, IP address, and source-based routing rules.
+		if deviceCfg.NetworkInterfaceConfigInPod.SubInterface != nil {
+			// Derive the subinterface name by adding a type prefix to the parent interface
+			if deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Name == "" {
+				subInterfaceType := deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Type
+				deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Name = string(subInterfaceType) + "-" + ifName
+			}
+
+			// If not specified, assign an IP address from the configured IP ranges using node local IPAM.
+			if len(deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses) == 0 {
+				ipRanges := deviceCfg.NetworkInterfaceConfigInPod.SubInterface.IPRanges
+				if len(ipRanges) == 0 {
+					errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s, no IPRanges specified", ifName))
+					continue
+				}
+				if np.localIPAM == nil {
+					errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s, IPAM database not initialized", ifName))
+					continue
+				}
+				// Allocate at most one IP per IP family from the configured ranges.
+				addresses, err := np.localIPAM.Allocate(ipRanges)
+				if err != nil {
+					errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s: %w", ifName, err))
+					continue
+				}
+				deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses = addresses
+			}
+
+			// If the user has already configured custom routes or rules, we
+			// preserve and skip automatic source-based routing. Otherwise,
+			// we perform source-based routing.
+			if len(customRoutes) > 0 || len(customRules) > 0 {
+				deviceCfg.NetworkInterfaceConfigInPod.Routes = customRoutes
+				deviceCfg.NetworkInterfaceConfigInPod.Rules = customRules
+			} else if len(deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses) != 0 {
+				addSourceBasedRouting(&deviceCfg, link.Attrs().Index)
+			}
 		}
 
 		// Get RDMA configuration: link and char devices
@@ -517,6 +571,7 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 }
 
 func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+	var ipsToRelease []string
 	for _, podUID := range np.podConfigStore.ListPods() {
 		podCfg, ok := np.podConfigStore.GetPodConfig(podUID)
 		if !ok {
@@ -524,6 +579,10 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 		}
 		for deviceName, devCfg := range podCfg.DeviceConfigs {
 			if devCfg.Claim.Namespace == claim.Namespace && devCfg.Claim.Name == claim.Name {
+				if devCfg.NetworkInterfaceConfigInPod.SubInterface != nil {
+					ipsToRelease = append(ipsToRelease, devCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses...)
+				}
+
 				if devCfg.NetworkInterfaceConfigInPod.Profile != "" {
 					if err := np.netdb.ReleaseProfileConfig(deviceName, claim.UID, &devCfg.NetworkInterfaceConfigInPod); err != nil {
 						klog.Errorf("failed to release profile config for claim %v: %v", claim.NamespacedName, err)
@@ -534,6 +593,12 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 	}
 
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+
+	if np.localIPAM != nil {
+		for _, ip := range ipsToRelease {
+			np.localIPAM.Release(ip)
+		}
+	}
 	return nil
 }
 
@@ -750,4 +815,83 @@ func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
 	}
 
 	return merged
+}
+
+// addSourceBasedRouting sets up source-based routing for the subinterface: each
+// source address egresses via a per-interface table holding an on-link gateway
+// route and a default route. It finds the gateway for each IP family from the
+// interface's configured routes, and mutates deviceCfg to replace the
+// host-copied Routes and Rules.
+func addSourceBasedRouting(deviceCfg *DeviceConfig, linkIndex int) {
+	tableID := 100 + linkIndex
+
+	// Parse the interface routes to find the gateway.
+	// gateways stores the gateway IP addresses, keyed by "ipv4" and "ipv6".
+	gateways := make(map[string]netip.Addr)
+	for _, r := range deviceCfg.NetworkInterfaceConfigInPod.Routes {
+		if r.Gateway != "" {
+			if gatewayAddr, err := netip.ParseAddr(r.Gateway); err == nil {
+				if gatewayAddr.Is6() {
+					gateways["ipv6"] = gatewayAddr
+				} else if gatewayAddr.Is4() {
+					gateways["ipv4"] = gatewayAddr
+				}
+			}
+		}
+	}
+	if len(gateways) == 0 {
+		klog.Warningf("Unable to configure source-based routing: no gateway found on interface %s", deviceCfg.NetworkInterfaceConfigInPod.Interface.Name)
+		return
+	}
+
+	// Clean up the routes and rules in the pod namespace copied from the host.
+	deviceCfg.NetworkInterfaceConfigInPod.Routes = nil
+	deviceCfg.NetworkInterfaceConfigInPod.Rules = nil
+
+	// Iterate through IP addresses to inject the gateway and default routes into the
+	// custom table, and add a source-based routing rule for each IP targeting the custom table.
+	// addedRoutes records whether the gateway and default routes are added for "ipv4" and "ipv6".
+	addedRoutes := make(map[string]bool)
+	for _, ipStr := range deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses {
+		prefix, _ := netip.ParsePrefix(ipStr)
+		var stack string
+		var defaultPrefix netip.Prefix
+		switch {
+		case prefix.Addr().Is6():
+			stack = "ipv6"
+			defaultPrefix = netip.PrefixFrom(netip.IPv6Unspecified(), 0)
+		case prefix.Addr().Is4():
+			stack = "ipv4"
+			defaultPrefix = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
+		default:
+			continue
+		}
+		gwAddr, hasGw := gateways[stack]
+		if !hasGw {
+			continue
+		}
+
+		if !addedRoutes[stack] {
+			// Add link route for the gateway.
+			gwPrefix := netip.PrefixFrom(gwAddr, gwAddr.BitLen())
+			deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, apis.RouteConfig{
+				Destination: gwPrefix.String(),
+				Scope:       253, // ScopeLink
+				Table:       tableID,
+			})
+			// Add default route in the custom table.
+			deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, apis.RouteConfig{
+				Destination: defaultPrefix.String(),
+				Gateway:     gwAddr.String(),
+				Table:       tableID,
+			})
+			addedRoutes[stack] = true
+		}
+		// Add source-based routing rule for the current IP address.
+		deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, apis.RuleConfig{
+			Source:   ipStr,
+			Table:    tableID,
+			Priority: 32000,
+		})
+	}
 }
