@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -849,6 +850,202 @@ func TestGetDeviceNetworkConfigWithWebhook(t *testing.T) {
 				}
 			} else if mergedConf.Profile != "" {
 				t.Errorf("Expected empty profile, got %s", mergedConf.Profile)
+			}
+		})
+	}
+}
+
+func TestGetIPFromRange(t *testing.T) {
+	type testCase struct {
+		name          string
+		ipRange       string
+		initIPAM      bool
+		checkContains bool
+		wantErr       string
+	}
+
+	tests := []testCase{
+		{
+			name:     "IPAM database not initialized",
+			ipRange:  "192.168.1.0/24",
+			initIPAM: false,
+			wantErr:  "IPAM database not initialized",
+		},
+		{
+			name:     "invalid IP range",
+			ipRange:  "invalid-cidr",
+			initIPAM: true,
+			wantErr:  "invalid IP range",
+		},
+		{
+			name:          "successful allocation",
+			ipRange:       "2001:db8::/64",
+			initIPAM:      true,
+			checkContains: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := mustNewPodConfigStore()
+			var localIPAM *LocalIPAM
+			if tc.initIPAM {
+				localIPAM = newLocalIPAM(store)
+			}
+			np := &NetworkDriver{
+				localIPAM:      localIPAM,
+				podConfigStore: store,
+			}
+
+			ipWithMask, err := np.getIPFromRange(tc.ipRange, "pod-test", "eth0")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("Expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("getIPFromRange() unexpected error: %v", err)
+			}
+
+			if tc.checkContains {
+				cidr, err := netip.ParsePrefix(tc.ipRange)
+				if err != nil {
+					t.Fatalf("Failed to parse tc.ipRange %q: %v", tc.ipRange, err)
+				}
+				prefix, err := netip.ParsePrefix(ipWithMask)
+				if err != nil {
+					t.Fatalf("Failed to parse returned IP prefix %q: %v", ipWithMask, err)
+				}
+				if !cidr.Contains(prefix.Addr()) {
+					t.Errorf("Expected returned IP %s to be within CIDR %s", prefix.Addr(), cidr)
+				}
+			}
+		})
+	}
+}
+
+func TestAddSourceBasedRoutingRule(t *testing.T) {
+	tests := []struct {
+		name       string
+		deviceCfg  DeviceConfig
+		wantRules  []apis.RuleConfig
+		wantRoutes []apis.RouteConfig
+	}{
+		{
+			name: "IPv4 no route containing gateway, source-based routing should not be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"192.168.1.3/32"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "192.168.1.0/24", Table: 0},
+					},
+				},
+			},
+			wantRules: nil,
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "192.168.1.0/24", Table: 0},
+			},
+		},
+		{
+			name: "IPv6 default route in main table, source-based routing should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"2001:db8::3/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "::/0", Gateway: "fe80::1", Table: 0},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "2001:db8::3/128", Table: 101, Priority: 32000},
+			},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "fe80::1/128", Table: 101, Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1", Table: 101},
+			},
+		},
+		{
+			name: "dual-stack routes with gateways, both IPv4 and IPv6 routes and rules should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"192.168.1.3/32", "2001:db8::3/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "192.168.1.0/24", Gateway: "192.168.1.1", Table: 100},
+						{Destination: "2001:db8::/64", Gateway: "fe80::1", Table: 0},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "192.168.1.3/32", Table: 101, Priority: 32000},
+				{Source: "2001:db8::3/128", Table: 101, Priority: 32000},
+			},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "192.168.1.1/32", Table: 101, Scope: 253},
+				{Destination: "0.0.0.0/0", Gateway: "192.168.1.1", Table: 101},
+				{Destination: "fe80::1/128", Table: 101, Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1", Table: 101},
+			},
+		},
+		{
+			name: "multiple IPv6 addresses with the default route, two rules and one set of custom table routes should be added",
+			deviceCfg: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{},
+					SubInterface: &apis.SubInterfaceConfig{
+						Type:      "ipvlan",
+						Addresses: []string{"2001:db8::3/128", "2001:db8::4/128"},
+					},
+					Routes: []apis.RouteConfig{
+						{Destination: "::/0", Gateway: "fe80::1", Table: 0},
+					},
+				},
+			},
+			wantRules: []apis.RuleConfig{
+				{Source: "2001:db8::3/128", Table: 101, Priority: 32000},
+				{Source: "2001:db8::4/128", Table: 101, Priority: 32000},
+			},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "fe80::1/128", Table: 101, Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1", Table: 101},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addSourceBasedRouting(&tt.deviceCfg, 1)
+			gotRules := tt.deviceCfg.NetworkInterfaceConfigInPod.Rules
+			if len(gotRules) != len(tt.wantRules) {
+				t.Fatalf("Expected %d rules, got %d", len(tt.wantRules), len(gotRules))
+			}
+			for i := range gotRules {
+				if gotRules[i].Source != tt.wantRules[i].Source || gotRules[i].Table != tt.wantRules[i].Table || gotRules[i].Priority != tt.wantRules[i].Priority {
+					t.Errorf("gotRules[%d] = %+v, want %+v", i, gotRules[i], tt.wantRules[i])
+				}
+			}
+
+			gotRoutes := tt.deviceCfg.NetworkInterfaceConfigInPod.Routes
+			if len(gotRoutes) != len(tt.wantRoutes) {
+				t.Fatalf("Expected %d routes, got %d", len(tt.wantRoutes), len(gotRoutes))
+			}
+			for i := range gotRoutes {
+				if gotRoutes[i].Destination != tt.wantRoutes[i].Destination || gotRoutes[i].Gateway != tt.wantRoutes[i].Gateway || gotRoutes[i].Table != tt.wantRoutes[i].Table || gotRoutes[i].Scope != tt.wantRoutes[i].Scope {
+					t.Errorf("gotRoutes[%d] = %+v, want %+v", i, gotRoutes[i], tt.wantRoutes[i])
+				}
 			}
 		})
 	}
