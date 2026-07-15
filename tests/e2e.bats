@@ -660,6 +660,12 @@ EOF
   local NODE_NAME="$CLUSTER_NAME"-worker
   local DUMMY_IFACE="dummy0"
 
+  # 0. Save original daemonset container args and enable the feature gate
+  local ORIGINAL_ARGS
+  ORIGINAL_ARGS=$(kubectl get daemonset dranet -n kube-system -o jsonpath='{.spec.template.spec.containers[0].args}')
+  kubectl patch daemonset dranet -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--feature-gates=PersistentResourceSliceAttributes=true"}]'
+  kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
+
   # 1. Create a dummy interface on the worker node
   docker exec "$NODE_NAME" bash -c "ip link add $DUMMY_IFACE type dummy"
   docker exec "$NODE_NAME" bash -c "ip link set up dev $DUMMY_IFACE"
@@ -696,9 +702,12 @@ EOF
   assert_success
   assert_output "$ORIGINAL_ATTRIBUTES"
 
-  # 7. Clean up Pod, Claim and Interface
+  # 7. Clean up Pod, Claim, Interface and restore original daemonset args
   kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml --ignore-not-found
   kubectl wait --for delete pod/pod1 --timeout=30s
   docker exec "$NODE_NAME" ip link delete $DUMMY_IFACE || true
+
+  kubectl patch daemonset dranet -n kube-system --type='json' -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/args\", \"value\": $ORIGINAL_ARGS}]"
+  kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
 }
 

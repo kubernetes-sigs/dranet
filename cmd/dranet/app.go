@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 	"sigs.k8s.io/dranet/pkg/driver"
+	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/inventory"
 	"sigs.k8s.io/dranet/pkg/pcidb"
 
@@ -66,6 +67,7 @@ var (
 	cloudProviderHint string
 	profileProvider   string
 	webhookURL        string
+	featureGates      string
 
 	kubeletRootDir string
 
@@ -86,6 +88,7 @@ func init() {
 	flag.StringVar(&profileProvider, "profile-provider", "cloud", "Provides user intent (cloud, webhook, none). 'cloud' falls back to the cloud-provider's native implementation.")
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
+	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -96,6 +99,12 @@ func init() {
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if featureGates != "" {
+		if err := features.DefaultMutableFeatureGate.Set(featureGates); err != nil {
+			klog.Fatalf("Failed to set feature gates: %v", err)
+		}
+	}
 
 	printVersion()
 	flag.VisitAll(func(f *flag.Flag) {

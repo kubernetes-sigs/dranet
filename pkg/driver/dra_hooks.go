@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/dranet/pkg/apis"
+	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/filter"
 	"sigs.k8s.io/dranet/pkg/inventory"
 
@@ -59,15 +60,19 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 	klog.V(2).Infof("Publishing resources")
 	for {
 		select {
-		case devices := <-np.netdb.GetResources(ctx):
-			klog.V(3).Infof("Got %d devices from inventory: %s", len(devices), formatDeviceNames(devices, 15))
+		// Wait for updates from the host-discovered (live available) device inventory
+		case live := <-np.netdb.GetResources(ctx):
+			klog.V(3).Infof("Got %d devices from inventory: %s", len(live), formatDeviceNames(live, 15))
 
 			// Fetch allocated devices from BoltDB store and merge
-			var allocated []resourceapi.Device
+			var snapshots []resourceapi.Device
 			if np.podConfigStore != nil {
-				allocated = np.podConfigStore.GetAllocatedDeviceSnapshots()
+				snapshots = np.podConfigStore.GetAllocatedDeviceSnapshots()
 			}
-			merged := mergeDevices(devices, allocated)
+			merged := live
+			if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
+				merged = mergeDevices(live, snapshots)
+			}
 
 			// Apply filtering on the merged set of devices
 			filtered := filter.FilterDevices(np.celProgram, merged)
@@ -691,16 +696,18 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 	return mergedConf, nil
 }
 
-func mergeDevices(available, allocated []resourceapi.Device) []resourceapi.Device {
+// mergeDevices merges live host devices with database snapshots of allocated devices,
+// giving precedence to live attributes and capacities where they overlap.
+func mergeDevices(live, snapshot []resourceapi.Device) []resourceapi.Device {
 	merged := make(map[string]resourceapi.Device)
 
 	// 1. Initial Load from Host Scan (Live available devices)
-	for _, dev := range available {
+	for _, dev := range live {
 		merged[dev.Name] = dev
 	}
 
 	// 2. Merge allocated devices
-	for _, dev := range allocated {
+	for _, dev := range snapshot {
 		liveDev, exists := merged[dev.Name]
 		if !exists {
 			// Device is completely missing from host (e.g. virtual interface in pod namespace).
@@ -725,31 +732,23 @@ func mergeDevices(available, allocated []resourceapi.Device) []resourceapi.Devic
 }
 
 func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
-	merged := live
+	merged := *live.DeepCopy()
 
-	// Deep-copy live attributes
-	merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
-	for k, v := range live.Attributes {
-		merged.Attributes[k] = v
+	if merged.Attributes == nil {
+		merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
 	}
-
-	// Layer snapshot attributes on top if they are missing in live
 	for k, v := range snap.Attributes {
 		if _, exists := merged.Attributes[k]; !exists {
-			merged.Attributes[k] = v
+			merged.Attributes[k] = *v.DeepCopy()
 		}
 	}
 
-	// Deep-copy live capacities
-	merged.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity)
-	for k, v := range live.Capacity {
-		merged.Capacity[k] = v
+	if merged.Capacity == nil {
+		merged.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity)
 	}
-
-	// Layer snapshot capacities on top if they are missing in live
 	for k, v := range snap.Capacity {
 		if _, exists := merged.Capacity[k]; !exists {
-			merged.Capacity[k] = v
+			merged.Capacity[k] = *v.DeepCopy()
 		}
 	}
 

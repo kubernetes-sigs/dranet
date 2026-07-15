@@ -26,8 +26,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	resourcev1 "k8s.io/api/resource/v1"
+	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -861,6 +863,12 @@ func TestMergeDevices(t *testing.T) {
 		}
 	}
 
+	qtyCap := func(val string) resourcev1.DeviceCapacity {
+		return resourcev1.DeviceCapacity{
+			Value: k8sresource.MustParse(val),
+		}
+	}
+
 	pciDev := resourcev1.Device{
 		Name: "0000:c0:14.0",
 		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
@@ -878,57 +886,70 @@ func TestMergeDevices(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		available []resourcev1.Device
-		allocated []resourcev1.Device
-		expected  []resourcev1.Device
+		name     string
+		live     []resourcev1.Device
+		snapshot []resourcev1.Device
+		expected []resourcev1.Device
 	}{
 		{
-			name:      "Available only",
-			available: []resourcev1.Device{pciDev},
-			allocated: nil,
-			expected:  []resourcev1.Device{pciDev},
+			name:     "Only available devices returned",
+			live:     []resourcev1.Device{pciDev},
+			snapshot: nil,
+			expected: []resourcev1.Device{pciDev},
 		},
 		{
-			name:      "Device merge",
-			available: []resourcev1.Device{pciDev},
-			allocated: []resourcev1.Device{pciDevSnapshot},
-			expected:  []resourcev1.Device{pciDevSnapshot},
+			name:     "Allocated device returned when unavailable",
+			live:     nil,
+			snapshot: []resourcev1.Device{pciDevSnapshot},
+			expected: []resourcev1.Device{pciDevSnapshot},
 		},
 		{
-			name:      "Allocated device missing from host (Ghost device)",
-			available: nil,
-			allocated: []resourcev1.Device{pciDevSnapshot},
-			expected:  []resourcev1.Device{pciDevSnapshot},
-		},
-		{
-			name: "Device back on host (Zombie override)",
-			available: []resourcev1.Device{{
+			name:      "Available device attribute takes precedence over snapshot",
+			live: []resourcev1.Device{{
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
 					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
-					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"), // back on host!
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-live"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("9000"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
 				},
 			}},
-			allocated: []resourcev1.Device{pciDevSnapshot},
-			expected:  []resourcev1.Device{pciDevSnapshot},
+			snapshot: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-snap"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
+					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("1G"),
+					"other-capacity":     qtyCap("50"),
+				},
+			}},
+			expected: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-live"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("9000"),
+					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
+					"other-capacity":     qtyCap("50"),
+				},
+			}},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := mergeDevices(tc.available, tc.allocated)
-			if len(result) != len(tc.expected) {
-				t.Fatalf("expected %d devices, got %d", len(tc.expected), len(result))
-			}
-			for i, dev := range result {
-				if dev.Name != tc.expected[i].Name {
-					t.Errorf("expected device %d name to be %s, got %s", i, tc.expected[i].Name, dev.Name)
-				}
-				// Verify attributes equality
-				if len(dev.Attributes) != len(tc.expected[i].Attributes) {
-					t.Errorf("device %d attribute mismatch: expected %v, got %v", i, tc.expected[i].Attributes, dev.Attributes)
-				}
+			result := mergeDevices(tc.live, tc.snapshot)
+			if diff := cmp.Diff(tc.expected, result); diff != "" {
+				t.Errorf("mergeDevices result mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
