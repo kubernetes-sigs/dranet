@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"net/netip"
 	"sync"
 	"time"
 
@@ -113,6 +114,7 @@ type PodConfigStore struct {
 	mu           sync.RWMutex
 	configs      map[types.UID]PodConfig
 	checkpointer Checkpointer // nil when no persistence is configured
+	allocatedIPs map[string]types.UID
 }
 
 // NewPodConfigStore creates a new PodConfigStore. If a Checkpointer is
@@ -123,6 +125,7 @@ func NewPodConfigStore(checkpointer Checkpointer) (*PodConfigStore, error) {
 	s := &PodConfigStore{
 		configs:      make(map[types.UID]PodConfig),
 		checkpointer: checkpointer,
+		allocatedIPs: make(map[string]types.UID),
 	}
 
 	if checkpointer != nil {
@@ -134,6 +137,16 @@ func NewPodConfigStore(checkpointer Checkpointer) (*PodConfigStore, error) {
 			klog.Infof("PodConfigStore: loaded checkpoint for pod %s (%d devices)", podUID, len(devices))
 			s.configs[podUID] = PodConfig{
 				DeviceConfigs: devices,
+			}
+			for _, devCfg := range devices {
+				for _, addrStr := range devCfg.NetworkInterfaceConfigInPod.Interface.Addresses {
+					s.allocatedIPs[addrStr] = podUID
+				}
+				if devCfg.NetworkInterfaceConfigInPod.SubInterface != nil {
+					for _, addrStr := range devCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses {
+						s.allocatedIPs[addrStr] = podUID
+					}
+				}
 			}
 		}
 	}
@@ -193,8 +206,30 @@ func (s *PodConfigStore) SetDeviceConfig(podUID types.UID, deviceName string, co
 			DeviceConfigs: make(map[string]DeviceConfig),
 		}
 		s.configs[podUID] = podConfig
+	} else {
+		// If the exact device has old config with addresses, remove the old addresses
+		// in allocatedIPs because they will be overwritten by the new config.
+		if oldConfig, exists := podConfig.DeviceConfigs[deviceName]; exists {
+			for _, addrStr := range oldConfig.NetworkInterfaceConfigInPod.Interface.Addresses {
+				delete(s.allocatedIPs, addrStr)
+			}
+			if oldConfig.NetworkInterfaceConfigInPod.SubInterface != nil {
+				for _, addrStr := range oldConfig.NetworkInterfaceConfigInPod.SubInterface.Addresses {
+					delete(s.allocatedIPs, addrStr)
+				}
+			}
+		}
 	}
 	podConfig.DeviceConfigs[deviceName] = config
+
+	for _, addrStr := range config.NetworkInterfaceConfigInPod.Interface.Addresses {
+		s.allocatedIPs[addrStr] = podUID
+	}
+	if config.NetworkInterfaceConfigInPod.SubInterface != nil {
+		for _, addrStr := range config.NetworkInterfaceConfigInPod.SubInterface.Addresses {
+			s.allocatedIPs[addrStr] = podUID
+		}
+	}
 	return nil
 }
 
@@ -215,9 +250,9 @@ func (s *PodConfigStore) GetDeviceConfig(podUID types.UID, deviceName string) (D
 // regardless of checkpoint outcome. This asymmetry with SetDeviceConfig
 // (which aborts on checkpoint failure) is intentional:
 //   - A failed Set leaving stale RAM would silently lose config on restart (#89).
-//   - A failed Delete leaving a stale checkpoint is harmless: Synchronize()
-//     prunes orphaned checkpoint entries on the next startup by diffing
-//     against live pods from the container runtime.
+//   - A failed Delete leaving a stale checkpoint is harmless: Kubelet's DRA manager
+//     is guaranteed to retry UnprepareResourceClaims (which triggers DeletePod)
+//     until it succeeds, ensuring that the checkpoint is eventually cleaned up.
 //
 // Skipping the RAM delete would be worse — the driver would keep processing
 // a pod that the runtime has already removed.
@@ -228,6 +263,18 @@ func (s *PodConfigStore) DeletePod(podUID types.UID) {
 	if s.checkpointer != nil {
 		if err := s.checkpointer.DeletePod(podUID); err != nil {
 			klog.Errorf("failed to delete checkpoint for pod %s: %v", podUID, err)
+		}
+	}
+	if podConfig, ok := s.configs[podUID]; ok {
+		for _, devCfg := range podConfig.DeviceConfigs {
+			for _, addrStr := range devCfg.NetworkInterfaceConfigInPod.Interface.Addresses {
+				delete(s.allocatedIPs, addrStr)
+			}
+			if devCfg.NetworkInterfaceConfigInPod.SubInterface != nil {
+				for _, addrStr := range devCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses {
+					delete(s.allocatedIPs, addrStr)
+				}
+			}
 		}
 	}
 	delete(s.configs, podUID)
@@ -282,8 +329,8 @@ func (s *PodConfigStore) SetPodNetNs(podUID types.UID, netns string) {
 	s.configs[podUID] = podCfg
 }
 
-// DeleteClaim removes all configurations associated with a given claim and
-// returns the list of Pod UIDs that were associated with it.
+// DeleteClaim removes all configurations and allocated IPs associated with a given
+// claim and returns the list of Pod UIDs that were associated with it.
 // Like DeletePod, checkpoint failures do not prevent in-memory cleanup.
 // See DeletePod for rationale on this intentional asymmetry with SetDeviceConfig.
 func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
@@ -305,7 +352,37 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
 				klog.Errorf("failed to delete checkpoint for pod %s: %v", uid, err)
 			}
 		}
+		if podConfig, ok := s.configs[uid]; ok {
+			for _, devCfg := range podConfig.DeviceConfigs {
+				for _, addrStr := range devCfg.NetworkInterfaceConfigInPod.Interface.Addresses {
+					delete(s.allocatedIPs, addrStr)
+				}
+				if devCfg.NetworkInterfaceConfigInPod.SubInterface != nil {
+					for _, addrStr := range devCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses {
+						delete(s.allocatedIPs, addrStr)
+					}
+				}
+			}
+		}
 		delete(s.configs, uid)
 	}
 	return podsToDelete
+}
+
+// GetAllocatedIPs returns a copy of all currently allocated IP addresses as
+// netip.Addr values. Creating the copy avoids lock contention on s.mu during
+// candidate address generation loops.
+func (s *PodConfigStore) GetAllocatedIPs() map[netip.Addr]types.UID {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ipsCopy := make(map[netip.Addr]types.UID, len(s.allocatedIPs))
+	for ipStr, uid := range s.allocatedIPs {
+		if prefix, err := netip.ParsePrefix(ipStr); err == nil {
+			ipsCopy[prefix.Addr()] = uid
+		} else {
+			klog.Errorf("PodConfigStore: failed to parse allocated IP %q as CIDR: %v", ipStr, err)
+		}
+	}
+	return ipsCopy
 }

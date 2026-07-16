@@ -23,9 +23,15 @@ type NetworkConfig struct {
 	// parameters resolved by the provider plugin (e.g., dynamic IPAM).
 	// This separates user intent from infrastructure implementation.
 	Profile string `json:"profile,omitempty"`
+
 	// Interface defines core properties of the network interface.
 	// Settings here are typically managed by `ip link` commands.
 	Interface InterfaceConfig `json:"interface"`
+
+	// SubInterface defines the properties of the subinterfaces created on the network interface.
+	// When specified, new subinterfaces will be created in the pod namespace based
+	// on this config, while the original interface stays in the host namespace.
+	SubInterface *SubInterfaceConfig `json:"subInterface,omitempty"`
 
 	// Routes defines static routes to be configured for this interface.
 	Routes []RouteConfig `json:"routes,omitempty"`
@@ -102,6 +108,60 @@ type VRFConfig struct {
 	// If not specified, a unique table ID will be automatically assigned (typically interface index + 100).
 	// Common reserved tables: 255 (local), 254 (main), 253 (default).
 	Table *int `json:"table,omitempty"`
+}
+
+// SubInterfaceConfig defines the properties of the subinterfaces.
+// The presence of a valid `Type` field activates this configuration,
+// triggering the creation of the subinterface.
+type SubInterfaceConfig struct {
+	// Type indicates the network type of the subinterface.
+	// A valid Type activates the configuration and creation of
+	// the subinterface. It can either be populated by the cloud
+	// provider or explicitly requested in the user's ResourceClaim.
+	// For now, we only support type "ipvlan".
+	Type SubInterfaceType `json:"type,omitempty"`
+
+	// Name is the desired logical name of the subinterface inside the Pod.
+	// If not specified, it will be derived by adding a type prefix to the parent interface name.
+	// e.g. for ipvlan type, Name will be "ipvlan-<parent_interface_name>"
+	Name string `json:"name,omitempty"`
+
+	// Addresses is a list of IP addresses in CIDR format to be assigned to the subinterface.
+	// Addresses should be populated dynamically rather than being statically defined by the user.
+	// If no custom routes or rules are specified, automatic source-based routing is configured
+	// for these addresses on the subinterface.
+	Addresses []string `json:"addresses,omitempty"`
+
+	// IPRange is a range of IP addresses from which the node
+	// local IPAM can generate an IP address for the subinterface.
+	// It needs to be provided by the cloud provider in GetDeviceConfig.
+	IPRange string `json:"ipRange,omitempty"`
+
+	// IPVlanConfig defines the IPVlan-specific configuration for the subinterface.
+	// It is valid only when the subinterface type is IPVlan.
+	IPVlanConfig *IPVlanConfig `json:"ipvlan,omitempty"`
+}
+
+// SubInterfaceType specifies the available subinterface network types.
+// Currently the supported type is "ipvlan".
+type SubInterfaceType string
+
+const (
+	SubInterfaceTypeIPVlan SubInterfaceType = "ipvlan"
+)
+
+// IPVlanConfig contains the IPVlan-specific configuration.
+// Currently, the default and only option is l2 mode and bridge
+// flag. New options will be added if required in the future.
+type IPVlanConfig struct {
+	// Mode defines how traffic is routed to the IPVlan child interfaces.
+	// Currently the supported mode is:
+	// - "l2": child interfaces handle their own L2 protocols like ARP.
+	Mode string `json:"mode,omitempty"`
+	// Flag defines the link behavior of the IPVlan child interfaces.
+	// Currently the supported flag is:
+	// - "bridge": child interfaces can talk directly to each other internally.
+	Flag string `json:"flag,omitempty"`
 }
 
 // RouteConfig represents a network route configuration.

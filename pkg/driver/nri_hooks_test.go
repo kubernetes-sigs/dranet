@@ -189,6 +189,59 @@ func TestRunPodSandboxUsesPersistedConfigAfterRestart(t *testing.T) {
 	}
 }
 
+// TestRunPodSandboxSubinterfaceCreation tests the creation of a subinterface during
+// RunPodSandbox when SubInterface is configured. It verifies the creation call
+// by checking the expected error message is returned from nsCreateSubinterface.
+func TestRunPodSandboxSubinterfaceCreation(t *testing.T) {
+	podUID := types.UID("test-pod-subinterface")
+	store := mustNewPodConfigStore()
+
+	deviceCfg := DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "nonexistent-parent"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			SubInterface: &apis.SubInterfaceConfig{
+				Type:      "ipvlan",
+				Name:      "ipvlan-eth0",
+				Addresses: []string{"2001:db8::10/64"},
+				IPRange:   "2001:db8::/64",
+			},
+		},
+	}
+
+	if err := store.SetDeviceConfig(podUID, "eth0", deviceCfg); err != nil {
+		t.Fatalf("SetDeviceConfig() error: %v", err)
+	}
+
+	np := &NetworkDriver{
+		podConfigStore: store,
+		netdb:          inventory.New(),
+		eventRecorder:  record.NewFakeRecorder(100),
+	}
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "test-pod-subinterface",
+		Namespace: "test-ns",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: "/proc/self/ns/net"},
+			},
+		},
+	}
+
+	// Verify that the subinterface creation path is called by passing a non-existent parent interface
+	// and asserting that the call fails with a "could not find parent interface on host" error.
+	err := np.RunPodSandbox(context.Background(), pod)
+	if err == nil {
+		t.Fatal("expected RunPodSandbox to error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "could not find parent interface nonexistent-parent on host") {
+		t.Errorf("expected error to contain 'could not find parent interface nonexistent-parent on host', got: %v", err)
+	}
+}
 
 func TestSynchronizeStoresNetNSOnlyForConfiguredPods(t *testing.T) {
 	store := mustNewPodConfigStore()
@@ -571,6 +624,19 @@ func TestStopPodSandboxRescanGating(t *testing.T) {
 			deviceConfig:      DeviceConfig{RDMADevice: RDMAConfig{LinkDev: "mlx5_0"}},
 			setupNetNs:        true,
 		},
+		{
+			name:              "subinterface configured: no rescan triggered",
+			setupDeviceConfig: true,
+			deviceConfig: DeviceConfig{
+				NetworkInterfaceConfigInPod: apis.NetworkConfig{
+					SubInterface: &apis.SubInterfaceConfig{
+						Name: "ipvlan-eth0",
+						Type: "ipvlan",
+					},
+				},
+			},
+			setupNetNs: true,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -670,5 +736,55 @@ func TestRemovePodSandboxMetrics(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCreateContainerSubinterfaceRDMAInjection verifies that the
+// RDMA character devices are correctly injected into the container
+// adjustment when the pod is configured to use a subinterface.
+func TestCreateContainerSubinterfaceRDMAInjection(t *testing.T) {
+	podUID := types.UID("test-pod-subinterface")
+	deviceCfg := DeviceConfig{
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			SubInterface: &apis.SubInterfaceConfig{
+				Type:      "ipvlan",
+				Name:      "ipvlan-eth0",
+				Addresses: []string{"2001:db8::10/64"},
+				IPRange:   "2001:db8::/64",
+			},
+		},
+		RDMADevice: RDMAConfig{
+			DevChars: []LinuxDevice{
+				{Path: "/dev/infiniband/uverbs0", Type: "c", Major: 231, Minor: 192},
+				{Path: "/dev/infiniband/rdma_cm", Type: "c", Major: 10, Minor: 58},
+			},
+		},
+	}
+
+	store := mustNewPodConfigStore()
+	if err := store.SetDeviceConfig(podUID, "eth0", deviceCfg); err != nil {
+		t.Fatalf("SetDeviceConfig() error: %v", err)
+	}
+
+	np := &NetworkDriver{podConfigStore: store}
+	pod := &api.PodSandbox{Uid: string(podUID), Name: "test-pod-subinterface", Namespace: "test-ns"}
+	ctr := &api.Container{Name: "test-container"}
+
+	adjust, _, err := np.CreateContainer(context.Background(), pod, ctr)
+	if err != nil {
+		t.Fatalf("CreateContainer failed: %v", err)
+	}
+	if adjust == nil || adjust.Linux == nil {
+		t.Fatalf("CreateContainer returned nil container adjustment")
+	}
+	if len(adjust.Linux.Devices) != 2 {
+		t.Fatalf("expected 2 injected RDMA char devices, got %d", len(adjust.Linux.Devices))
+	}
+
+	expectedPaths := []string{"/dev/infiniband/uverbs0", "/dev/infiniband/rdma_cm"}
+	for i, expectedPath := range expectedPaths {
+		if got := adjust.Linux.Devices[i].Path; got != expectedPath {
+			t.Errorf("expected device %d path to be %q, got %q", i, expectedPath, got)
+		}
 	}
 }
