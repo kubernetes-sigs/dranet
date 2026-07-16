@@ -130,6 +130,49 @@ func TestMergeNetworkConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "same destination in different tables is kept across user and cloud (policy routing)",
+			user: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 100},
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 200},
+				},
+			},
+			cloud: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "0.0.0.0/0", Gateway: "192.168.1.254"},
+					// Same destination as the user routes but a distinct table:
+					// this cloud route must be preserved, not deduplicated away.
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.254", Table: 300},
+				},
+			},
+			want: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "0.0.0.0/0", Gateway: "192.168.1.254"},
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.254", Table: 300},
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 100},
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 200},
+				},
+			},
+		},
+		{
+			name: "same destination and table resolves to user (override preserved)",
+			user: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 100},
+				},
+			},
+			cloud: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.254", Table: 100},
+				},
+			},
+			want: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 100},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {

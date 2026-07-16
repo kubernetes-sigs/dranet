@@ -49,7 +49,9 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 	// For addresses, we just unique them.
 	merged.Interface.Addresses = deduplicateStrings(merged.Interface.Addresses)
 
-	// For Routes, deduplicate by destination (user wins, which were appended last, so we iterate backwards).
+	// For Routes, deduplicate by destination and table (user wins, which were appended last, so we
+	// iterate backwards). Routes to the same destination in different tables are distinct entries
+	// (policy routing) and are all kept.
 	merged.Routes = deduplicateRoutes(merged.Routes)
 	merged.Neighbors = deduplicateNeighbors(merged.Neighbors)
 
@@ -70,12 +72,18 @@ func deduplicateStrings(s []string) []string {
 }
 
 func deduplicateRoutes(routes []RouteConfig) []RouteConfig {
-	seen := make(map[string]bool)
+	// A route is identified by its destination and table: the same destination in
+	// different tables is a distinct route (policy routing) and must be kept.
+	type routeKey struct {
+		destination string
+		table       int
+	}
+	seen := make(map[routeKey]bool)
 	var res []RouteConfig
 	for i := len(routes) - 1; i >= 0; i-- {
-		dest := routes[i].Destination
-		if !seen[dest] {
-			seen[dest] = true
+		key := routeKey{destination: routes[i].Destination, table: routes[i].Table}
+		if !seen[key] {
+			seen[key] = true
 			res = append([]RouteConfig{routes[i]}, res...)
 		}
 	}
