@@ -434,13 +434,13 @@ func TestValidateRoutes(t *testing.T) {
 			errCount:  1,
 		},
 		{
-			name:      "valid IPv6 route with IPv6 gateway",
+			name:      "valid IPv6 route with gateway matching the destination IP family",
 			routes:    []RouteConfig{{Destination: "2001:db8:1::/64", Gateway: "2001:db8::1", Scope: scopeUniverse}},
 			fieldPath: "routes",
 			expectErr: false,
 		},
 		{
-			name:      "valid route with matching gateway and source",
+			name:      "valid IPv4 route with gateway and source matching the destination IP family",
 			routes:    []RouteConfig{{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Source: "192.168.1.2", Scope: scopeUniverse}},
 			fieldPath: "routes",
 			expectErr: false,
@@ -543,7 +543,7 @@ func TestValidateRules(t *testing.T) {
 			errCount:  1,
 		},
 		{
-			name:      "valid rule with matching IPv6 source and destination",
+			name:      "valid IPv6 rule with matching source and destination IP family",
 			rules:     []RuleConfig{{Source: "2001:db8::/64", Destination: "2001:db8:1::/64", Table: 100}},
 			fieldPath: "rules",
 			expectErr: false,
