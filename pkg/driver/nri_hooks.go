@@ -39,15 +39,16 @@ import (
 // the information necessary should passed to the NRI hooks via the np.podConfigStore so it can be executed
 // quickly.
 
-func (np *NetworkDriver) Synchronize(_ context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
-	klog.Infof("Synchronized state with the runtime (%d pods, %d containers)...",
-		len(pods), len(containers))
+func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
+	logger := klog.FromContext(ctx)
+	logger.Info("Synchronized state with the runtime", "pods", len(pods), "containers", len(containers))
 
 	// livePodNetNs map tracks live pods by UID and their network namespace paths.
 	livePodNetNs := make(map[types.UID]string)
 	for _, pod := range pods {
-		klog.Infof("Synchronize Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
-		klog.V(2).Infof("pod %s/%s: namespace=%s ips=%v", pod.GetNamespace(), pod.GetName(), getNetworkNamespace(pod), pod.GetIps())
+		podLogger := klog.LoggerWithValues(logger, "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid)
+		podLogger.Info("Synchronize Pod")
+		podLogger.V(2).Info("Pod network details", "netns", getNetworkNamespace(pod), "ips", pod.GetIps())
 		livePodNetNs[types.UID(pod.Uid)] = getNetworkNamespace(pod)
 	}
 
@@ -63,7 +64,9 @@ func (np *NetworkDriver) Synchronize(_ context.Context, pods []*api.PodSandbox, 
 
 // CreateContainer handles container creation requests.
 func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	klog.V(2).Infof("CreateContainer Pod %s/%s UID %s Container %s", pod.Namespace, pod.Name, pod.Uid, ctr.Name)
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid, "container", ctr.Name)
+	ctx = klog.NewContext(ctx, logger)
+	logger.V(2).Info("CreateContainer")
 	start := time.Now()
 	status := statusNoop
 	defer func() {
@@ -77,7 +80,7 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 
 	defer func() {
 		// Update container creation activity timestamp.
-		klog.V(3).Infof("Pod %s hit CreateContainer for container %s, updating activity timestamp", pod.Uid, ctr.Name)
+		logger.V(3).Info("Updating activity timestamp after CreateContainer")
 		np.podConfigStore.UpdateLastNRIActivity(types.UID(pod.GetUid()), time.Now())
 	}()
 
@@ -116,12 +119,14 @@ func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _
 }
 
 func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
-	klog.V(2).Infof("RunPodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid)
+	ctx = klog.NewContext(ctx, logger)
+	logger.V(2).Info("RunPodSandbox")
 	start := time.Now()
 	status := statusNoop
 	defer func() {
 		nriPluginRequestsTotal.WithLabelValues(methodRunPodSandbox, status).Inc()
-		klog.V(2).Infof("RunPodSandbox Pod %s/%s UID %s took %v", pod.Namespace, pod.Name, pod.Uid, time.Since(start))
+		logger.V(2).Info("RunPodSandbox finished", "duration", time.Since(start))
 		nriPluginRequestsLatencySeconds.WithLabelValues(methodRunPodSandbox, status).Observe(time.Since(start).Seconds())
 
 	}()
@@ -138,7 +143,8 @@ func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox)
 	}
 	return err
 }
-func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
+func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
+	logger := klog.FromContext(ctx)
 	// get the pod network namespace
 	ns := getNetworkNamespace(pod)
 	// host network pods can not allocate network devices because it impact the host
@@ -152,7 +158,7 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
 	// Process the configurations of the ResourceClaim
 	for deviceName, config := range podConfig.DeviceConfigs {
-		klog.V(4).Infof("RunPodSandbox processing device: %s with config: %#v", deviceName, config)
+		logger.V(4).Info("RunPodSandbox processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
 		resourceClaim := types.NamespacedName{Name: config.Claim.Name, Namespace: config.Claim.Namespace}
 		resourceClaimStatus := statusUpdates[resourceClaim]
 		if statusUpdates[resourceClaim] == nil {
@@ -170,7 +176,7 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 
 		// Block 1: netdev operations — only when a network interface is present.
 		if ifName != "" {
-			if err := attachNetdevToNS(pod, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+			if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
 					"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
 				return err
@@ -181,7 +187,7 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 		// For IB-only devices (no netdev) this is the only operation here;
 		// for RoCE (netdev + RDMA) it runs after the netdev block above.
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
-			if err := attachRdmaToNS(config.RDMADevice.LinkDev, ns, resourceClaimStatusDevice); err != nil {
+			if err := attachRdmaToNS(ctx, config.RDMADevice.LinkDev, ns, resourceClaimStatusDevice); err != nil {
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "RDMADeviceAttachFailed",
 					"failed to attach RDMA device %s to pod %s/%s: %v", config.RDMADevice.LinkDev, pod.GetNamespace(), pod.GetName(), err)
 				return err
@@ -207,17 +213,18 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 	// do not block the handler to update the status
 	for claim, status := range statusUpdates {
 		resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).WithStatus(status)
+		claimLogger := klog.LoggerWithValues(logger, "claim", klog.KRef(claim.Namespace, claim.Name))
 		go func() {
-			ctxStatus, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctxStatus, cancel := context.WithTimeout(klog.NewContext(context.Background(), claimLogger), 3*time.Second)
 			defer cancel()
 			_, err := np.kubeClient.ResourceV1().ResourceClaims(claim.Namespace).ApplyStatus(ctxStatus,
 				resourceClaimApply,
 				metav1.ApplyOptions{FieldManager: np.driverName, Force: true},
 			)
 			if err != nil {
-				klog.Infof("failed to update status for claim %s/%s : %v", claim.Namespace, claim.Name, err)
+				claimLogger.Info("Failed to update status for claim", "err", err)
 			} else {
-				klog.V(4).Infof("updated status for claim %s/%s", claim.Namespace, claim.Name)
+				claimLogger.V(4).Info("Updated status for claim")
 			}
 		}()
 	}
@@ -227,10 +234,11 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 
 // attachRdmaToNS moves the RDMA link device into the pod network namespace and
 // records the RDMALinkReady status condition on resourceClaimStatusDevice.
-func attachRdmaToNS(linkDev, ns string, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
-	klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", linkDev)
+func attachRdmaToNS(ctx context.Context, linkDev, ns string, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "rdmaDevice", linkDev, "netns", ns)
+	logger.V(2).Info("RunPodSandbox processing RDMA device")
 	if err := nsAttachRdmadev(linkDev, ns); err != nil {
-		klog.Infof("RunPodSandbox error getting RDMA device %s to namespace %s: %v", linkDev, ns, err)
+		logger.Info("RunPodSandbox error moving RDMA device to namespace", "err", err)
 		return fmt.Errorf("error moving RDMA device %s to namespace %s: %v", linkDev, ns, err)
 	}
 	resourceClaimStatusDevice.WithConditions(
@@ -246,14 +254,15 @@ func attachRdmaToNS(linkDev, ns string, resourceClaimStatusDevice *resourceapply
 // attachNetdevToNS moves the host network interface into the pod network namespace,
 // applies all associated configuration (ethtool, eBPF, routes, rules, neighbors),
 // and records the resulting status conditions on resourceClaimStatusDevice.
-func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
 	ifName := config.NetworkInterfaceConfigInHost.Interface.Name
-	klog.V(2).Infof("RunPodSandbox processing Network device: %s", ifName)
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "device", deviceName, "interface", ifName, "netns", ns)
+	logger.V(2).Info("RunPodSandbox processing Network device")
 	// TODO config options to rename the device and pass parameters
 	// use https://github.com/opencontainers/runtime-spec/pull/1271
 	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
-		klog.Infof("RunPodSandbox error moving device %s to namespace %s: %v", deviceName, ns, err)
+		logger.Info("RunPodSandbox error moving network device to namespace", "err", err)
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
 	}
 
@@ -276,7 +285,7 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 	if config.NetworkInterfaceConfigInPod.Ethtool != nil {
 		err = applyEthtoolConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Ethtool)
 		if err != nil {
-			klog.Infof("RunPodSandbox error applying ethtool config for %s in ns %s: %v", ifNameInNs, ns, err)
+			logger.Info("RunPodSandbox error applying ethtool config", "podInterface", ifNameInNs, "err", err)
 			return fmt.Errorf("error applying ethtool config for %s in ns %s: %v", ifNameInNs, ns, err)
 		}
 	}
@@ -286,7 +295,7 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 		*config.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms {
 		err := detachEBPFPrograms(ns, ifNameInNs)
 		if err != nil {
-			klog.Infof("error disabling ebpf programs for %s in ns %s: %v", ifNameInNs, ns, err)
+			logger.Info("Error disabling ebpf programs", "podInterface", ifNameInNs, "err", err)
 			return fmt.Errorf("error disabling ebpf programs for %s in ns %s: %v", ifNameInNs, ns, err)
 		}
 	}
@@ -302,7 +311,7 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 	// Configure routes
 	err = applyRoutingConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Routes, vrfTable)
 	if err != nil {
-		klog.Infof("RunPodSandbox error configuring device %s namespace %s routing: %v", deviceName, ns, err)
+		logger.Info("RunPodSandbox error configuring routing", "podInterface", ifNameInNs, "err", err)
 		return fmt.Errorf("error configuring device %s routes on namespace %s: %v", deviceName, ns, err)
 	}
 
@@ -311,7 +320,7 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 	if vrfTable == 0 {
 		err = applyRulesConfig(ns, config.NetworkInterfaceConfigInPod.Rules)
 		if err != nil {
-			klog.Infof("RunPodSandbox error configuring device %s namespace %s rules: %v", deviceName, ns, err)
+			logger.Info("RunPodSandbox error configuring rules", "err", err)
 			return fmt.Errorf("error configuring device %s rules on namespace %s: %v", deviceName, ns, err)
 		}
 	}
@@ -319,7 +328,7 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 	// Configure neighbors
 	err = applyNeighborConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Neighbors)
 	if err != nil {
-		klog.Infof("RunPodSandbox for pod %s/%s (UID %s) failed to apply neighbor configuration for interface %s in namespace %s: %v", pod.Namespace, pod.Name, pod.Uid, ifNameInNs, ns, err)
+		logger.Info("RunPodSandbox failed to apply neighbor configuration", "podInterface", ifNameInNs, "err", err)
 		return fmt.Errorf("failed to apply neighbor configuration for interface %s in namespace %s: %w", ifNameInNs, ns, err)
 	}
 
@@ -337,12 +346,14 @@ func attachNetdevToNS(pod *api.PodSandbox, ns, deviceName string, config DeviceC
 // to avoid disrupting the pod shutdown. The kernel will do the cleanup once the namespace
 // is deleted.
 func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
-	klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid)
+	ctx = klog.NewContext(ctx, logger)
+	logger.V(2).Info("StopPodSandbox")
 	start := time.Now()
 	status := statusNoop
 	defer func() {
 		nriPluginRequestsTotal.WithLabelValues(methodStopPodSandbox, status).Inc()
-		klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s took %v", pod.Namespace, pod.Name, pod.Uid, time.Since(start))
+		logger.V(2).Info("StopPodSandbox finished", "duration", time.Since(start))
 		nriPluginRequestsLatencySeconds.WithLabelValues(methodStopPodSandbox, status).Observe(time.Since(start).Seconds())
 	}()
 	// get the devices associated to this Pod
@@ -359,7 +370,8 @@ func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox
 	return err
 }
 
-func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
+func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
+	logger := klog.FromContext(ctx)
 	// get the pod network namespace
 	ns := getNetworkNamespace(pod)
 	if ns == "" {
@@ -367,7 +379,7 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		// we workaround it using the local copy we have in the db to associate interfaces with Pods via
 		// the network namespace id.
 		if podConfig.NetNS == "" {
-			klog.Warningf("StopPodSandbox: network namespace for DRANET pod %s/%s (UID %s) is unknown; skipping explicit device detach and relying on kernel netns teardown", pod.Namespace, pod.Name, pod.Uid)
+			logger.Info("StopPodSandbox: network namespace for DRANET pod is unknown; skipping explicit device detach and relying on kernel netns teardown")
 			return nil
 		}
 		ns = podConfig.NetNS
@@ -382,7 +394,7 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		rdmaDetached := false
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
 			if err := nsDetachRdmadev(ns, config.RDMADevice.LinkDev); err != nil {
-				klog.Errorf("fail to return rdma device %s : %v", deviceName, err)
+				logger.Error(err, "Failed to return rdma device", "device", deviceName)
 			} else {
 				rdmaDetached = true
 			}
@@ -392,7 +404,7 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		ifName := config.NetworkInterfaceConfigInPod.Interface.Name
 		if ifName != "" {
 			if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
-				klog.Errorf("fail to return network device %s : %v", deviceName, err)
+				logger.Error(err, "Failed to return network device", "device", deviceName)
 			} else {
 				netdevDetached = true
 			}
@@ -426,7 +438,9 @@ func needsRescanAfterDetach(rdmaDetached, netdevDetached bool) bool {
 }
 
 func (np *NetworkDriver) RemovePodSandbox(ctx context.Context, pod *api.PodSandbox) error {
-	klog.V(2).Infof("RemovePodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid)
+	ctx = klog.NewContext(ctx, logger)
+	logger.V(2).Info("RemovePodSandbox")
 	start := time.Now()
 	status := statusNoop
 	defer func() {
@@ -449,8 +463,8 @@ func (np *NetworkDriver) removePodSandbox(_ context.Context, pod *api.PodSandbox
 	return nil
 }
 
-func (np *NetworkDriver) Shutdown(_ context.Context) {
-	klog.Info("Runtime shutting down...")
+func (np *NetworkDriver) Shutdown(ctx context.Context) {
+	klog.FromContext(ctx).Info("Runtime shutting down...")
 }
 
 func getNetworkNamespace(pod *api.PodSandbox) string {
