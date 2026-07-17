@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -46,6 +47,10 @@ type PodConfig struct {
 // routes for the Pod's network namespace, and RDMA configurations.
 type DeviceConfig struct {
 	Claim types.NamespacedName `json:"claim"`
+
+	// DeviceSnapshot contains the original discovered ResourceSlice Device structure,
+	// which includes the device's identifying attributes and capacity.
+	DeviceSnapshot *resourceapi.Device `json:"deviceSnapshot,omitempty"`
 
 	// NetworkInterfaceConfigInHost is the config of the network interface as
 	// seen in the host's network namespace BEFORE it was moved to the pod's
@@ -308,4 +313,21 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
 		delete(s.configs, uid)
 	}
 	return podsToDelete
+}
+
+// GetAllocatedDeviceSnapshots returns all devices currently allocated to active pods
+// that have a valid device attributes snapshot stored in BoltDB.
+func (s *PodConfigStore) GetAllocatedDeviceSnapshots() []resourceapi.Device {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var allocated []resourceapi.Device
+	for _, podConfig := range s.configs {
+		for _, config := range podConfig.DeviceConfigs {
+			if config.DeviceSnapshot != nil {
+				allocated = append(allocated, *config.DeviceSnapshot)
+			}
+		}
+	}
+	return allocated
 }

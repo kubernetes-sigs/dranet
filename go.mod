@@ -34,6 +34,7 @@ require (
 	k8s.io/apimachinery v0.36.2
 	k8s.io/client-go v0.36.2
 	k8s.io/cloud-provider-gcp v0.0.0-20250326051131-7056e3facd39
+	k8s.io/component-base v0.36.2
 	k8s.io/component-helpers v0.36.2
 	k8s.io/dynamic-resource-allocation v0.36.2
 	k8s.io/klog/v2 v2.140.0
@@ -61,6 +62,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.44.1 // indirect
 	github.com/aws/smithy-go v1.27.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect

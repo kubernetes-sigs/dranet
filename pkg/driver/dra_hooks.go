@@ -21,10 +21,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
 	"sigs.k8s.io/dranet/pkg/apis"
+	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/filter"
 	"sigs.k8s.io/dranet/pkg/inventory"
 
@@ -58,16 +60,27 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 	klog.V(2).Infof("Publishing resources")
 	for {
 		select {
-		case devices := <-np.netdb.GetResources(ctx):
-			klog.V(3).Infof("Got %d devices from inventory: %s", len(devices), formatDeviceNames(devices, 15))
-			devices = filter.FilterDevices(np.celProgram, devices)
-			klog.V(3).Infof("After filtering, publishing %d devices in ResourceSlice(s): %s", len(devices), formatDeviceNames(devices, 15))
+		// Wait for updates from the host-discovered (live) device inventory
+		case live := <-np.netdb.GetResources(ctx):
+			klog.V(3).Infof("Got %d devices from inventory: %s", len(live), formatDeviceNames(live, 15))
 
-			np.publishResourcesPrometheusMetrics(devices)
+			// Fetch device snapshots from BoltDB store and merge
+			merged := live
+			if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
+				snapshots := np.podConfigStore.GetAllocatedDeviceSnapshots()
+				merged = mergeDevices(live, snapshots)
+			}
+
+			// Apply filtering on the merged set of devices
+			filtered := filter.FilterDevices(np.celProgram, merged)
+
+			klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
+
+			np.publishResourcesPrometheusMetrics(filtered)
 
 			resources := resourceslice.DriverResources{
 				Pools: map[string]resourceslice.Pool{
-					np.nodeName: {Slices: []resourceslice.Slice{{Devices: devices}}},
+					np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
 				},
 			}
 			err := np.draPlugin.PublishResources(ctx, resources)
@@ -223,12 +236,21 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		netconf := *mergedConf
 
 		klog.V(4).Infof("PrepareResourceClaim %s/%s final Configuration %#v", claim.Namespace, claim.Name, netconf)
+		// Query the local discovery database (netdb) for the card's clean attributes
+		var deviceSnapshot *resourceapi.Device
+		if device, ok := np.netdb.GetDevice(result.Device); ok {
+			deviceSnapshot = &device
+		} else {
+			klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
+		}
+
 		deviceCfg := DeviceConfig{
 			Claim: types.NamespacedName{
 				Namespace: claim.Namespace,
 				Name:      claim.Name,
 			},
 			NetworkInterfaceConfigInPod: netconf,
+			DeviceSnapshot:              deviceSnapshot,
 		}
 
 		// Store early to guarantee profile cleanup on subsequent failures within this loop.
@@ -669,4 +691,63 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 		mergedConf = apis.MergeNetworkConfig(mergedConf, profileConf)
 	}
 	return mergedConf, nil
+}
+
+// mergeDevices merges live host devices with database snapshots,
+// giving precedence to live attributes and capacities where they overlap.
+func mergeDevices(live, snapshot []resourceapi.Device) []resourceapi.Device {
+	merged := make(map[string]resourceapi.Device)
+
+	// 1. Initial Load from Host Scan (Live devices)
+	for _, dev := range live {
+		merged[dev.Name] = dev
+	}
+
+	// 2. Merge database snapshots
+	for _, dev := range snapshot {
+		liveDev, exists := merged[dev.Name]
+		if !exists {
+			// Device is completely missing from host (e.g. virtual interface in pod namespace).
+			// Use the snapshot as-is.
+			merged[dev.Name] = dev
+			continue
+		}
+
+		// Device is in both (e.g. physical device). Merge them, giving precedence to liveDev.
+		merged[dev.Name] = mergeDeviceStructs(liveDev, dev)
+	}
+
+	// 3. Convert map to sorted slice
+	result := make([]resourceapi.Device, 0, len(merged))
+	for _, dev := range merged {
+		result = append(result, dev)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
+	return result
+}
+
+func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
+	merged := *live.DeepCopy()
+
+	if merged.Attributes == nil {
+		merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
+	}
+	for k, v := range snap.Attributes {
+		if _, exists := merged.Attributes[k]; !exists {
+			merged.Attributes[k] = *v.DeepCopy()
+		}
+	}
+
+	if merged.Capacity == nil {
+		merged.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity)
+	}
+	for k, v := range snap.Capacity {
+		if _, exists := merged.Capacity[k]; !exists {
+			merged.Capacity[k] = *v.DeepCopy()
+		}
+	}
+
+	return merged
 }

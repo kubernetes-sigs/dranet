@@ -655,3 +655,59 @@ EOF
   run kubectl exec -it $POD_1 -- ping -I eth1 -c 1 10.10.20.1
   assert_success
 }
+
+@test "allocated device in ResourceSlice remains unchanged" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  local DUMMY_IFACE="dummy0"
+
+  # 0. Save original daemonset container args and enable the feature gate
+  local ORIGINAL_ARGS
+  ORIGINAL_ARGS=$(kubectl get daemonset dranet -n kube-system -o jsonpath='{.spec.template.spec.containers[0].args}')
+  kubectl patch daemonset dranet -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--feature-gates=PersistentResourceSliceAttributes=true"}]'
+  kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
+
+  # 1. Create a dummy interface on the worker node
+  docker exec "$NODE_NAME" bash -c "ip link add $DUMMY_IFACE type dummy"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev $DUMMY_IFACE"
+
+  # 2. Wait for it to be discovered and published to the ResourceSlice
+  sleep 5
+  run kubectl get resourceslices -o jsonpath='{.items[*].spec.devices[*].name}'
+  assert_success
+  assert_output --partial "$DUMMY_IFACE"
+
+  # Retrieve its original attributes before allocation
+  local ORIGINAL_ATTRIBUTES
+  ORIGINAL_ATTRIBUTES=$(kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes}")
+
+  # Ensure the retrieved values are not empty
+  [ -n "$ORIGINAL_ATTRIBUTES" ]
+
+  # 3. Apply the resource claim (allocating dummy0) and start the Pod
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml
+  kubectl wait --timeout=30s --for=condition=ready pods -l app=pod
+
+  # 4. Verify that the allocated dummy0 device attributes are still present and correct
+  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes}"
+  assert_success
+  assert_output "$ORIGINAL_ATTRIBUTES"
+
+  # 5. Restart the DRANET daemonset to test persistence
+  kubectl rollout restart -n kube-system daemonset/dranet
+  kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
+
+  # 6. Verify that the allocated device attributes are still correct after daemon restart
+  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='$DUMMY_IFACE')].attributes}"
+  assert_success
+  assert_output "$ORIGINAL_ATTRIBUTES"
+
+  # 7. Clean up Pod, Claim, Interface and restore original daemonset args
+  kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml --ignore-not-found
+  kubectl wait --for delete pod/pod1 --timeout=30s
+  docker exec "$NODE_NAME" ip link delete $DUMMY_IFACE || true
+
+  kubectl patch daemonset dranet -n kube-system --type='json' -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/args\", \"value\": $ORIGINAL_ARGS}]"
+  kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
+}
+
