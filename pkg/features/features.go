@@ -5,10 +5,10 @@ import (
 )
 
 const (
-	// PersistentResourceSliceAttributes gates the persistence of network
+	// PersistentResourceSliceAttributes gates the persistence of device
 	// attributes (like MAC, MTU, etc.) in the ResourceSlice across daemon restarts.
 	// owner: @purvavj
-	// alpha: v0.1.0
+	// alpha: v1.4.0
 	PersistentResourceSliceAttributes featuregate.Feature = "PersistentResourceSliceAttributes"
 )
 

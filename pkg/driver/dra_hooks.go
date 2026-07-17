@@ -60,17 +60,14 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 	klog.V(2).Infof("Publishing resources")
 	for {
 		select {
-		// Wait for updates from the host-discovered (live available) device inventory
+		// Wait for updates from the host-discovered (live) device inventory
 		case live := <-np.netdb.GetResources(ctx):
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(live), formatDeviceNames(live, 15))
 
-			// Fetch allocated devices from BoltDB store and merge
-			var snapshots []resourceapi.Device
-			if np.podConfigStore != nil {
-				snapshots = np.podConfigStore.GetAllocatedDeviceSnapshots()
-			}
+			// Fetch device snapshots from BoltDB store and merge
 			merged := live
 			if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
+				snapshots := np.podConfigStore.GetAllocatedDeviceSnapshots()
 				merged = mergeDevices(live, snapshots)
 			}
 
@@ -696,17 +693,17 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 	return mergedConf, nil
 }
 
-// mergeDevices merges live host devices with database snapshots of allocated devices,
+// mergeDevices merges live host devices with database snapshots,
 // giving precedence to live attributes and capacities where they overlap.
 func mergeDevices(live, snapshot []resourceapi.Device) []resourceapi.Device {
 	merged := make(map[string]resourceapi.Device)
 
-	// 1. Initial Load from Host Scan (Live available devices)
+	// 1. Initial Load from Host Scan (Live devices)
 	for _, dev := range live {
 		merged[dev.Name] = dev
 	}
 
-	// 2. Merge allocated devices
+	// 2. Merge database snapshots
 	for _, dev := range snapshot {
 		liveDev, exists := merged[dev.Name]
 		if !exists {

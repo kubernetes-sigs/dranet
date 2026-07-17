@@ -892,19 +892,19 @@ func TestMergeDevices(t *testing.T) {
 		expected []resourcev1.Device
 	}{
 		{
-			name:     "Only available devices returned",
+			name:     "Only live devices returned",
 			live:     []resourcev1.Device{pciDev},
 			snapshot: nil,
 			expected: []resourcev1.Device{pciDev},
 		},
 		{
-			name:     "Allocated device returned when unavailable",
+			name:     "Snapshot device returned when not live",
 			live:     nil,
 			snapshot: []resourcev1.Device{pciDevSnapshot},
 			expected: []resourcev1.Device{pciDevSnapshot},
 		},
 		{
-			name:      "Available device attribute takes precedence over snapshot",
+			name:      "Live device attribute takes precedence over snapshot",
 			live: []resourcev1.Device{{
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
