@@ -398,6 +398,16 @@ func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 	device.Attributes[apis.AttrState] = resourceapi.DeviceAttribute{StringValue: ptr.To(link.Attrs().OperState.String())}
 	device.Attributes[apis.AttrType] = resourceapi.DeviceAttribute{StringValue: ptr.To(link.Type())}
 
+	// RDMADevice is an identity attribute: the kernel RDMA link name backing
+	// this netdev (e.g. bnxt_re12, mlx5_0). Resolving it here — during
+	// discovery — means netdev-linked RoCE/IB VFs publish it too, not just
+	// IB-only devices. addRDMAAttributes later derives the rdma=true/false
+	// bool from its presence. GetRdmaDevice is the same resolution Prepare
+	// performs, so the slice value matches what a pod is granted.
+	if rdmaDevName, err := GetRdmaDevice(ifName); err == nil && rdmaDevName != "" {
+		device.Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: ptr.To(rdmaDevName)}
+	}
+
 	v4 := sets.Set[string]{}
 	v6 := sets.Set[string]{}
 	if ips, err := nlwrap.AddrList(link, netlink.FAMILY_ALL); err == nil && len(ips) > 0 {
@@ -482,30 +492,25 @@ func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 func (db *DB) addRDMAAttributes(devices []resourceapi.Device) []resourceapi.Device {
 	for i := range devices {
 		isRDMA := false
-		if ifName := devices[i].Attributes[apis.AttrInterfaceName].StringValue; ifName != nil && *ifName != "" {
-			// Try rdmamap library first
-			isRDMA = rdmamap.IsRDmaDeviceForNetdevice(*ifName)
-
-			// Fallback to sysfs check if rdmamap fails. This is particularly
-			// needed for InfiniBand interfaces where rdmamap has a bug comparing
-			// against node GUID instead of port GUID:
-			// https://github.com/Mellanox/rdmamap/issues/15
-			if !isRDMA {
-				isRDMA = isRdmaDeviceInSysfs(*ifName)
-			}
+		// RDMADevice is resolved during discovery — addLinkAttributes for
+		// netdev-linked devices, discoverStandaloneRDMADevices for IB-only
+		// devices. When it is set, the device is RDMA-capable and we derive
+		// the bool from its presence.
+		if rdmaDevAttr, ok := devices[i].Attributes[apis.AttrRDMADevice]; ok && rdmaDevAttr.StringValue != nil && *rdmaDevAttr.StringValue != "" {
+			isRDMA = true
+		} else if ifName := devices[i].Attributes[apis.AttrInterfaceName].StringValue; ifName != nil && *ifName != "" {
+			// Netdev without a resolved RDMA link name: not RDMA-capable.
+			// (GetRdmaDevice in discovery already applies the rdmamap + sysfs
+			// fallback, so a missing name here means no RDMA device.)
+			isRDMA = false
 		} else if pciAddr := devices[i].Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil && *pciAddr != "" {
-			// IB-only device: has RDMA capability but no netdev interface.
-			// If AttrRDMADevice was already set (e.g., by discoverStandaloneRDMADevices),
-			// trust it directly; otherwise look it up via rdmamap.
-			if rdmaDevAttr, ok := devices[i].Attributes[apis.AttrRDMADevice]; ok && rdmaDevAttr.StringValue != nil && *rdmaDevAttr.StringValue != "" {
-				isRDMA = true
-			} else {
-				rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)
-				isRDMA = len(rdmaDevices) != 0
-				if isRDMA {
-					rdmaDevName := rdmaDevices[0]
-					devices[i].Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: &rdmaDevName}
-				}
+			// IB-only device not resolved during discovery: fall back to
+			// rdmamap by PCI address.
+			rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)
+			isRDMA = len(rdmaDevices) != 0
+			if isRDMA {
+				rdmaDevName := rdmaDevices[0]
+				devices[i].Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: &rdmaDevName}
 			}
 		}
 		devices[i].Attributes[apis.AttrRDMA] = resourceapi.DeviceAttribute{BoolValue: &isRDMA}

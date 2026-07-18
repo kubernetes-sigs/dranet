@@ -676,4 +676,50 @@ func TestAddRDMAAttributesStandalone(t *testing.T) {
 			t.Errorf("AttrRDMADevice = %v, want erdma_0 (should not be overwritten)", v)
 		}
 	})
+
+	t.Run("netdev-linked device with resolved RDMADevice is rdma=true", func(t *testing.T) {
+		// addLinkAttributes resolves the RDMA link name during discovery for
+		// RoCE/IB VFs with an active netdev (e.g. bnxt_re* backing a RoCE VF).
+		// Enrichment must derive rdma=true from it and keep the name.
+		devices := []resourceapi.Device{
+			{
+				Name: "eth0",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrInterfaceName: {StringValue: ptr.To("eth0")},
+					apis.AttrPCIAddress:    {StringValue: ptr.To("0000:1b:00.1")},
+					apis.AttrRDMADevice:    {StringValue: ptr.To("bnxt_re12")},
+				},
+			},
+		}
+		db := &DB{}
+		result := db.addRDMAAttributes(devices)
+
+		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || !*v.BoolValue {
+			t.Errorf("AttrRDMA = %v, want true", v)
+		}
+		if v, ok := result[0].Attributes[apis.AttrRDMADevice]; !ok || v.StringValue == nil || *v.StringValue != "bnxt_re12" {
+			t.Errorf("AttrRDMADevice = %v, want bnxt_re12 (should not be overwritten)", v)
+		}
+	})
+
+	t.Run("netdev without resolved RDMADevice is rdma=false", func(t *testing.T) {
+		devices := []resourceapi.Device{
+			{
+				Name: "eth1",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrInterfaceName: {StringValue: ptr.To("eth1")},
+					apis.AttrPCIAddress:    {StringValue: ptr.To("0000:1c:00.0")},
+				},
+			},
+		}
+		db := &DB{}
+		result := db.addRDMAAttributes(devices)
+
+		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || *v.BoolValue {
+			t.Errorf("AttrRDMA = %v, want false", v)
+		}
+		if _, ok := result[0].Attributes[apis.AttrRDMADevice]; ok {
+			t.Errorf("AttrRDMADevice should not be set for a non-RDMA netdev")
+		}
+	})
 }

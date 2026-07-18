@@ -185,27 +185,6 @@ func getRdmaDeviceFromSysfs(basePath, ifName string) (string, error) {
 	return "", fmt.Errorf("no RDMA device found for %s", ifName)
 }
 
-// isRdmaDeviceInSysfs checks if a network interface has RDMA capability by
-// examining the sysfs infiniband directory. This serves as a workaround for
-// cases where the rdmamap library fails to detect RDMA devices, particularly
-// for InfiniBand interfaces where the library incorrectly compares against the
-// node GUID instead of the port GUID.
-//
-// The function checks /sys/class/net/{ifname}/device/infiniband/ for any RDMA
-// device entries. If the directory exists and contains at least one entry, the
-// interface is considered RDMA-capable.
-func isRdmaDeviceInSysfs(ifName string) bool {
-	// Check if the infiniband directory exists under the device
-	rdmaName, err := getRdmaDeviceFromSysfs(sysnetPath, ifName)
-	if err != nil {
-		klog.V(4).Infof("No RDMA device found for interface %s via sysfs: %v", ifName, err)
-		return false
-	}
-
-	klog.V(4).Infof("Interface %s is RDMA-capable with device %s", ifName, rdmaName)
-	return true
-}
-
 // pciAddress BDF Notation
 // [domain:]bus:device.function
 // https://wiki.xenproject.org/wiki/Bus:Device.Function_(BDF)_Notation

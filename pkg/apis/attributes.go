@@ -46,6 +46,10 @@ const (
 	AttrSRIOVVfs        = AttrPrefix + "/" + "sriovVfs"
 	AttrIsSriovVf       = AttrPrefix + "/" + "isSriovVf"
 	AttrVirtual         = AttrPrefix + "/" + "virtual"
-	AttrRDMA            = AttrPrefix + "/" + "rdma"
-	AttrRDMADevice      = AttrPrefix + "/" + "rdmaDevice"
+	// AttrRDMA is true when the device has an associated RDMA HCA (RoCE or IB).
+	AttrRDMA = AttrPrefix + "/" + "rdma"
+	// AttrRDMADevice is the kernel RDMA link name (e.g. "bnxt_re12", "mlx5_0").
+	// Set for both netdev-linked RoCE/IB devices and IB-only / netdev-absent
+	// PCI devices.
+	AttrRDMADevice = AttrPrefix + "/" + "rdmaDevice"
 )
