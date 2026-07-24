@@ -25,15 +25,16 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/jaypipes/ghw"
+	"github.com/jaypipes/pcidb"
 	"github.com/vishvananda/netlink"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
-
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/gce"
 
+	"github.com/jaypipes/ghw/pkg/topology"
 	userns "sigs.k8s.io/dranet/internal/testutils"
 )
 
@@ -463,6 +464,7 @@ func TestBuildIPList(t *testing.T) {
 		})
 	}
 }
+
 // mockCloudInstance implements cloudprovider.CloudInstance for testing
 type mockCloudInstance struct {
 	deviceAttributes map[string]map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
@@ -564,4 +566,160 @@ func TestGetProviderAttributes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAddPCIAttributes(t *testing.T) {
+	pciInfo := &ghw.PCIInfo{
+		Devices: []*ghw.PCIDevice{
+			{
+				Address:   "0000:00:1f.0",
+				Class:     &pcidb.Class{ID: "02"},
+				Vendor:    &pcidb.Vendor{Name: "Intel Corp."},
+				Product:   &pcidb.Product{Name: "Ethernet Controller", ID: "0x1234"},
+				Subsystem: &pcidb.Product{ID: "0x5678"},
+				Node:      &topology.Node{ID: 0},
+			},
+		},
+	}
+
+	t.Run("enriches device missing attributes from ghw", func(t *testing.T) {
+		devices := []resourceapi.Device{
+			{
+				Name: "0000:00:1f.0",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrPCIAddress: {StringValue: ptr.To("0000:00:1f.0")},
+				},
+			},
+		}
+		db := &DB{}
+		result := db.addPCIAttributes(devices, pciInfo)
+
+		if v, ok := result[0].Attributes[apis.AttrNUMANode]; !ok || v.IntValue == nil || *v.IntValue != 0 {
+			t.Errorf("AttrNUMANode not set from ghw, got: %v", v)
+		}
+		if v, ok := result[0].Attributes[apis.AttrPCIVendor]; !ok || v.StringValue == nil || *v.StringValue != "Intel Corp." {
+			t.Errorf("AttrPCIVendor not set from ghw, got: %v", v)
+		}
+		if v, ok := result[0].Attributes[apis.AttrPCIDevice]; !ok || v.StringValue == nil || *v.StringValue != "Ethernet Controller" {
+			t.Errorf("AttrPCIDevice not set from ghw, got: %v", v)
+		}
+		if v, ok := result[0].Attributes[apis.AttrPCISubsystem]; !ok || v.StringValue == nil || *v.StringValue != "0x5678" {
+			t.Errorf("AttrPCISubsystem not set from ghw, got: %v", v)
+		}
+	})
+
+	t.Run("does not overwrite existing attributes", func(t *testing.T) {
+		devices := []resourceapi.Device{
+			{
+				Name: "0000:00:1f.0",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrPCIAddress: {StringValue: ptr.To("0000:00:1f.0")},
+					apis.AttrNUMANode:   {IntValue: ptr.To(int64(99))},
+				},
+			},
+		}
+		db := &DB{}
+		result := db.addPCIAttributes(devices, pciInfo)
+
+		if v, ok := result[0].Attributes[apis.AttrNUMANode]; !ok || v.IntValue == nil || *v.IntValue != 99 {
+			t.Errorf("AttrNUMANode overwritten, expected 99, got: %v", v)
+		}
+	})
+
+	t.Run("skips devices without PCIAddress", func(t *testing.T) {
+		devices := []resourceapi.Device{
+			{
+				Name:       "eth0",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+			},
+		}
+		db := &DB{}
+		result := db.addPCIAttributes(devices, pciInfo)
+
+		if len(result[0].Attributes) != 0 {
+			t.Errorf("expected no attributes added for non-PCI device, got: %v", result[0].Attributes)
+		}
+	})
+
+	t.Run("nil pciInfo does not panic", func(t *testing.T) {
+		devices := []resourceapi.Device{
+			{
+				Name: "0000:00:1f.0",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrPCIAddress: {StringValue: ptr.To("0000:00:1f.0")},
+				},
+			},
+		}
+		db := &DB{}
+		_ = db.addPCIAttributes(devices, nil)
+	})
+}
+
+func TestAddRDMAAttributesStandalone(t *testing.T) {
+	t.Run("uses existing AttrRDMADevice without rdmamap lookup", func(t *testing.T) {
+		devices := []resourceapi.Device{
+			{
+				Name: "0000:1b:00.0",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrPCIAddress: {StringValue: ptr.To("0000:1b:00.0")},
+					apis.AttrRDMADevice: {StringValue: ptr.To("erdma_0")},
+				},
+			},
+		}
+		db := &DB{}
+		result := db.addRDMAAttributes(devices)
+
+		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || !*v.BoolValue {
+			t.Errorf("AttrRDMA = %v, want true", v)
+		}
+		if v, ok := result[0].Attributes[apis.AttrRDMADevice]; !ok || v.StringValue == nil || *v.StringValue != "erdma_0" {
+			t.Errorf("AttrRDMADevice = %v, want erdma_0 (should not be overwritten)", v)
+		}
+	})
+
+	t.Run("netdev-linked device with resolved RDMADevice is rdma=true", func(t *testing.T) {
+		// addLinkAttributes resolves the RDMA link name during discovery for
+		// RoCE/IB VFs with an active netdev (e.g. bnxt_re* backing a RoCE VF).
+		// Enrichment must derive rdma=true from it and keep the name.
+		devices := []resourceapi.Device{
+			{
+				Name: "eth0",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrInterfaceName: {StringValue: ptr.To("eth0")},
+					apis.AttrPCIAddress:    {StringValue: ptr.To("0000:1b:00.1")},
+					apis.AttrRDMADevice:    {StringValue: ptr.To("bnxt_re12")},
+				},
+			},
+		}
+		db := &DB{}
+		result := db.addRDMAAttributes(devices)
+
+		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || !*v.BoolValue {
+			t.Errorf("AttrRDMA = %v, want true", v)
+		}
+		if v, ok := result[0].Attributes[apis.AttrRDMADevice]; !ok || v.StringValue == nil || *v.StringValue != "bnxt_re12" {
+			t.Errorf("AttrRDMADevice = %v, want bnxt_re12 (should not be overwritten)", v)
+		}
+	})
+
+	t.Run("netdev without resolved RDMADevice is rdma=false", func(t *testing.T) {
+		devices := []resourceapi.Device{
+			{
+				Name: "eth1",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrInterfaceName: {StringValue: ptr.To("eth1")},
+					apis.AttrPCIAddress:    {StringValue: ptr.To("0000:1c:00.0")},
+				},
+			},
+		}
+		db := &DB{}
+		result := db.addRDMAAttributes(devices)
+
+		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || *v.BoolValue {
+			t.Errorf("AttrRDMA = %v, want false", v)
+		}
+		if _, ok := result[0].Attributes[apis.AttrRDMADevice]; ok {
+			t.Errorf("AttrRDMADevice should not be set for a non-RDMA netdev")
+		}
+	})
 }
