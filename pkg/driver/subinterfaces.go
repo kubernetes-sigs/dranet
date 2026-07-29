@@ -133,7 +133,6 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 
 // nsCreateSubinterface creates a subinterface (currently supports IPVLAN) of hostIfName
 // directly in the container network namespace and configures it with the specified addresses.
-// The parent interface stays in the host namespace.
 func nsCreateSubinterface(hostIfName string, containerNsPath string, subInterfaceConfig *apis.SubInterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
 	containerNs, err := netns.GetFromPath(containerNsPath)
 	if err != nil {
@@ -170,40 +169,11 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, subInterfac
 		return nil, fmt.Errorf("unsupported subinterface type: %v", subInterfaceConfig.Type)
 	}
 
-	// Strip the addresses from the host parent so the pod's subinterface
-	// exclusively owns them. This only matters when the addresses came from
-	// the parent itself (e.g. a provider reusing a bond's existing IP instead
-	// of allocating a fresh one from IPRanges/IPAM): a duplicate address on
-	// both the host bond and the pod's ipvlan child causes NDP/ARP ambiguity
-	// and the pod cannot receive replies. The bond stays UP for LACP — only
-	// the L3 address moves. Addresses are restored to the parent on teardown
-	// by nsDeleteSubinterface. Best-effort: harmless no-op if the address was
-	// never present on the parent (freshly IPAM-allocated addresses).
-	hostHandle, err := nlwrap.NewHandle()
-	if err != nil {
-		klog.Warningf("could not get host netlink handle to strip addresses from %s: %v (pod and host will share the address)", hostIfName, err)
-	} else {
-		defer hostHandle.Close()
-		for _, address := range subInterfaceConfig.Addresses {
-			ip, ipnet, parseErr := net.ParseCIDR(address)
-			if parseErr != nil {
-				continue
-			}
-			if delErr := hostHandle.AddrDel(parentLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}); delErr != nil {
-				klog.V(4).Infof("could not remove address %s from parent %s (may already be absent): %v", address, hostIfName, delErr)
-			}
-		}
-	}
-
 	return networkData, nil
 }
 
 // nsDeleteSubinterface deletes a subinterface inside the container namespace.
-// If restoreAddresses is non-empty, those addresses are re-added to the host
-// parent (hostIfName) so the parent reclaims the L3 address the pod had
-// borrowed, mirroring the move-NIC teardown where the interface returns to
-// the host carrying its address.
-func nsDeleteSubinterface(containerNsPath string, devName string, hostIfName string, restoreAddresses []string) error {
+func nsDeleteSubinterface(containerNsPath string, devName string) error {
 	containerNs, err := netns.GetFromPath(containerNsPath)
 	if err != nil {
 		return fmt.Errorf("could not get container network namespace %s: %w", containerNsPath, err)
@@ -227,28 +197,6 @@ func nsDeleteSubinterface(containerNsPath string, devName string, hostIfName str
 
 	if err := nhNs.LinkDel(link); err != nil {
 		return fmt.Errorf("failed to delete subinterface %s inside namespace %s: %w", devName, containerNsPath, err)
-	}
-
-	// Restore the borrowed addresses to the host parent so it reclaims its
-	// L3 address when the pod is gone. Best-effort: the host parent must
-	// already exist; failures are logged, not fatal, since the kernel and
-	// node network controller can re-establish the address independently.
-	if len(restoreAddresses) > 0 && hostIfName != "" {
-		if parentLink, err := nlwrap.LinkByName(hostIfName); err == nil {
-			hostHandle, hErr := nlwrap.NewHandle()
-			if hErr == nil {
-				defer hostHandle.Close()
-				for _, address := range restoreAddresses {
-					ip, ipnet, parseErr := net.ParseCIDR(address)
-					if parseErr != nil {
-						continue
-					}
-					if addErr := hostHandle.AddrAdd(parentLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}); addErr != nil {
-						klog.V(4).Infof("could not restore address %s to parent %s: %v", address, hostIfName, addErr)
-					}
-				}
-			}
-		}
 	}
 	return nil
 }
