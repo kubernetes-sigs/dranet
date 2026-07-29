@@ -450,7 +450,9 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		if ifName != "" {
 			if config.NetworkInterfaceConfigInPod.SubInterface != nil {
 				subIfName := config.NetworkInterfaceConfigInPod.SubInterface.Name
-				if err := nsDeleteSubinterface(ns, subIfName); err != nil {
+				hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
+				restoreAddrs := config.NetworkInterfaceConfigInPod.SubInterface.Addresses
+				if err := nsDeleteSubinterface(ns, subIfName, hostIfName, restoreAddrs); err != nil {
 					klog.Errorf("fail to delete subinterface %s for device %s: %v", subIfName, deviceName, err)
 				}
 			} else {

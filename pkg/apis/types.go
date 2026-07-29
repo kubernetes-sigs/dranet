@@ -110,9 +110,9 @@ type VRFConfig struct {
 	Table *int `json:"table,omitempty"`
 }
 
-// SubInterfaceConfig describes a virtual subinterface (e.g. IPVLAN) to create
-// in the Pod on top of a shared host network interface. A valid Type field
-// activates it and triggers creation of the subinterface.
+// SubInterfaceConfig defines the properties of the subinterfaces.
+// The presence of a valid `Type` field activates this configuration,
+// triggering the creation of the subinterface.
 type SubInterfaceConfig struct {
 	// Type indicates the network type of the subinterface.
 	// A valid Type activates the configuration and creation of
@@ -176,8 +176,9 @@ const (
 	SubInterfaceTypeIPVlan SubInterfaceType = "ipvlan"
 )
 
-// IPVlanConfig holds the mode and flag of an IPVLAN subinterface.
-// Currently only "l2" mode with the "bridge" flag is supported.
+// IPVlanConfig contains the IPVlan-specific configuration.
+// Currently, the default and only option is l2 mode and bridge
+// flag. New options will be added if required in the future.
 type IPVlanConfig struct {
 	// Mode defines how traffic is routed to the IPVlan child interfaces.
 	// Currently the supported mode is:

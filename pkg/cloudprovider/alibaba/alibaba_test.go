@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 )
 
@@ -105,13 +106,60 @@ func TestGetDeviceAttributes(t *testing.T) {
 }
 
 func TestGetDeviceConfig(t *testing.T) {
-	instance := &AlibabaInstance{
-		InstanceType:      "ecs.gn8is-2x.8xlarge",
-		ERDMAPCIAddresses: sets.New[string](testPCIAddress),
+	orig := isLACPBond
+	t.Cleanup(func() { isLACPBond = orig })
+
+	tests := []struct {
+		name     string
+		isBond   bool
+		id       cloudprovider.DeviceIdentifiers
+		wantNil  bool
+		wantType apis.SubInterfaceType
+	}{
+		{
+			name:     "eRDMA device, not a bond -> nil config",
+			isBond:   false,
+			id:       cloudprovider.DeviceIdentifiers{PCIAddress: testPCIAddress},
+			wantNil:  true,
+			wantType: "",
+		},
+		{
+			name:     "LACP bond -> IPVlan subinterface config (transparent to user)",
+			isBond:   true,
+			id:       cloudprovider.DeviceIdentifiers{Name: "bond0", PCIAddress: testPCIAddress},
+			wantNil:  false,
+			wantType: apis.SubInterfaceTypeIPVlan,
+		},
+		{
+			name:     "regular NIC, not a bond -> nil config",
+			isBond:   false,
+			id:       cloudprovider.DeviceIdentifiers{Name: "eth0"},
+			wantNil:  true,
+			wantType: "",
+		},
 	}
-	config := instance.GetDeviceConfig(cloudprovider.DeviceIdentifiers{PCIAddress: testPCIAddress})
-	if config != nil {
-		t.Errorf("expected nil config for eRDMA device, got %v", config)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isLACPBond = func(string) bool { return tt.isBond }
+			instance := &AlibabaInstance{
+				InstanceType:      "ecs.gn8is-2x.8xlarge",
+				ERDMAPCIAddresses: sets.New[string](testPCIAddress),
+			}
+			config := instance.GetDeviceConfig(tt.id)
+			if tt.wantNil {
+				if config != nil {
+					t.Errorf("expected nil config, got %v", config)
+				}
+				return
+			}
+			if config == nil || config.SubInterface == nil {
+				t.Fatalf("expected non-nil SubInterface config, got %v", config)
+			}
+			if config.SubInterface.Type != tt.wantType {
+				t.Errorf("SubInterface.Type = %q, want %q", config.SubInterface.Type, tt.wantType)
+			}
+		})
 	}
 }
 

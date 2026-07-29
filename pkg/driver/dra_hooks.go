@@ -499,6 +499,21 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			deviceCfg.RDMADevice = buildRDMAConfig(rdmaDev, charDevices)
 		}
 
+		// If a subinterface is configured (e.g. an LACP bond that cannot be moved
+		// into the pod namespace), derive its name and let it inherit the parent
+		// interface's addresses so that claiming a bond is transparent to the
+		// user, exactly like claiming a regular NIC. IPRange/local IPAM and
+		// source-based routing (the #63 sharing case) are intentionally not
+		// implemented here.
+		if subIf := deviceCfg.NetworkInterfaceConfigInPod.SubInterface; subIf != nil {
+			if subIf.Name == "" {
+				subIf.Name = string(subIf.Type) + "-" + ifName
+			}
+			if len(subIf.Addresses) == 0 && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) > 0 {
+				subIf.Addresses = append(subIf.Addresses, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses...)
+			}
+		}
+
 		// Remove the pinned programs before the NRI hooks since it
 		// has to walk the entire bpf virtual filesystem and is slow
 		// TODO: check if there is some other way to do this

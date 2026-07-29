@@ -106,12 +106,36 @@ func TestSubinterface_IPVlan(t *testing.T) {
 		t.Fatalf("Failed to set up dummy link %s on host: %v", ifaceName, err)
 	}
 
+	// Give the host parent the same address the subinterface will request,
+	// simulating a provider that reuses an interface's existing IP (e.g. a
+	// bonded interface's address) rather than allocating a fresh one.
+	testAddr := "2001:db8::3/128"
+	ip, ipnet, err := net.ParseCIDR(testAddr)
+	if err != nil {
+		t.Fatalf("failed to parse test address: %v", err)
+	}
+	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}); err != nil {
+		t.Fatalf("failed to assign address to host parent %s: %v", ifaceName, err)
+	}
+
+	// Give the host parent the same address the subinterface will request,
+	// simulating a provider that reuses an interface's existing IP (e.g. a
+	// bonded interface's address) rather than allocating a fresh one.
+	testAddr := "2001:db8::3/128"
+	ip, ipnet, err := net.ParseCIDR(testAddr)
+	if err != nil {
+		t.Fatalf("failed to parse test address: %v", err)
+	}
+	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}); err != nil {
+		t.Fatalf("failed to assign address to host parent %s: %v", ifaceName, err)
+	}
+
 	// Phase 3: Call nsCreateSubinterface.
 	// Create the IPVlan subinterface in the target container
 	// namespace and assert driver-reported device data.
 	config := &apis.SubInterfaceConfig{
 		Name:      "dranet0",
-		Addresses: []string{"2001:db8::3/128"},
+		Addresses: []string{testAddr},
 		Type:      "ipvlan",
 	}
 
@@ -131,9 +155,21 @@ func TestSubinterface_IPVlan(t *testing.T) {
 	}
 
 	// Verify that the parent interface still exists in the host namespace (was not moved).
-	_, err = nlwrap.LinkByName(ifaceName)
+	parentLink, err := nlwrap.LinkByName(ifaceName)
 	if err != nil {
 		t.Errorf("expected parent interface %s to still exist in the host namespace: %v", ifaceName, err)
+	}
+
+	// Verify that the borrowed address was stripped from the host parent so
+	// the pod's subinterface exclusively owns it (avoids NDP/ARP ambiguity).
+	if addrs, err := netlink.AddrList(parentLink, netlink.FAMILY_ALL); err != nil {
+		t.Errorf("failed to list addresses on parent %s: %v", ifaceName, err)
+	} else {
+		for _, a := range addrs {
+			if a.IPNet.String() == ipnet.String() {
+				t.Errorf("expected address %s to be stripped from host parent %s, but it is still present", testAddr, ifaceName)
+			}
+		}
 	}
 
 	// Phase 4: Inspect the state of the interface in the container namespace.
@@ -192,9 +228,25 @@ func TestSubinterface_IPVlan(t *testing.T) {
 
 	// Phase 5: Call nsDeleteSubinterface for teardown.
 	// Verify that the subinterface is successfully deleted inside the test namespace.
-	err = nsDeleteSubinterface(path.Join("/run/netns", nsName), config.Name)
+	err = nsDeleteSubinterface(path.Join("/run/netns", nsName), config.Name, ifaceName, config.Addresses)
 	if err != nil {
 		t.Fatalf("fail to delete subinterface: %v", err)
+	}
+
+	// Verify that the borrowed address was restored to the host parent now
+	// that the pod no longer holds the subinterface.
+	restored := false
+	if addrs, err := netlink.AddrList(parentLink, netlink.FAMILY_ALL); err != nil {
+		t.Errorf("failed to list addresses on parent %s: %v", ifaceName, err)
+	} else {
+		for _, a := range addrs {
+			if a.IPNet.String() == ipnet.String() {
+				restored = true
+			}
+		}
+	}
+	if !restored {
+		t.Errorf("expected address %s to be restored to host parent %s after teardown", testAddr, ifaceName)
 	}
 
 	func() {

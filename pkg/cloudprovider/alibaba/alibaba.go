@@ -33,6 +33,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
+	"sigs.k8s.io/dranet/pkg/inventory"
 )
 
 const (
@@ -105,8 +106,26 @@ func (a *AlibabaInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers
 }
 
 func (a *AlibabaInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
+	// LACP-bonded interfaces (common on HPN GPU nodes, e.g. H20 with dual-port
+	// CX7 NICs bonded at the infrastructure level) cannot be moved into a pod
+	// network namespace without breaking link aggregation. When such a bond is
+	// claimed, transparently request an IPVlan subinterface instead of moving
+	// the bond, so claiming a bond feels identical to claiming a regular NIC
+	// (issue #239). This is a provider-internal decision: the user's
+	// ResourceClaim YAML never mentions the subInterface field.
+	if id.Name != "" && isLACPBond(id.Name) {
+		return &apis.NetworkConfig{
+			SubInterface: &apis.SubInterfaceConfig{
+				Type: apis.SubInterfaceTypeIPVlan,
+			},
+		}
+	}
 	return nil
 }
+
+// isLACPBond reports whether the named interface is a bond in 802.3ad (LACP)
+// mode. It is a package var so tests can override it without a real bond.
+var isLACPBond = inventory.IsLACPBond
 
 // detectERDMAPCIAddresses returns the PCI addresses of eRDMA devices found in
 // /sys/class/infiniband/ by following the device symlink of each erdma_* entry.
