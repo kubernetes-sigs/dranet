@@ -125,7 +125,8 @@ func IsSriovVf(name string) bool {
 //
 // The bonding/mode sysfs attribute only exists for bond masters, so a missing
 // file (non-bond or bonding unloaded) is reported as false rather than an
-// error.
+// error. The attribute value is of the form "<mode-name> <mode-number>",
+// e.g. "802.3ad 4" for LACP.
 func IsLACPBond(ifName string) bool {
 	modePath := filepath.Join(sysnetPath, ifName, "bonding/mode")
 	modeBytes, err := os.ReadFile(modePath)
@@ -135,13 +136,6 @@ func IsLACPBond(ifName string) bool {
 	}
 	mode := strings.TrimSpace(string(bytes.TrimSpace(modeBytes)))
 	klog.V(5).Infof("interface %s bonding mode: %q", ifName, mode)
-	return isLACPMode(mode)
-}
-
-// isLACPMode reports whether a bonding/mode sysfs attribute value denotes
-// 802.3ad (LACP) mode. The attribute value is of the form
-// "<mode-name> <mode-number>", e.g. "802.3ad 4" for LACP.
-func isLACPMode(mode string) bool {
 	return strings.Contains(mode, "802.3ad")
 }
 

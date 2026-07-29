@@ -109,13 +109,10 @@ func (a *AlibabaInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers
 }
 
 func (a *AlibabaInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
-	// LACP-bonded interfaces (common on HPN GPU nodes, e.g. H20 with dual-port
-	// CX7 NICs bonded at the infrastructure level) cannot be moved into a pod
-	// network namespace without breaking link aggregation. When such a bond is
-	// claimed, transparently request an IPVlan subinterface instead of moving
-	// the bond, so claiming a bond feels identical to claiming a regular NIC
-	// (issue #239). This is a provider-internal decision: the user's
-	// ResourceClaim YAML never mentions the subInterface field.
+	// LACP bonds can't be moved into a pod netns without breaking link
+	// aggregation, so claiming one transparently gets an IPVlan subinterface
+	// instead (issue #239). Everything else, including eRDMA, needs no
+	// special config here and is moved into the pod netns as-is.
 	if id.Name == "" || !isLACPBond(id.Name) {
 		return nil
 	}
