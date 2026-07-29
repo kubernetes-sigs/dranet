@@ -456,15 +456,23 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		// If subinterface is enabled, configure the subinterface properties,
 		// including interface name, IP address, and source-based routing rules.
 		if deviceCfg.NetworkInterfaceConfigInPod.SubInterface != nil {
+			subIf := deviceCfg.NetworkInterfaceConfigInPod.SubInterface
 			// Derive the subinterface name by adding a type prefix to the parent interface
-			if deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Name == "" {
-				subInterfaceType := deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Type
-				deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Name = string(subInterfaceType) + "-" + ifName
+			if subIf.Name == "" {
+				subIf.Name = string(subIf.Type) + "-" + ifName
 			}
 
-			// If not specified, assign an IP address from the configured IP ranges using node local IPAM.
-			if len(deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses) == 0 {
-				ipRanges := deviceCfg.NetworkInterfaceConfigInPod.SubInterface.IPRanges
+			// If not specified, first try inheriting the parent interface's own
+			// addresses (e.g. an LACP bond that cannot be moved into the pod
+			// namespace but whose existing IP the pod should claim transparently,
+			// exactly like claiming a regular NIC). Otherwise fall back to
+			// allocating a fresh address from the configured IP ranges using
+			// node-local IPAM (the shared-NIC case).
+			if len(subIf.Addresses) == 0 && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) > 0 {
+				subIf.Addresses = append(subIf.Addresses, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses...)
+			}
+			if len(subIf.Addresses) == 0 {
+				ipRanges := subIf.IPRanges
 				if len(ipRanges) == 0 {
 					errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s, no IPRanges specified", ifName))
 					continue
@@ -479,7 +487,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 					errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s: %w", ifName, err))
 					continue
 				}
-				deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses = addresses
+				subIf.Addresses = addresses
 			}
 
 			// If the user has already configured custom routes or rules, we
@@ -488,7 +496,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			if len(customRoutes) > 0 || len(customRules) > 0 {
 				deviceCfg.NetworkInterfaceConfigInPod.Routes = customRoutes
 				deviceCfg.NetworkInterfaceConfigInPod.Rules = customRules
-			} else if len(deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses) != 0 {
+			} else if len(subIf.Addresses) != 0 {
 				addSourceBasedRouting(&deviceCfg, link.Attrs().Index)
 			}
 		}
@@ -497,21 +505,6 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		if rdmaDev, err := inventory.GetRdmaDevice(ifName); err == nil && rdmaDev != "" {
 			klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
 			deviceCfg.RDMADevice = buildRDMAConfig(rdmaDev, charDevices)
-		}
-
-		// If a subinterface is configured (e.g. an LACP bond that cannot be moved
-		// into the pod namespace), derive its name and let it inherit the parent
-		// interface's addresses so that claiming a bond is transparent to the
-		// user, exactly like claiming a regular NIC. IPRange/local IPAM and
-		// source-based routing (the #63 sharing case) are intentionally not
-		// implemented here.
-		if subIf := deviceCfg.NetworkInterfaceConfigInPod.SubInterface; subIf != nil {
-			if subIf.Name == "" {
-				subIf.Name = string(subIf.Type) + "-" + ifName
-			}
-			if len(subIf.Addresses) == 0 && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) > 0 {
-				subIf.Addresses = append(subIf.Addresses, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses...)
-			}
 		}
 
 		// Remove the pinned programs before the NRI hooks since it

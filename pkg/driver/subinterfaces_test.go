@@ -118,18 +118,6 @@ func TestSubinterface_IPVlan(t *testing.T) {
 		t.Fatalf("failed to assign address to host parent %s: %v", ifaceName, err)
 	}
 
-	// Give the host parent the same address the subinterface will request,
-	// simulating a provider that reuses an interface's existing IP (e.g. a
-	// bonded interface's address) rather than allocating a fresh one.
-	testAddr := "2001:db8::3/128"
-	ip, ipnet, err := net.ParseCIDR(testAddr)
-	if err != nil {
-		t.Fatalf("failed to parse test address: %v", err)
-	}
-	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}); err != nil {
-		t.Fatalf("failed to assign address to host parent %s: %v", ifaceName, err)
-	}
-
 	// Phase 3: Call nsCreateSubinterface.
 	// Create the IPVlan subinterface in the target container
 	// namespace and assert driver-reported device data.
