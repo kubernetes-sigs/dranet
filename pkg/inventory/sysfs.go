@@ -117,6 +117,28 @@ func IsSriovVf(name string) bool {
 	return isSriovVf(name, sysnetPath)
 }
 
+// IsLACPBond reports whether ifName is a bonding master negotiated in
+// 802.3ad (LACP) mode. LACP bonds cannot be moved into a pod network
+// namespace without breaking link aggregation with the switch, so dranet
+// must create a child interface (e.g. IPVlan) on top of them instead of
+// moving the bond itself (see issue #239).
+//
+// The bonding/mode sysfs attribute only exists for bond masters, so a missing
+// file (non-bond or bonding unloaded) is reported as false rather than an
+// error. The attribute value is of the form "<mode-name> <mode-number>",
+// e.g. "802.3ad 4" for LACP.
+func IsLACPBond(ifName string) bool {
+	modePath := filepath.Join(sysnetPath, ifName, "bonding/mode")
+	modeBytes, err := os.ReadFile(modePath)
+	if err != nil {
+		// Not a bond, or bonding module not loaded.
+		return false
+	}
+	mode := strings.TrimSpace(string(bytes.TrimSpace(modeBytes)))
+	klog.V(5).Infof("interface %s bonding mode: %q", ifName, mode)
+	return strings.Contains(mode, "802.3ad")
+}
+
 // getPFInterfaceNameFromSysfs returns the name of the Physical Function (PF) network
 // interface for a given SR-IOV Virtual Function (VF) interface, using basePath as the
 // root of the sysfs net directory (e.g. /sys/class/net). It returns an error if the
