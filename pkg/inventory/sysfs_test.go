@@ -191,11 +191,30 @@ func TestIsSriovVf(t *testing.T) {
 }
 
 // TestIsLACPBond_NonBond asserts that a non-existent / non-bond interface
-// is reported as not an LACP bond (the sysfs path is absent). The
-// positive case (a real 802.3ad bond) is covered by e2e on bond nodes.
+// is reported as not an LACP bond (the sysfs path is absent).
 func TestIsLACPBond_NonBond(t *testing.T) {
 	if IsLACPBond("dranet-definitely-not-a-bond-9999") {
 		t.Errorf("expected non-bond interface to report false")
+	}
+}
+
+func TestIsLACPMode(t *testing.T) {
+	tests := []struct {
+		name string
+		mode string
+		want bool
+	}{
+		{name: "802.3ad LACP mode", mode: "802.3ad 4\n", want: true},
+		{name: "non-LACP bonding mode", mode: "balance-rr 0\n", want: false},
+		{name: "empty", mode: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isLACPMode(tt.mode)
+			if got != tt.want {
+				t.Errorf("isLACPMode(%q) = %t, want %t", tt.mode, got, tt.want)
+			}
+		})
 	}
 }
 
