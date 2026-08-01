@@ -835,7 +835,7 @@ func (db *DB) addPCIAttributes(devices []resourceapi.Device, pciInfo *ghw.PCIInf
 		if _, hasAttr := devices[i].Attributes[deviceattribute.StandardDeviceAttributePCIeRoot]; !hasAttr {
 			pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(*pciAddrAttr.StringValue)
 			if err != nil {
-				klog.V(4).Infof("Could not get PCIe root for PCI device %s: %v", normalizedAddr, err)
+				klog.Errorf("Could not get PCIe root for PCI device %s: %v", normalizedAddr, err)
 			} else {
 				devices[i].Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
 			}
