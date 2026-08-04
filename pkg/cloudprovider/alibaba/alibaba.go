@@ -20,19 +20,23 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 
 	resourceapi "k8s.io/api/resource/v1"
+	"sigs.k8s.io/dranet/internal/nlwrap"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
+	"sigs.k8s.io/dranet/pkg/inventory"
 )
 
 const (
@@ -105,7 +109,89 @@ func (a *AlibabaInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers
 }
 
 func (a *AlibabaInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
-	return nil
+	// LACP bonds can't be moved into a pod netns without breaking link
+	// aggregation, so claiming one transparently gets an IPVlan subinterface
+	// instead (issue #239). Everything else, including eRDMA, needs no
+	// special config here and is moved into the pod netns as-is.
+	if id.Name == "" || !isLACPBond(id.Name) {
+		return nil
+	}
+
+	prefix, err := getNICIPv6Prefix(id.Name)
+	if err != nil {
+		klog.Warningf("could not determine eflo RDMA IPv6 prefix for bond %s: %v", id.Name, err)
+		return nil
+	}
+
+	ipRange, err := efloRDMASubinterfaceRange(prefix)
+	if err != nil {
+		klog.Warningf("could not derive eflo RDMA subinterface range for bond %s: %v", id.Name, err)
+		return nil
+	}
+
+	return &apis.NetworkConfig{
+		SubInterface: &apis.SubInterfaceConfig{
+			Type:     apis.SubInterfaceTypeIPVlan,
+			IPRanges: []apis.IPRangeConfig{{CIDR: ipRange}},
+		},
+	}
+}
+
+// isLACPBond reports whether the named interface is a bond in 802.3ad (LACP)
+// mode. It is a package var so tests can override it without a real bond.
+var isLACPBond = inventory.IsLACPBond
+
+// efloRDMABlockSuffix is the fixed 64-bit host-part offset eflo reserves, out
+// of every RDMA NIC's own /64 prefix, for that NIC's pod-facing IPVlan
+// subinterface addresses: 0000:000f:0000:0c00. Only the low 4 bits vary
+// (0c00-0c0f), giving a 16-address /124 block. The prefix itself is left
+// untouched, so this range is disjoint from whatever address the NIC already
+// carries on the host -- no address is shared between host and pod, so no
+// stripping/restoring of host addresses is needed.
+var efloRDMABlockSuffix = [8]byte{0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x0c, 0x00}
+
+// efloRDMASubinterfaceRange derives the eflo-reserved /124 IPv6 range for the
+// pod-facing subinterface from the RDMA NIC's own /64 prefix, by replacing
+// the host portion of the prefix with eflo's fixed RDMA block offset.
+func efloRDMASubinterfaceRange(prefix *net.IPNet) (string, error) {
+	ones, bits := prefix.Mask.Size()
+	if bits != 128 {
+		return "", fmt.Errorf("address %s is not IPv6", prefix)
+	}
+	if ones != 64 {
+		return "", fmt.Errorf("expected a /64 prefix, got /%d for %s", ones, prefix)
+	}
+
+	rangeIP := make(net.IP, 16)
+	copy(rangeIP[0:8], prefix.IP.To16()[0:8])
+	copy(rangeIP[8:16], efloRDMABlockSuffix[:])
+
+	return (&net.IPNet{IP: rangeIP, Mask: net.CIDRMask(124, 128)}).String(), nil
+}
+
+// getNICIPv6Prefix returns the /64 network prefix of the first global-scope
+// IPv6 address configured on ifName in the host network namespace. It is a
+// package var so tests can override it without a real interface.
+var getNICIPv6Prefix = func(ifName string) (*net.IPNet, error) {
+	link, err := nlwrap.LinkByName(ifName)
+	if err != nil {
+		return nil, fmt.Errorf("could not find interface %s: %w", ifName, err)
+	}
+	addrs, err := nlwrap.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return nil, fmt.Errorf("could not list IPv6 addresses for %s: %w", ifName, err)
+	}
+	for _, addr := range addrs {
+		if !addr.IP.IsGlobalUnicast() {
+			continue
+		}
+		ones, bits := addr.IPNet.Mask.Size()
+		if bits != 128 || ones != 64 {
+			continue
+		}
+		return &net.IPNet{IP: addr.IP.Mask(addr.IPNet.Mask), Mask: addr.IPNet.Mask}, nil
+	}
+	return nil, fmt.Errorf("no global /64 IPv6 address found on %s", ifName)
 }
 
 // detectERDMAPCIAddresses returns the PCI addresses of eRDMA devices found in

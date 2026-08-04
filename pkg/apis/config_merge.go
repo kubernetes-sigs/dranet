@@ -24,7 +24,8 @@ import (
 // It returns a new *NetworkConfig with the merged result.
 // It follows a strict "User wins" strategy: any scalar setting defined in the user config
 // overrides the cloud provider config. For slices, the two configurations are combined,
-// but duplicates are resolved in favor of the user config.
+// but duplicates are resolved in favor of the user config. For subinterface IPRanges,
+// user-provided ranges are ordered before cloud-provided ranges before deduplication.
 // The user parameter is assumed to be non-nil. The cloud parameter can be nil, resulting in
 // a copy of the user parameter.
 func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
@@ -48,6 +49,26 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 	// Deduplicate slices where order or uniqueness matters.
 	// For addresses, we just unique them.
 	merged.Interface.Addresses = deduplicateStrings(merged.Interface.Addresses)
+	if merged.SubInterface != nil {
+		merged.SubInterface.Addresses = deduplicateStrings(merged.SubInterface.Addresses)
+
+		// For IPRanges, place user-provided ranges first and cloud-provided
+		// ranges after, then remove exact duplicates.
+		var userRanges, cloudRanges []IPRangeConfig
+		if user.SubInterface != nil {
+			userRanges = user.SubInterface.IPRanges
+		}
+		if cloud.SubInterface != nil {
+			cloudRanges = cloud.SubInterface.IPRanges
+		}
+		combined := append(append([]IPRangeConfig{}, userRanges...), cloudRanges...)
+		merged.SubInterface.IPRanges = deduplicateIPRanges(combined)
+	}
+
+	// Subinterface creation is activated only when Type is set; otherwise, discard the subinterface config.
+	if merged.SubInterface != nil && merged.SubInterface.Type == "" {
+		merged.SubInterface = nil
+	}
 
 	// For Routes, deduplicate by destination and table (user wins, which were appended last, so we
 	// iterate backwards). Routes to the same destination in different tables are distinct entries
@@ -66,6 +87,20 @@ func deduplicateStrings(s []string) []string {
 		if !seen[s[i]] {
 			seen[s[i]] = true
 			res = append([]string{s[i]}, res...)
+		}
+	}
+	return res
+}
+
+// deduplicateIPRanges removes exact-duplicate ranges, preserving the order of the
+// first occurrence.
+func deduplicateIPRanges(ranges []IPRangeConfig) []IPRangeConfig {
+	seen := make(map[IPRangeConfig]bool)
+	var res []IPRangeConfig
+	for _, r := range ranges {
+		if !seen[r] {
+			seen[r] = true
+			res = append(res, r)
 		}
 	}
 	return res

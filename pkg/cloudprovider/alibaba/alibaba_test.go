@@ -17,9 +17,12 @@ limitations under the License.
 package alibaba
 
 import (
+	"fmt"
+	"net"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 )
 
@@ -105,15 +108,137 @@ func TestGetDeviceAttributes(t *testing.T) {
 }
 
 func TestGetDeviceConfig(t *testing.T) {
-	instance := &AlibabaInstance{
-		InstanceType:      "ecs.gn8is-2x.8xlarge",
-		ERDMAPCIAddresses: sets.New[string](testPCIAddress),
+	origIsBond := isLACPBond
+	origPrefix := getNICIPv6Prefix
+	t.Cleanup(func() {
+		isLACPBond = origIsBond
+		getNICIPv6Prefix = origPrefix
+	})
+
+	_, testPrefix, err := net.ParseCIDR("2001:db8:1234:5678::/64")
+	if err != nil {
+		t.Fatalf("failed to parse test prefix: %v", err)
 	}
-	config := instance.GetDeviceConfig(cloudprovider.DeviceIdentifiers{PCIAddress: testPCIAddress})
-	if config != nil {
-		t.Errorf("expected nil config for eRDMA device, got %v", config)
+
+	tests := []struct {
+		name        string
+		isBond      bool
+		prefix      *net.IPNet
+		prefixErr   error
+		id          cloudprovider.DeviceIdentifiers
+		wantNil     bool
+		wantType    apis.SubInterfaceType
+		wantIPRange string
+	}{
+		{
+			name:    "eRDMA device, not a bond -> nil config",
+			isBond:  false,
+			id:      cloudprovider.DeviceIdentifiers{PCIAddress: testPCIAddress},
+			wantNil: true,
+		},
+		{
+			name:        "LACP bond -> IPVlan subinterface with eflo RDMA IP block (transparent to user)",
+			isBond:      true,
+			prefix:      testPrefix,
+			id:          cloudprovider.DeviceIdentifiers{Name: "bond0", PCIAddress: testPCIAddress},
+			wantNil:     false,
+			wantType:    apis.SubInterfaceTypeIPVlan,
+			wantIPRange: "2001:db8:1234:5678:0:f:0:c00/124",
+		},
+		{
+			name:    "regular NIC, not a bond -> nil config",
+			isBond:  false,
+			id:      cloudprovider.DeviceIdentifiers{Name: "eth0"},
+			wantNil: true,
+		},
+		{
+			name:      "LACP bond but no eflo RDMA IPv6 prefix found -> nil config",
+			isBond:    true,
+			prefixErr: fmt.Errorf("no global /64 IPv6 address found"),
+			id:        cloudprovider.DeviceIdentifiers{Name: "bond0"},
+			wantNil:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isLACPBond = func(string) bool { return tt.isBond }
+			getNICIPv6Prefix = func(string) (*net.IPNet, error) { return tt.prefix, tt.prefixErr }
+			instance := &AlibabaInstance{
+				InstanceType:      "ecs.gn8is-2x.8xlarge",
+				ERDMAPCIAddresses: sets.New[string](testPCIAddress),
+			}
+			config := instance.GetDeviceConfig(tt.id)
+			if tt.wantNil {
+				if config != nil {
+					t.Errorf("expected nil config, got %v", config)
+				}
+				return
+			}
+			if config == nil || config.SubInterface == nil {
+				t.Fatalf("expected non-nil SubInterface config, got %v", config)
+			}
+			if config.SubInterface.Type != tt.wantType {
+				t.Errorf("SubInterface.Type = %q, want %q", config.SubInterface.Type, tt.wantType)
+			}
+			if len(config.SubInterface.IPRanges) != 1 || config.SubInterface.IPRanges[0].CIDR != tt.wantIPRange {
+				t.Errorf("SubInterface.IPRanges = %v, want [{CIDR: %q}]", config.SubInterface.IPRanges, tt.wantIPRange)
+			}
+			// The parent's own address must never appear in the subinterface
+			// config: the derived range is disjoint from the NIC's live host
+			// address, so there is nothing to strip from or restore to the host.
+			if len(config.SubInterface.Addresses) != 0 {
+				t.Errorf("expected no static Addresses (range is IPAM-allocated), got %v", config.SubInterface.Addresses)
+			}
+		})
 	}
 }
+
+func TestEfloRDMASubinterfaceRange(t *testing.T) {
+	tests := []struct {
+		name    string
+		cidr    string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "typical /64 prefix",
+			cidr: "2001:db8:1234:5678::/64",
+			want: "2001:db8:1234:5678:0:f:0:c00/124",
+		},
+		{
+			name: "prefix with non-zero host bits gets masked away",
+			cidr: "2001:db8:1234:5678::1/64",
+			want: "2001:db8:1234:5678:0:f:0:c00/124",
+		},
+		{
+			name:    "IPv4 rejected",
+			cidr:    "10.0.0.0/24",
+			wantErr: true,
+		},
+		{
+			name:    "non-/64 prefix rejected",
+			cidr:    "2001:db8:1234:5678::/80",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, prefix, err := net.ParseCIDR(tt.cidr)
+			if err != nil {
+				t.Fatalf("failed to parse test CIDR: %v", err)
+			}
+			got, err := efloRDMASubinterfaceRange(prefix)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("efloRDMASubinterfaceRange() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && got != tt.want {
+				t.Errorf("efloRDMASubinterfaceRange() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 
 func TestDetectERDMAPCIAddresses(t *testing.T) {
 	orig := detectERDMAPCIAddresses

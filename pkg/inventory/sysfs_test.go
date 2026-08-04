@@ -190,6 +190,15 @@ func TestIsSriovVf(t *testing.T) {
 	})
 }
 
+// TestIsLACPBond_NonBond asserts that a non-existent / non-bond interface
+// is reported as not an LACP bond (the sysfs path is absent). The positive
+// case (a real 802.3ad bond) is covered by e2e on bond nodes.
+func TestIsLACPBond_NonBond(t *testing.T) {
+	if IsLACPBond("dranet-definitely-not-a-bond-9999") {
+		t.Errorf("expected non-bond interface to report false")
+	}
+}
+
 func TestGetPFInterfaceNameFromSysfs(t *testing.T) {
 	testCases := []struct {
 		name        string

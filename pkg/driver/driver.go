@@ -24,9 +24,10 @@ import (
 	"time"
 
 	"github.com/google/cel-go/cel"
-	"sigs.k8s.io/dranet/pkg/apis"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
+	"sigs.k8s.io/dranet/pkg/ipam"
 
 	"github.com/containerd/nri/pkg/stub"
 	"sigs.k8s.io/dranet/internal/nlwrap"
@@ -118,6 +119,7 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+	localIPAM      *ipam.LocalIPAM
 	dbPath         string // path for persistent bbolt database; empty means in-memory
 
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
@@ -175,6 +177,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		return nil, fmt.Errorf("failed to initialize pod config store: %v", err)
 	}
 	plugin.podConfigStore = store
+	plugin.localIPAM = ipam.NewLocalIPAM(store.GetAllocatedIPs())
 
 	driverPluginPath := filepath.Join(plugin.kubeletRootDir, "plugins", driverName)
 	err = os.MkdirAll(driverPluginPath, 0750)

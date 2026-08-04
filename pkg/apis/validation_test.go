@@ -327,6 +327,91 @@ func TestValidateInterfaceConfig(t *testing.T) {
 	}
 }
 
+func TestValidateSubInterfaceConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfg       *SubInterfaceConfig
+		fieldPath string
+		expectErr bool
+		errCount  int
+	}{
+		{
+			name:      "valid subinterface config",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}, {StartIP: "10.24.4.10", EndIP: "10.24.4.20"}}, IPVlan: &IPVlanConfig{Mode: "l2", Flag: "bridge"}},
+			fieldPath: "subInterface",
+			expectErr: false,
+		},
+		{
+			name:      "nil config",
+			cfg:       nil,
+			fieldPath: "subInterface",
+			expectErr: false,
+		},
+		{
+			name:      "unsupported subinterface type",
+			cfg:       &SubInterfaceConfig{Type: "macvlan"},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid subinterface addresses",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", Addresses: []string{"invalid-address"}},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "unsupported subinterface mode and flag",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", IPVlan: &IPVlanConfig{Mode: "l3", Flag: "private"}},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := validateSubInterfaceConfig(tt.cfg, tt.fieldPath)
+			if (len(errs) > 0) != tt.expectErr {
+				t.Errorf("validateSubInterfaceConfig() expectErr %v, got errors: %v", tt.expectErr, errs)
+			}
+			if tt.expectErr && len(errs) != tt.errCount {
+				t.Errorf("validateSubInterfaceConfig() expected %d errors, got %d. Errors: %v", tt.errCount, len(errs), errs)
+			}
+		})
+	}
+}
+
+func TestIPRangeConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     IPRangeConfig
+		wantErr bool
+	}{
+		{name: "CIDR only", cfg: IPRangeConfig{CIDR: "192.168.1.0/24"}},
+		{name: "IPv6 CIDR only", cfg: IPRangeConfig{CIDR: "2001:db8::/64"}},
+		{name: "start and end only", cfg: IPRangeConfig{StartIP: "10.0.0.5", EndIP: "10.0.0.10"}},
+		{name: "start == end", cfg: IPRangeConfig{StartIP: "10.0.0.5", EndIP: "10.0.0.5"}},
+		{name: "all three, within cidr", cfg: IPRangeConfig{CIDR: "10.0.0.0/24", StartIP: "10.0.0.5", EndIP: "10.0.0.10"}},
+		{name: "invalid cidr", cfg: IPRangeConfig{CIDR: "not-a-cidr"}, wantErr: true},
+		{name: "invalid startIP", cfg: IPRangeConfig{StartIP: "bad", EndIP: "10.0.0.10"}, wantErr: true},
+		{name: "startIP without endIP", cfg: IPRangeConfig{StartIP: "10.0.0.5"}, wantErr: true},
+		{name: "endIP without startIP", cfg: IPRangeConfig{EndIP: "10.0.0.5"}, wantErr: true},
+		{name: "family mismatch", cfg: IPRangeConfig{StartIP: "10.0.0.5", EndIP: "2001:db8::5"}, wantErr: true},
+		{name: "start after end", cfg: IPRangeConfig{StartIP: "10.0.0.10", EndIP: "10.0.0.5"}, wantErr: true},
+		{name: "range outside cidr", cfg: IPRangeConfig{CIDR: "10.0.0.0/24", StartIP: "10.1.0.5", EndIP: "10.1.0.10"}, wantErr: true},
+		{name: "nothing set", cfg: IPRangeConfig{}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("IPRangeConfig.Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateRoutes(t *testing.T) {
 	scopeLink := uint8(unix.RT_SCOPE_LINK)
 	scopeUniverse := uint8(unix.RT_SCOPE_UNIVERSE)
