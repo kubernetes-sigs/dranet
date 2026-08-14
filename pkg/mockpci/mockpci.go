@@ -27,16 +27,13 @@ import (
 	"strings"
 
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/dranet/internal/nlwrap"
 )
 
 var (
-	defaultMockPCIRoot = "/var/run/dranet/mock-pci"
-	stateFileName      = "state.json"
-	sysBusPCIDevices   = "/sys/bus/pci/devices"
-	sysClassNet        = "/sys/class/net"
-	savedPCIBusDir     = "/var/run/dranet/pci-bus-save"
-	savedNetDir        = "/var/run/dranet/net-save"
+	defaultMockSysfsRoot = "/var/run/dranet/sysfs"
+	stateFileName        = "state.json"
 )
 
 // DeviceConfig represents a synthetic PCI network device configuration.
@@ -76,7 +73,7 @@ func ApplyDefaults(cfg *DeviceConfig) {
 }
 
 // GenerateModalias creates a standard Linux kernel modalias string for a PCI device.
-func GenerateModalias(vendorID, deviceID, class string) string {
+func GenerateModalias(vendorID, deviceID, class string) (string, error) {
 	if vendorID == "" {
 		vendorID = "0x15b3"
 	}
@@ -86,15 +83,24 @@ func GenerateModalias(vendorID, deviceID, class string) string {
 	if class == "" {
 		class = "0x020000"
 	}
-	vInt, _ := strconv.ParseUint(strings.TrimPrefix(vendorID, "0x"), 16, 64)
-	dInt, _ := strconv.ParseUint(strings.TrimPrefix(deviceID, "0x"), 16, 64)
-	cInt, _ := strconv.ParseUint(strings.TrimPrefix(class, "0x"), 16, 64)
+	vInt, err := strconv.ParseUint(strings.TrimPrefix(vendorID, "0x"), 16, 64)
+	if err != nil {
+		return "", fmt.Errorf("invalid hex vendorID %q: %w", vendorID, err)
+	}
+	dInt, err := strconv.ParseUint(strings.TrimPrefix(deviceID, "0x"), 16, 64)
+	if err != nil {
+		return "", fmt.Errorf("invalid hex deviceID %q: %w", deviceID, err)
+	}
+	cInt, err := strconv.ParseUint(strings.TrimPrefix(class, "0x"), 16, 64)
+	if err != nil {
+		return "", fmt.Errorf("invalid hex class %q: %w", class, err)
+	}
 
 	baseClass := (cInt >> 16) & 0xff
 	subClass := (cInt >> 8) & 0xff
 	progIface := cInt & 0xff
 
-	return fmt.Sprintf("pci:v%08Xd%08Xsv%08Xsd00000001bc%02Xsc%02Xi%02X\n", vInt, dInt, vInt, baseClass, subClass, progIface)
+	return fmt.Sprintf("pci:v%08Xd%08Xsv%08Xsd00000001bc%02Xsc%02Xi%02X\n", vInt, dInt, vInt, baseClass, subClass, progIface), nil
 }
 
 func ensureSymlink(target, link string) error {
@@ -107,13 +113,26 @@ func ensureSymlink(target, link string) error {
 	return nil
 }
 
-// PopulateMockPCIDir creates the mock sysfs tree structure for a PCIe device.
+// PopulateMockPCIDir creates the mock sysfs tree structure for a PCIe device inside a shadow sysfs root.
 func PopulateMockPCIDir(cfg DeviceConfig, rootDir string) error {
 	ApplyDefaults(&cfg)
-	mockPCIDir := filepath.Join(rootDir, cfg.PCIAddress)
+
+	sysRoot := filepath.Join(rootDir, "sys")
+	busPCIDevices := filepath.Join(sysRoot, "bus", "pci", "devices")
+	busPCIDrivers := filepath.Join(sysRoot, "bus", "pci", "drivers")
+	classNet := filepath.Join(sysRoot, "class", "net")
+	devicesDir := filepath.Join(sysRoot, "devices", "pci0000:00")
+	mockPCIDir := filepath.Join(devicesDir, cfg.PCIAddress)
 	mockNetDir := filepath.Join(mockPCIDir, "net", cfg.Name)
+
 	if err := os.MkdirAll(mockNetDir, 0755); err != nil {
 		return fmt.Errorf("failed creating mock directory %s: %w", mockNetDir, err)
+	}
+	if err := os.MkdirAll(busPCIDevices, 0755); err != nil {
+		return fmt.Errorf("failed creating %s: %w", busPCIDevices, err)
+	}
+	if err := os.MkdirAll(classNet, 0755); err != nil {
+		return fmt.Errorf("failed creating %s: %w", classNet, err)
 	}
 
 	if err := os.WriteFile(filepath.Join(mockPCIDir, "vendor"), []byte(cfg.VendorID+"\n"), 0644); err != nil {
@@ -135,13 +154,16 @@ func PopulateMockPCIDir(cfg DeviceConfig, rootDir string) error {
 		return err
 	}
 
-	modalias := GenerateModalias(cfg.VendorID, cfg.DeviceID, cfg.Class)
+	modalias, err := GenerateModalias(cfg.VendorID, cfg.DeviceID, cfg.Class)
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(filepath.Join(mockPCIDir, "modalias"), []byte(modalias), 0644); err != nil {
 		return err
 	}
 
 	// Driver symlink
-	driverDir := filepath.Join(rootDir, "drivers", cfg.Driver)
+	driverDir := filepath.Join(busPCIDrivers, cfg.Driver)
 	if err := os.MkdirAll(driverDir, 0755); err != nil {
 		return fmt.Errorf("failed creating driver directory %s: %w", driverDir, err)
 	}
@@ -159,14 +181,37 @@ func PopulateMockPCIDir(cfg DeviceConfig, rootDir string) error {
 		}
 	}
 	if cfg.PhysFn != "" {
-		if err := ensureSymlink(filepath.Join(rootDir, cfg.PhysFn), filepath.Join(mockPCIDir, "physfn")); err != nil {
+		if err := ensureSymlink(filepath.Join(devicesDir, cfg.PhysFn), filepath.Join(mockPCIDir, "physfn")); err != nil {
 			return err
 		}
 	}
 
-	// Net device link inside PCI directory
+	// Net device link inside PCI directory: mockPCIDir/net/<dev>/device -> mockPCIDir
 	if err := ensureSymlink(mockPCIDir, filepath.Join(mockNetDir, "device")); err != nil {
 		return err
+	}
+
+	// Symlink in bus/pci/devices/<PCIAddress> -> mockPCIDir
+	if err := ensureSymlink(mockPCIDir, filepath.Join(busPCIDevices, cfg.PCIAddress)); err != nil {
+		return err
+	}
+
+	// Symlink in class/net/<Name> -> mockNetDir
+	if err := ensureSymlink(mockNetDir, filepath.Join(classNet, cfg.Name)); err != nil {
+		return err
+	}
+
+	// Mirror existing real host PCI devices into shadow bus/pci/devices if present
+	if realEntries, err := os.ReadDir("/sys/bus/pci/devices"); err == nil {
+		for _, entry := range realEntries {
+			if entry.Name() != cfg.PCIAddress {
+				target := filepath.Join("/sys/bus/pci/devices", entry.Name())
+				link := filepath.Join(busPCIDevices, entry.Name())
+				if err := ensureSymlink(target, link); err != nil {
+					return fmt.Errorf("failed mirroring host PCI device %s: %w", entry.Name(), err)
+				}
+			}
+		}
 	}
 
 	return nil
@@ -178,7 +223,7 @@ type State struct {
 }
 
 func loadState() (*State, error) {
-	statePath := filepath.Join(defaultMockPCIRoot, stateFileName)
+	statePath := filepath.Join(defaultMockSysfsRoot, stateFileName)
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -197,73 +242,17 @@ func loadState() (*State, error) {
 }
 
 func saveState(state *State) error {
-	if err := os.MkdirAll(defaultMockPCIRoot, 0755); err != nil {
+	if err := os.MkdirAll(defaultMockSysfsRoot, 0755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(defaultMockPCIRoot, stateFileName), data, 0644)
+	return os.WriteFile(filepath.Join(defaultMockSysfsRoot, stateFileName), data, 0644)
 }
 
-func isMountPoint(path string) bool {
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		return false
-	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == path {
-			return true
-		}
-	}
-	return false
-}
-
-func ensureTmpfsMount(target, backupDir string) error {
-	if isMountPoint(target) {
-		return nil
-	}
-
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
-		return err
-	}
-
-	entries, err := os.ReadDir(target)
-	if err == nil {
-		for _, entry := range entries {
-			src := filepath.Join(target, entry.Name())
-			linkDst, err := filepath.EvalSymlinks(src)
-			if err == nil {
-				if err := ensureSymlink(linkDst, filepath.Join(backupDir, entry.Name())); err != nil {
-					return fmt.Errorf("failed backing up symlink %s: %w", entry.Name(), err)
-				}
-			}
-		}
-	}
-
-	if err := unix.Mount("tmpfs", target, "tmpfs", 0, ""); err != nil {
-		return fmt.Errorf("failed mounting tmpfs over %s: %w", target, err)
-	}
-
-	backupEntries, err := os.ReadDir(backupDir)
-	if err == nil {
-		for _, entry := range backupEntries {
-			dst, err := os.Readlink(filepath.Join(backupDir, entry.Name()))
-			if err == nil {
-				if err := ensureSymlink(dst, filepath.Join(target, entry.Name())); err != nil {
-					return fmt.Errorf("failed restoring symlink %s: %w", entry.Name(), err)
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// Create sets up an in-kernel dummy network interface and links it into a mocked sysfs PCI hierarchy.
+// Create sets up an in-kernel dummy network interface and registers it in the shadow sysfs hierarchy.
 func Create(cfg DeviceConfig) error {
 	if cfg.Name == "" {
 		return fmt.Errorf("device name is required")
@@ -274,7 +263,7 @@ func Create(cfg DeviceConfig) error {
 	ApplyDefaults(&cfg)
 
 	// 1. Create in-kernel dummy network interface via Netlink
-	link, err := netlink.LinkByName(cfg.Name)
+	link, err := nlwrap.LinkByName(cfg.Name)
 	if err != nil {
 		dummy := &netlink.Dummy{
 			LinkAttrs: netlink.LinkAttrs{
@@ -285,13 +274,13 @@ func Create(cfg DeviceConfig) error {
 		if cfg.MAC != "" {
 			hwAddr, err := net.ParseMAC(cfg.MAC)
 			if err == nil {
-				dummy.LinkAttrs.HardwareAddr = hwAddr
+				dummy.HardwareAddr = hwAddr
 			}
 		}
 		if err := netlink.LinkAdd(dummy); err != nil {
 			return fmt.Errorf("failed to add dummy interface %s: %w", cfg.Name, err)
 		}
-		link, err = netlink.LinkByName(cfg.Name)
+		link, err = nlwrap.LinkByName(cfg.Name)
 		if err != nil {
 			return fmt.Errorf("failed to get newly created interface %s: %w", cfg.Name, err)
 		}
@@ -299,36 +288,21 @@ func Create(cfg DeviceConfig) error {
 
 	// 2. Attach Soft-RoCE (rdma_rxe) if requested
 	if cfg.RDMADevice != "" {
-		_ = exec.Command("modprobe", "rdma_rxe").Run()
+		// modprobe may fail if running without CAP_SYS_MODULE, but the module may already be loaded in the kernel.
+		if out, err := exec.Command("modprobe", "rdma_rxe").CombinedOutput(); err != nil {
+			klog.V(4).Infof("modprobe rdma_rxe notice: %s (%v)", strings.TrimSpace(string(out)), err)
+		}
 		if out, err := exec.Command("rdma", "link", "add", cfg.RDMADevice, "type", "rxe", "netdev", cfg.Name).CombinedOutput(); err != nil {
 			return fmt.Errorf("failed adding rdma link %s: %s: %w", cfg.RDMADevice, strings.TrimSpace(string(out)), err)
 		}
 	}
 
-	// 3. Populate mock PCI directory
-	if err := PopulateMockPCIDir(cfg, defaultMockPCIRoot); err != nil {
-		return err
-	}
-	mockPCIDir := filepath.Join(defaultMockPCIRoot, cfg.PCIAddress)
-	mockNetDir := filepath.Join(mockPCIDir, "net", cfg.Name)
-
-	// 4. Mount tmpfs over /sys/bus/pci/devices and /sys/class/net
-	if err := ensureTmpfsMount(sysBusPCIDevices, savedPCIBusDir); err != nil {
-		return err
-	}
-	if err := ensureTmpfsMount(sysClassNet, savedNetDir); err != nil {
+	// 3. Populate shadow sysfs directory
+	if err := PopulateMockPCIDir(cfg, defaultMockSysfsRoot); err != nil {
 		return err
 	}
 
-	// 5. Link into sysfs
-	if err := ensureSymlink(mockPCIDir, filepath.Join(sysBusPCIDevices, cfg.PCIAddress)); err != nil {
-		return err
-	}
-	if err := ensureSymlink(mockNetDir, filepath.Join(sysClassNet, cfg.Name)); err != nil {
-		return err
-	}
-
-	// 6. Trigger Netlink notification so dranet immediately scans the interface
+	// 4. Trigger Netlink notification so dranet immediately scans the interface
 	if err := netlink.LinkSetDown(link); err != nil {
 		return fmt.Errorf("failed setting link %s down: %w", cfg.Name, err)
 	}
@@ -364,41 +338,50 @@ func Delete(nameOrBDF string) error {
 	if targetCfg != nil {
 		// Remove RDMA link if attached
 		if targetCfg.RDMADevice != "" {
-			_ = exec.Command("rdma", "link", "del", targetCfg.RDMADevice).Run()
+			if out, err := exec.Command("rdma", "link", "del", targetCfg.RDMADevice).CombinedOutput(); err != nil {
+				return fmt.Errorf("failed deleting rdma link %s: %s: %w", targetCfg.RDMADevice, strings.TrimSpace(string(out)), err)
+			}
 		}
 
 		// Delete dummy interface
-		if link, err := netlink.LinkByName(targetCfg.Name); err == nil {
+		if link, err := nlwrap.LinkByName(targetCfg.Name); err == nil {
 			if err := netlink.LinkDel(link); err != nil {
 				return fmt.Errorf("failed deleting link %s: %w", targetCfg.Name, err)
 			}
 		}
 
-		// Remove sysfs links
-		if err := os.Remove(filepath.Join(sysBusPCIDevices, targetCfg.PCIAddress)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed removing %s from %s: %w", targetCfg.PCIAddress, sysBusPCIDevices, err)
+		// Remove shadow sysfs links and device directory
+		sysRoot := filepath.Join(defaultMockSysfsRoot, "sys")
+		busPCILink := filepath.Join(sysRoot, "bus", "pci", "devices", targetCfg.PCIAddress)
+		classNetLink := filepath.Join(sysRoot, "class", "net", targetCfg.Name)
+		deviceDir := filepath.Join(sysRoot, "devices", "pci0000:00", targetCfg.PCIAddress)
+
+		if err := os.Remove(busPCILink); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed removing %s: %w", busPCILink, err)
 		}
-		if err := os.Remove(filepath.Join(sysClassNet, targetCfg.Name)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed removing %s from %s: %w", targetCfg.Name, sysClassNet, err)
+		if err := os.Remove(classNetLink); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed removing %s: %w", classNetLink, err)
 		}
-		if err := os.RemoveAll(filepath.Join(defaultMockPCIRoot, targetCfg.PCIAddress)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed removing mock PCI directory %s: %w", targetCfg.PCIAddress, err)
+		if err := os.RemoveAll(deviceDir); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed removing %s: %w", deviceDir, err)
 		}
 	}
 
 	return saveState(state)
 }
 
-// Cleanup unmounts tmpfs layers and purges all mocked devices.
+// Cleanup purges all mocked devices and removes the shadow sysfs hierarchy.
 func Cleanup() error {
 	var errs []error
 	state, err := loadState()
 	if err == nil {
 		for _, dev := range state.Devices {
 			if dev.RDMADevice != "" {
-				_ = exec.Command("rdma", "link", "del", dev.RDMADevice).Run()
+				if out, err := exec.Command("rdma", "link", "del", dev.RDMADevice).CombinedOutput(); err != nil {
+					errs = append(errs, fmt.Errorf("failed deleting rdma link %s: %s: %w", dev.RDMADevice, strings.TrimSpace(string(out)), err))
+				}
 			}
-			if link, err := netlink.LinkByName(dev.Name); err == nil {
+			if link, err := nlwrap.LinkByName(dev.Name); err == nil {
 				if err := netlink.LinkDel(link); err != nil {
 					errs = append(errs, fmt.Errorf("failed deleting link %s: %w", dev.Name, err))
 				}
@@ -414,31 +397,16 @@ func Cleanup() error {
 			if len(parts) >= 2 {
 				rdmaDev := strings.TrimSpace(parts[1])
 				if rdmaDev != "" {
-					_ = exec.Command("rdma", "link", "del", rdmaDev).Run()
+					if out, err := exec.Command("rdma", "link", "del", rdmaDev).CombinedOutput(); err != nil {
+						errs = append(errs, fmt.Errorf("failed deleting rdma link %s: %s: %w", rdmaDev, strings.TrimSpace(string(out)), err))
+					}
 				}
 			}
 		}
 	}
 
-	if isMountPoint(sysBusPCIDevices) {
-		if err := unix.Unmount(sysBusPCIDevices, unix.MNT_DETACH); err != nil {
-			errs = append(errs, fmt.Errorf("failed unmounting %s: %w", sysBusPCIDevices, err))
-		}
-	}
-	if isMountPoint(sysClassNet) {
-		if err := unix.Unmount(sysClassNet, unix.MNT_DETACH); err != nil {
-			errs = append(errs, fmt.Errorf("failed unmounting %s: %w", sysClassNet, err))
-		}
-	}
-
-	if err := os.RemoveAll(defaultMockPCIRoot); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("failed removing %s: %w", defaultMockPCIRoot, err))
-	}
-	if err := os.RemoveAll(savedPCIBusDir); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("failed removing %s: %w", savedPCIBusDir, err))
-	}
-	if err := os.RemoveAll(savedNetDir); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("failed removing %s: %w", savedNetDir, err))
+	if err := os.RemoveAll(defaultMockSysfsRoot); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("failed removing %s: %w", defaultMockSysfsRoot, err))
 	}
 
 	if len(errs) > 0 {

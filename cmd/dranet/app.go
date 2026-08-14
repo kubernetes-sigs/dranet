@@ -68,6 +68,7 @@ var (
 	profileProvider   string
 	webhookURL        string
 	featureGates      string
+	sysfsRoot         string
 
 	kubeletRootDir string
 
@@ -89,6 +90,7 @@ func init() {
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
+	flag.StringVar(&sysfsRoot, "sysfs-root", "/sys", "The path to the sysfs root directory. Set to a custom path during testing or device simulation.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -197,7 +199,12 @@ func main() {
 		klog.Fatalf("failed to setup providers: %v", err)
 	}
 
+	if envRoot := os.Getenv("SYSFS_ROOT"); envRoot != "" && sysfsRoot == "/sys" {
+		sysfsRoot = envRoot
+	}
+
 	optsDb := []inventory.Option{
+		inventory.WithSysfsRoot(sysfsRoot),
 		inventory.WithRateLimiter(rate.NewLimiter(rate.Every(minPollInterval), pollBurst)),
 		inventory.WithMaxPollInterval(maxPollInterval),
 		inventory.WithMoveIBInterfaces(moveIBInterfaces),

@@ -90,11 +90,12 @@ func TestApplyDefaults(t *testing.T) {
 
 func TestGenerateModalias(t *testing.T) {
 	tests := []struct {
-		name     string
-		vendor   string
-		device   string
-		class    string
-		expected string
+		name      string
+		vendor    string
+		device    string
+		class     string
+		expected  string
+		expectErr bool
 	}{
 		{
 			name:     "default mellanox connectx",
@@ -131,11 +132,41 @@ func TestGenerateModalias(t *testing.T) {
 			class:    "",
 			expected: "pci:v000015B3d0000101Bsv000015B3sd00000001bc02sc00i00\n",
 		},
+		{
+			name:      "invalid vendorID hex returns error",
+			vendor:    "0xZZZZ",
+			device:    "0x101b",
+			class:     "0x020000",
+			expectErr: true,
+		},
+		{
+			name:      "invalid deviceID hex returns error",
+			vendor:    "0x15b3",
+			device:    "invalid",
+			class:     "0x020000",
+			expectErr: true,
+		},
+		{
+			name:      "invalid class hex returns error",
+			vendor:    "0x15b3",
+			device:    "0x101b",
+			class:     "0xGGGG",
+			expectErr: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := GenerateModalias(tt.vendor, tt.device, tt.class)
+			actual, err := GenerateModalias(tt.vendor, tt.device, tt.class)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("expected error for %s, got nil", tt.name)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if actual != tt.expected {
 				t.Errorf("GenerateModalias(%q, %q, %q) = %q, want %q", tt.vendor, tt.device, tt.class, actual, tt.expected)
 			}
@@ -168,7 +199,8 @@ func TestPopulateMockPCIDir(t *testing.T) {
 		t.Fatalf("PopulateMockPCIDir failed: %v", err)
 	}
 
-	mockPCIDir := filepath.Join(tempDir, cfg.PCIAddress)
+	sysRoot := filepath.Join(tempDir, "sys")
+	mockPCIDir := filepath.Join(sysRoot, "devices", "pci0000:00", cfg.PCIAddress)
 
 	// Check files created
 	checkFileContent := func(filename, expected string) {
@@ -198,7 +230,7 @@ func TestPopulateMockPCIDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read driver symlink: %v", err)
 	}
-	expectedDriverDest := filepath.Join(tempDir, "drivers", "mlx5_core")
+	expectedDriverDest := filepath.Join(sysRoot, "bus", "pci", "drivers", "mlx5_core")
 	if driverLink != expectedDriverDest {
 		t.Errorf("driver link = %q, want %q", driverLink, expectedDriverDest)
 	}
@@ -217,18 +249,37 @@ func TestPopulateMockPCIDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read physfn symlink: %v", err)
 	}
-	expectedPhysfn := filepath.Join(tempDir, "0000:00:08.0")
+	expectedPhysfn := filepath.Join(sysRoot, "devices", "pci0000:00", "0000:00:08.0")
 	if physfnLink != expectedPhysfn {
 		t.Errorf("physfn link = %q, want %q", physfnLink, expectedPhysfn)
+	}
+
+	// Check bus/pci/devices symlink
+	busPCILink, err := os.Readlink(filepath.Join(sysRoot, "bus", "pci", "devices", cfg.PCIAddress))
+	if err != nil {
+		t.Fatalf("failed to read bus/pci/devices symlink: %v", err)
+	}
+	if busPCILink != mockPCIDir {
+		t.Errorf("bus/pci/devices link = %q, want %q", busPCILink, mockPCIDir)
+	}
+
+	// Check class/net symlink
+	classNetLink, err := os.Readlink(filepath.Join(sysRoot, "class", "net", cfg.Name))
+	if err != nil {
+		t.Fatalf("failed to read class/net symlink: %v", err)
+	}
+	expectedNetDir := filepath.Join(mockPCIDir, "net", cfg.Name)
+	if classNetLink != expectedNetDir {
+		t.Errorf("class/net link = %q, want %q", classNetLink, expectedNetDir)
 	}
 }
 
 func TestStateLoadSave(t *testing.T) {
-	origRoot := defaultMockPCIRoot
+	origRoot := defaultMockSysfsRoot
 	tempDir := t.TempDir()
-	defaultMockPCIRoot = tempDir
+	defaultMockSysfsRoot = tempDir
 	defer func() {
-		defaultMockPCIRoot = origRoot
+		defaultMockSysfsRoot = origRoot
 	}()
 
 	// 1. Initial load from non-existent state file should return empty map
