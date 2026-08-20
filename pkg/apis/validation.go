@@ -142,6 +142,15 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, fmt.Errorf("%s.type: '%s' is not supported", fieldPath, cfg.Type))
 	}
 
+	if cfg.Unnumbered != nil && *cfg.Unnumbered {
+		if !cfg.IsSubinterface() {
+			allErrors = append(allErrors, fmt.Errorf("%s.unnumbered: only valid for subinterface types", fieldPath))
+		}
+		if len(cfg.Addresses) > 0 || (cfg.DHCP != nil && *cfg.DHCP) {
+			allErrors = append(allErrors, fmt.Errorf("%s.unnumbered: cannot be set together with addresses or dhcp", fieldPath))
+		}
+	}
+
 	allErrors = append(allErrors, isValidLinuxInterfaceName(cfg.Name, fieldPath+".name")...)
 
 	for i, addr := range cfg.Addresses {

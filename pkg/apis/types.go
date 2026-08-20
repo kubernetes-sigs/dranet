@@ -58,6 +58,11 @@ type InterfaceConfig struct {
 	// If empty, it is treated as "passthrough".
 	Type InterfaceType `json:"type,omitempty"`
 
+	// Unnumbered indicates the interface is intentionally brought up with no
+	// address configured by DraNet. Valid only when Type selects a subinterface.
+	// Use it when addresses are obtained in-band.
+	Unnumbered *bool `json:"unnumbered,omitempty"`
+
 	// Addresses is a list of IP addresses in CIDR format (e.g., "192.168.1.10/24")
 	// to be assigned to the interface.
 	Addresses []string `json:"addresses,omitempty"`

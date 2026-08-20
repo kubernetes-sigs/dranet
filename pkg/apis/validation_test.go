@@ -414,6 +414,33 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			expectErr: true,
 			errCount:  1,
 		},
+		{
+			name:      "unnumbered on ipvlan subinterface without addresses or dhcp",
+			cfg:       &InterfaceConfig{Type: "ipvlan", Name: "eth0", Unnumbered: ptr.To(true)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "unnumbered on non-subinterface type",
+			cfg:       &InterfaceConfig{Type: "passthrough", Name: "eth0", Unnumbered: ptr.To(true)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "unnumbered with addresses",
+			cfg:       &InterfaceConfig{Type: "ipvlan", Name: "eth0", Unnumbered: ptr.To(true), Addresses: []string{"10.0.0.1/24"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "unnumbered with dhcp",
+			cfg:       &InterfaceConfig{Type: "ipvlan", Name: "eth0", Unnumbered: ptr.To(true), DHCP: ptr.To(true)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -461,15 +461,23 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			deviceCfg.NetworkInterfaceConfigInPod.Neighbors = append(deviceCfg.NetworkInterfaceConfigInPod.Neighbors, neighCfg)
 		}
 
-		// If the user has already configured custom routes or rules, we
-		// preserve and skip automatic source-based routing. Otherwise,
-		// we perform source-based routing.
+		// Configure addressing/routing for subinterfaces. A subinterface has no
+		// host addresses to inherit, so its addresses must come from the user
+		// config, a profile, or be explicitly waived via Unnumbered.
 		if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-			if len(customRoutes) > 0 || len(customRules) > 0 {
+			iface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
+			switch {
+			case len(customRoutes) > 0 || len(customRules) > 0:
+				// Preserve user-provided routes/rules and skip automatic source-based routing.
 				deviceCfg.NetworkInterfaceConfigInPod.Routes = customRoutes
 				deviceCfg.NetworkInterfaceConfigInPod.Rules = customRules
-			} else if len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) != 0 {
+			case len(iface.Addresses) > 0:
 				addSourceBasedRouting(&deviceCfg)
+			case iface.Unnumbered != nil && *iface.Unnumbered:
+				klog.V(2).Infof("device %s: unnumbered %s interface requested; skipping address and route configuration", result.Device, iface.Type)
+			default:
+				errorList = append(errorList, fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.unnumbered: true", result.Device, iface.Type))
+				continue
 			}
 		}
 
