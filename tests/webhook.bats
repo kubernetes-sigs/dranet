@@ -57,7 +57,15 @@ teardown_file() {
   # Validate pod has IP from whereabouts range
   run kubectl exec pod-whereabouts -- ip -4 addr show
   assert_output --partial "192.168.100."
-  
+
+  # The webhook API passes the full ResourceClaim, so whereabouts records the
+  # claim UID as the allocation identity and the real Pod as podref.
+  claim_uid="$(kubectl get resourceclaims -o json | jq -r '.items[] | select(any(.status.reservedFor[]?; .name == "pod-whereabouts")) | .metadata.uid')"
+  run kubectl -n kube-system get ippool 192.168.100.0-24 -o json
+  assert_success
+  allocation_id="$(jq -r '.spec.allocations | to_entries[] | select(.value.podref == "default/pod-whereabouts") | .value.id' <<<"$output")"
+  assert_equal "$allocation_id" "$claim_uid"
+
   kubectl delete pod pod-whereabouts
   kubectl delete resourceclaimtemplate whereabouts-claim
   

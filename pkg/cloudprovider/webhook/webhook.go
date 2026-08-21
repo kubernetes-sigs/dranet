@@ -51,6 +51,14 @@ type Capabilities struct {
 
 // API Contracts (JSON payloads)
 type ProfileRequest struct {
+	Device cloudprovider.DeviceIdentifiers `json:"device"`
+	Claim  *resourceapi.ResourceClaim      `json:"claim"`
+	Config *apis.NetworkConfig             `json:"config,omitempty"`
+}
+
+// ProfileReleaseRequest contains the stable identity needed to release a
+// profile. NodeUnprepareResources does not provide the full ResourceClaim.
+type ProfileReleaseRequest struct {
 	Device   cloudprovider.DeviceIdentifiers `json:"device"`
 	ClaimUID types.UID                       `json:"claim_uid"`
 	Config   *apis.NetworkConfig             `json:"config,omitempty"`
@@ -230,11 +238,11 @@ func (p *WebhookProvider) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *a
 }
 
 // GetProfileConfig asks the webhook to resolve the logical profile (e.g., allocate an IP).
-func (p *WebhookProvider) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+func (p *WebhookProvider) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	req := ProfileRequest{
-		Device:   id,
-		ClaimUID: claimUID,
-		Config:   config,
+		Device: id,
+		Claim:  claim,
+		Config: config,
 	}
 
 	var respConfig apis.NetworkConfig
@@ -247,7 +255,7 @@ func (p *WebhookProvider) GetProfileConfig(id cloudprovider.DeviceIdentifiers, c
 
 // ReleaseProfileConfig tells the webhook to free stateful resources (e.g., release IP).
 func (p *WebhookProvider) ReleaseProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error {
-	req := ProfileRequest{
+	req := ProfileReleaseRequest{
 		Device:   id,
 		ClaimUID: claimUID,
 		Config:   config,

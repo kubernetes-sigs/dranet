@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 )
@@ -110,7 +112,8 @@ func TestWebhookCapabilitiesAndPost(t *testing.T) {
 				t.Errorf("Expected GetDeviceAttributes to fail and return nil due to lack of capability")
 			}
 
-			_, err = provider.GetProfileConfig(id, "claim-123", nil)
+			claim := &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{UID: "claim-123"}}
+			_, err = provider.GetProfileConfig(id, claim, nil)
 			if tt.expectProfileSuccess && err != nil {
 				t.Errorf("Expected GetProfileConfig to succeed, got error: %v", err)
 			} else if !tt.expectProfileSuccess && err == nil {
@@ -307,6 +310,16 @@ func TestWebhookGetProfileConfigPassesConfig(t *testing.T) {
 				w.Write([]byte(`{"error": "expected config with profile 'test-profile'"}`))
 				return
 			}
+			if req.Claim == nil || req.Claim.Name != "claim" || req.Claim.Namespace != "default" || req.Claim.UID != "claim-123" {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`{"error": "expected full ResourceClaim"}`))
+				return
+			}
+			if len(req.Claim.Status.ReservedFor) != 1 || req.Claim.Status.ReservedFor[0].Name != "pod" {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`{"error": "expected ResourceClaim consumer"}`))
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"interface": {"mtu": 1450}}`))
 			return
@@ -323,13 +336,52 @@ func TestWebhookGetProfileConfigPassesConfig(t *testing.T) {
 	testConfig := &apis.NetworkConfig{
 		Profile: "test-profile",
 	}
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default", UID: "claim-123"},
+		Status: resourceapi.ResourceClaimStatus{ReservedFor: []resourceapi.ResourceClaimConsumerReference{
+			{Resource: "pods", Name: "pod", UID: "pod-123"},
+		}},
+	}
 
-	conf, err := provider.GetProfileConfig(cloudprovider.DeviceIdentifiers{}, "claim-123", testConfig)
+	conf, err := provider.GetProfileConfig(cloudprovider.DeviceIdentifiers{}, claim, testConfig)
 	if err != nil {
 		t.Fatalf("Expected GetProfileConfig to succeed, got error: %v", err)
 	}
 
 	if conf == nil || conf.Interface.MTU == nil || *conf.Interface.MTU != 1450 {
 		t.Errorf("Expected GetProfileConfig to return MTU 1450, got %v", conf)
+	}
+}
+
+func TestWebhookReleaseProfileConfigPassesClaimUID(t *testing.T) {
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case PathHealth:
+			json.NewEncoder(w).Encode(Capabilities{ProfileProvider: true})
+		case PathReleaseProfileConfig:
+			var req ProfileReleaseRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.ClaimUID != "claim-123" || req.Config == nil || req.Config.Profile != "test-profile" {
+				http.Error(w, "unexpected release request", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	provider, err := NewWebhookProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("NewWebhookProvider failed: %v", err)
+	}
+	if err := provider.ReleaseProfileConfig(cloudprovider.DeviceIdentifiers{}, "claim-123", &apis.NetworkConfig{Profile: "test-profile"}); err != nil {
+		t.Fatalf("ReleaseProfileConfig failed: %v", err)
 	}
 }

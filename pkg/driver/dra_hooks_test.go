@@ -384,7 +384,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Success Case", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return &apis.NetworkConfig{
 				Interface: apis.InterfaceConfig{
 					Addresses: []string{"10.0.0.1/24"},
@@ -447,7 +447,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Unsupported Provider Case", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return nil, fmt.Errorf("current cloud provider does not support dynamic profiles")
 		}
 		fakeDB.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
@@ -497,7 +497,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Allocation Failure Case", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return nil, fmt.Errorf("ipam allocation failed")
 		}
 		fakeDB.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
@@ -588,7 +588,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Early Store Profile Release on Subsequent Failure", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return &apis.NetworkConfig{
 				Interface: apis.InterfaceConfig{
 					Addresses: []string{"10.0.0.1/24"},
@@ -793,9 +793,9 @@ func TestGetDeviceNetworkConfigWithWebhook(t *testing.T) {
 			}
 
 			fakeDB := newFakeInventoryDB()
-			fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+			fakeDB.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 				id := cloudprovider.DeviceIdentifiers{Name: deviceName}
-				return provider.GetProfileConfig(id, claimUID, config)
+				return provider.GetProfileConfig(id, claim, config)
 			}
 			fakeDB.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
 				id := cloudprovider.DeviceIdentifiers{Name: deviceName}
@@ -809,7 +809,8 @@ func TestGetDeviceNetworkConfigWithWebhook(t *testing.T) {
 				podConfigStore: mustNewPodConfigStore(),
 			}
 
-			mergedConf, err := np.getDeviceNetworkConfig("device-1", "claim-uid-1", tc.userConf)
+			claim := &resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-1"}}
+			mergedConf, err := np.getDeviceNetworkConfig("device-1", claim, tc.userConf)
 
 			if tc.expectedError {
 				if err == nil {

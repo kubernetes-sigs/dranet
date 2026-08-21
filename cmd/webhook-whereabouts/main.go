@@ -32,6 +32,7 @@ import (
 
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	types100 "github.com/containernetworking/cni/pkg/types/100"
+	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 )
@@ -44,6 +45,45 @@ type cniNetConf struct {
 type Server struct {
 	binDir   string
 	profiles map[string]cniNetConf
+}
+
+type podIdentity struct {
+	Namespace string
+	Name      string
+}
+
+func podFromClaim(claim *resourceapi.ResourceClaim) (podIdentity, error) {
+	if claim == nil {
+		return podIdentity{}, fmt.Errorf("resource claim is required")
+	}
+	if claim.UID == "" {
+		return podIdentity{}, fmt.Errorf("resource claim UID is required")
+	}
+	if claim.Namespace == "" {
+		return podIdentity{}, fmt.Errorf("resource claim namespace is required")
+	}
+	if len(claim.Status.ReservedFor) != 1 {
+		return podIdentity{}, fmt.Errorf("resource claim must be reserved for exactly one Pod, got %d consumers", len(claim.Status.ReservedFor))
+	}
+	consumer := claim.Status.ReservedFor[0]
+	if consumer.APIGroup != "" || consumer.Resource != "pods" {
+		return podIdentity{}, fmt.Errorf("resource claim consumer must reference a core Pod")
+	}
+	if consumer.Name == "" || consumer.UID == "" {
+		return podIdentity{}, fmt.Errorf("resource claim Pod consumer name and UID are required")
+	}
+	return podIdentity{Namespace: claim.Namespace, Name: consumer.Name}, nil
+}
+
+func cniEnv(command, containerID, ifName string, pod podIdentity, binDir string) []string {
+	return []string{
+		"CNI_COMMAND=" + command,
+		"CNI_CONTAINERID=" + containerID,
+		"CNI_NETNS=/dev/null",
+		"CNI_IFNAME=" + ifName,
+		"CNI_PATH=" + binDir,
+		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=" + pod.Namespace + ";K8S_POD_NAME=" + pod.Name + ";K8S_POD_INFRA_CONTAINER_ID=" + containerID,
+	}
 }
 
 func (s *Server) GetDeviceAttributes(w http.ResponseWriter, r *http.Request) {
@@ -77,8 +117,7 @@ const pciNamePrefix = "pci-"
 //     ("pci-0000-27-00-2" -> "0000-27-00-2"), re-validating the result;
 //   - anything still invalid (e.g. base32-encoded names, already unreadable):
 //     a deterministic hash.
-func cniIfname(req webhook.ProfileRequest) string {
-	name := req.Device.Name
+func cniIfname(name string) string {
 	if isValidCNIIfname(name) {
 		return name
 	}
@@ -118,6 +157,11 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	pod, err := podFromClaim(req.Claim)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	var profileName string
 	if req.Config != nil {
@@ -131,14 +175,8 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	binPath := filepath.Join(s.binDir, filepath.Base(conf.IPAM.Type))
-	env := []string{
-		"CNI_COMMAND=ADD",
-		"CNI_CONTAINERID=" + string(req.ClaimUID),
-		"CNI_NETNS=/dev/null", // IPAM plugins don't need network namespaces
-		"CNI_IFNAME=" + cniIfname(req),
-		"CNI_PATH=" + s.binDir,
-		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=default;K8S_POD_NAME=pod-whereabouts;K8S_POD_INFRA_CONTAINER_ID=" + string(req.ClaimUID),
-	}
+	claimUID := string(req.Claim.UID)
+	env := cniEnv("ADD", claimUID, cniIfname(req.Device.Name), pod, s.binDir)
 
 	cmd := exec.Command(binPath)
 	cmd.Env = append(os.Environ(), env...)
@@ -180,9 +218,13 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ReleaseProfileConfig(w http.ResponseWriter, r *http.Request) {
-	var req webhook.ProfileRequest
+	var req webhook.ProfileReleaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ClaimUID == "" {
+		http.Error(w, "resource claim UID is required", http.StatusBadRequest)
 		return
 	}
 
@@ -198,14 +240,12 @@ func (s *Server) ReleaseProfileConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	binPath := filepath.Join(s.binDir, filepath.Base(conf.IPAM.Type))
-	env := []string{
-		"CNI_COMMAND=DEL",
-		"CNI_CONTAINERID=" + string(req.ClaimUID),
-		"CNI_NETNS=/dev/null",
-		"CNI_IFNAME=" + cniIfname(req),
-		"CNI_PATH=" + s.binDir,
-		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=default;K8S_POD_NAME=pod-whereabouts;K8S_POD_INFRA_CONTAINER_ID=" + string(req.ClaimUID),
-	}
+	// NodeUnprepareResources does not provide the full ResourceClaim, so the
+	// Pod identity is unavailable here. whereabouts releases the allocation by
+	// (CNI_CONTAINERID, CNI_IFNAME); keep the legacy placeholder CNI_ARGS for
+	// compatibility with the CNI invocation while deriving the same ifname as ADD.
+	pod := podIdentity{Namespace: "default", Name: "pod-whereabouts"}
+	env := cniEnv("DEL", string(req.ClaimUID), cniIfname(req.Device.Name), pod, s.binDir)
 
 	cmd := exec.Command(binPath)
 	cmd.Env = append(os.Environ(), env...)

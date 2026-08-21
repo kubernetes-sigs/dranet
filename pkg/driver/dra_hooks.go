@@ -226,7 +226,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			}
 		}
 
-		mergedConf, err := np.getDeviceNetworkConfig(result.Device, claim.UID, userConf)
+		mergedConf, err := np.getDeviceNetworkConfig(result.Device, claim, userConf)
 		if err != nil {
 			errorList = append(errorList, err)
 			continue
@@ -675,7 +675,7 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 
 // getDeviceNetworkConfig merges the user configuration with the cloud provider configuration and resolves the dynamic profile.
 // User configuration always takes precedence in case of conflicts.
-func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UID, userConf *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+func (np *NetworkDriver) getDeviceNetworkConfig(device string, claim *resourceapi.ResourceClaim, userConf *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	cloudConf, ok := np.netdb.GetDeviceConfig(device)
 	if ok && cloudConf != nil {
 		klog.V(4).Infof("Found cloud provider configuration for device %s: %#v", device, cloudConf)
@@ -683,7 +683,7 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claimUID types.UI
 	mergedConf := apis.MergeNetworkConfig(userConf, cloudConf)
 
 	if mergedConf.Profile != "" {
-		profileConf, err := np.netdb.GetProfileConfig(device, claimUID, mergedConf)
+		profileConf, err := np.netdb.GetProfileConfig(device, claim, mergedConf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get profile config: %v", err)
 		}

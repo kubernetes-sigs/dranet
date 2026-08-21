@@ -1,0 +1,111 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: whereabouts-cni-config
+  namespace: kube-system
+data:
+  90-dranet-whereabouts.conf: |
+    {
+      "cniVersion": "0.3.0",
+      "name": "whereabouts-profile",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.130.119-192.168.130.128/24",
+        "log_file" : "/tmp/whereabouts.log",
+        "log_level" : "debug"
+      }
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: whereabouts-webhook
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: whereabouts-webhook-gc
+rules:
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["whereabouts.cni.cncf.io"]
+  resources: ["ippools"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["whereabouts.cni.cncf.io"]
+  resources: ["overlappingrangeipreservations"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: whereabouts-webhook-gc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: whereabouts-webhook-gc
+subjects:
+- kind: ServiceAccount
+  name: whereabouts-webhook
+  namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: whereabouts-webhook
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: whereabouts-webhook
+  template:
+    metadata:
+      labels:
+        app: whereabouts-webhook
+    spec:
+      hostNetwork: true
+      serviceAccountName: whereabouts-webhook
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: webhook
+        #image: dranet/webhook-whereabouts:test
+        image: 192.168.21.17:30003/dci-community-general/webhook-whereabouts:fix-webhook-api
+        #imagePullPolicy: Never
+        imagePullPolicy: Always
+        command:
+        - /usr/local/bin/webhook-whereabouts
+        args:
+        - --bind-address=127.0.0.1:8080
+        - --cni-bin-dir=/opt/cni/bin
+        - --cni-conf-dir=/etc/cni/net.d
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: cni-bin
+          mountPath: /opt/cni/bin
+        - name: cni-conf-dir
+          mountPath: /etc/cni/net.d
+        - name: cni-conf
+          mountPath: /etc/cni/net.d/90-dranet-whereabouts.conf
+          subPath: 90-dranet-whereabouts.conf
+      volumes:
+      - name: cni-bin
+        hostPath:
+          path: /opt/cni/bin
+          type: Directory
+      - name: cni-conf-dir
+        hostPath:
+          path: /etc/cni/net.d
+          type: DirectoryOrCreate
+      - name: cni-conf
+        configMap:
+          name: whereabouts-cni-config

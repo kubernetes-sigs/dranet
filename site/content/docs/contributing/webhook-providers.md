@@ -7,7 +7,7 @@ weight: 5
 
 DRANET supports a flexible webhook architecture that allows users to supply custom implementations for both hardware discovery (Cloud Provider) and user intent (Profile Provider).
 
-Instead of hardcoding bare-metal or CNI logic directly into DRANET, you can delegate these responsibilities to an external HTTP REST server. 
+Instead of hardcoding bare-metal or CNI logic directly into DRANET, you can delegate these responsibilities to an external HTTP REST server.
 
 ### Enabling Webhook Providers
 
@@ -27,26 +27,26 @@ The following diagram illustrates how DRANET communicates with the webhook provi
 sequenceDiagram
     participant D as DRANET Daemon
     participant W as Webhook Server (BYODP)
-    
+
     note over D,W: Initialization Phase
     D->>W: GET /health
     W-->>D: { "cloudProvider": true, "profileProvider": true }
-    
+
     note over D,W: Cloud Provider Phase (Hardware Discovery)
     D->>W: POST /GetDeviceAttributes (Device ID)
     W-->>D: Hardware attributes (MAC, PCI, Network constraints)
     D->>W: POST /GetDeviceConfig (Device ID)
     W-->>D: Baseline Hardware Settings (MTU, baseline routes)
-    
+
     note over D,W: Profile Provider Phase (User Intent Resolution)
-    D->>W: POST /GetProfileConfig (Device ID, full NetworkConfig containing Profile Name)
+    D->>W: POST /GetProfileConfig (Device ID, ResourceClaim, full NetworkConfig)
     W-->>D: Logical Network Config (Assigned IPs, custom routes)
-    
+
     note over D: DRANET merges all configs
     note over D: DRANET programs the interface statically
-    
+
     note over D,W: Teardown Phase
-    D->>W: POST /ReleaseProfileConfig (Device ID, full NetworkConfig)
+    D->>W: POST /ReleaseProfileConfig (Device ID, ResourceClaim UID, full NetworkConfig)
     W-->>D: 200 OK (Resources released)
 ```
 
@@ -88,7 +88,7 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
 
 #### Profile Provider API (`profileProvider: true`)
 
-* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM). 
+* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM). The request includes the complete `ResourceClaim`, including its UID, namespace, allocation, and `status.reservedFor` Pod consumer. Providers can therefore use the Claim UID as an idempotency key and the actual Pod namespace/name when integrating with an IPAM system.
 
   **Mutation & Validation**: The webhook receives the *entire* `NetworkConfig` (combined from user and cloud intents) as context. Unlike standard Mutating Webhooks on the API server, this node-level webhook cannot directly mutate the opaque config object in the API server. Instead, it computes and returns the *resolved profile parameters* (like the chosen IP), which DRANET then merges into the final configuration. Passing the full configuration gives the webhook the power of a Validating Admission Controller.
 
@@ -108,7 +108,7 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
   * **Kubelet Retry Loops**: Standard Kubernetes behavior is to retry failed resource preparations. A persistent denial (like a 400 Bad Request) will cause the Kubelet to continuously retry `NodePrepareResources`, which can generate unnecessary load on the node and webhook server compared to an upfront API rejection.
   * **Idempotency**: The kubelet may retry `NodePrepareResources`, so DRANET can call this more than once for the same `(device, claimUID)`. It must return an equivalent result without allocating additional resources (e.g. key the allocation by `claimUID`, as `whereabouts` does via `CNI_CONTAINERID`).
 
-* `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). Also receives the full `NetworkConfig`. Should return `200 OK` on success or if the resource was already released (idempotency).
+* `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). It receives the ResourceClaim UID and the full `NetworkConfig`. `NodeUnprepareResources` does not provide the complete ResourceClaim. The endpoint should return `200 OK` on success or if the resource was already released (idempotency).
   * **Best-effort teardown**: A failed `ReleaseProfileConfig` is logged but not retried by DRANET (teardown must not block pod deletion). The provider therefore owns leak reclamation and must be able to garbage-collect orphaned allocations on its own, otherwise resources leak permanently.
 
 ### Reference Implementation
