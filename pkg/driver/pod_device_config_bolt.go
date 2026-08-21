@@ -39,16 +39,16 @@ var (
 	deviceConfigsKey = []byte("device_configs")
 )
 
-// boltCheckpointer implements Checkpointer backed by bbolt.
-type boltCheckpointer struct {
+// BoltCheckpointer implements Checkpointer backed by bbolt.
+type BoltCheckpointer struct {
 	db *bolt.DB
 }
 
 // Compile-time interface check.
-var _ Checkpointer = &boltCheckpointer{}
+var _ Checkpointer = &BoltCheckpointer{}
 
-// newBoltCheckpointer opens (or creates) a bbolt database at the given path.
-func newBoltCheckpointer(path string) (*boltCheckpointer, error) {
+// NewBoltCheckpointer opens (or creates) a bbolt database at the given path.
+func NewBoltCheckpointer(path string) (*BoltCheckpointer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return nil, fmt.Errorf("create pod config db directory: %w", err)
 	}
@@ -68,14 +68,14 @@ func newBoltCheckpointer(path string) (*boltCheckpointer, error) {
 		return nil, fmt.Errorf("initialize pod config db bucket: %w", err)
 	}
 
-	return &boltCheckpointer{db: db}, nil
+	return &BoltCheckpointer{db: db}, nil
 }
 
-func (c *boltCheckpointer) Close() error {
+func (c *BoltCheckpointer) Close() error {
 	return c.db.Close()
 }
 
-func (c *boltCheckpointer) Store(podUID types.UID, deviceName string, config DeviceConfig) error {
+func (c *BoltCheckpointer) Store(podUID types.UID, deviceName string, config DeviceConfig) error {
 	return c.db.Update(func(tx *bolt.Tx) error {
 		root := tx.Bucket(podConfigsBucket)
 		if root == nil {
@@ -97,7 +97,7 @@ func (c *boltCheckpointer) Store(podUID types.UID, deviceName string, config Dev
 	})
 }
 
-func (c *boltCheckpointer) GetOrCreate() (map[types.UID]map[string]DeviceConfig, error) {
+func (c *BoltCheckpointer) GetOrCreate() (map[types.UID]map[string]DeviceConfig, error) {
 	result := make(map[types.UID]map[string]DeviceConfig)
 	err := c.db.View(func(tx *bolt.Tx) error {
 		root := tx.Bucket(podConfigsBucket)
@@ -143,7 +143,7 @@ func (c *boltCheckpointer) GetOrCreate() (map[types.UID]map[string]DeviceConfig,
 	return result, nil
 }
 
-func (c *boltCheckpointer) DeletePod(podUID types.UID) error {
+func (c *BoltCheckpointer) DeletePod(podUID types.UID) error {
 	return c.db.Update(func(tx *bolt.Tx) error {
 		root := tx.Bucket(podConfigsBucket)
 		if root == nil {

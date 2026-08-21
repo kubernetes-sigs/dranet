@@ -166,9 +166,25 @@ func main() {
 
 	opts := []driver.Option{}
 
+	// Build the pod config store with optional bbolt checkpoint backend.
+	// If the dbPath for persistence is not provided, the store will be in-memory only.
+	var checkpointer driver.Checkpointer
 	if dbPath != "" {
-		opts = append(opts, driver.WithDBPath(dbPath))
+		cp, err := driver.NewBoltCheckpointer(dbPath)
+		if err != nil {
+			klog.Fatalf("failed to open pod config database at %s: %v", dbPath, err)
+		}
+		checkpointer = cp
 	}
+	store, err := driver.NewPodConfigStore(checkpointer)
+	if err != nil {
+		if checkpointer != nil {
+			checkpointer.Close()
+		}
+		klog.Fatalf("failed to initialize pod config store: %v", err)
+	}
+	defer store.Close()
+	opts = append(opts, driver.WithPodConfigStore(store))
 
 	opts = append(opts, driver.WithKubeletRootDir(kubeletRootDir))
 
@@ -192,7 +208,11 @@ func main() {
 		}
 		opts = append(opts, driver.WithFilter(prg))
 	}
-	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL)
+	// Cloud provider construction options.
+	cloudOpts := cloudprovider.InstanceOptions{
+		AllocatedIPs: store.GetAllocatedIPs(),
+	}
+	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL, cloudOpts)
 	if err != nil {
 		klog.Fatalf("failed to setup providers: %v", err)
 	}
@@ -249,7 +269,7 @@ func printVersion() {
 	klog.Infof("dranet go %s build: %s time: %s", info.GoVersion, vcsRevision, vcsTime)
 }
 
-func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
+func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string, opts cloudprovider.InstanceOptions) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
 	var cloudInst cloudprovider.CloudInstance
 	var profProv cloudprovider.ProfileProvider
 	var err error
@@ -263,7 +283,7 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 	}
 
 	// Setup the Underlay (Hardware Discovery / Cloud Instance Info)
-	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, webhookURL)
+	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, webhookURL, opts)
 	if err != nil {
 		klog.Infof("failed to initialize cloud provider %q: %v", hint, err)
 		cloudInst = nil

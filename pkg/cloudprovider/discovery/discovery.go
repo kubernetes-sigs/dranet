@@ -66,10 +66,10 @@ func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProvider
 }
 
 // GetInstanceProperties initializes and returns the specified cloud provider instance.
-func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string) (cloudprovider.CloudInstance, error) {
+func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string, opts cloudprovider.InstanceOptions) (cloudprovider.CloudInstance, error) {
 	switch hint {
 	case CloudProviderHintGCE:
-		return gce.GetInstance(ctx)
+		return gce.GetInstance(ctx, opts)
 	case CloudProviderHintAWS:
 		return aws.GetInstance(ctx)
 	case CloudProviderHintAzure:

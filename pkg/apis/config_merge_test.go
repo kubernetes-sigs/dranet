@@ -173,6 +173,62 @@ func TestMergeNetworkConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "user requests ipvlan interface type, cloud provider configs merge in",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Name: "eth0",
+					Type: InterfaceTypeIPVlan,
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					MTU: ptr.To[int32](1500),
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Name: "eth0",
+					Type: InterfaceTypeIPVlan,
+					MTU:  ptr.To[int32](1500),
+				},
+			},
+		},
+		{
+			name: "no user request, cloud provider configures ipvlan type, cloud provider override",
+			user: &NetworkConfig{},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:   InterfaceTypeIPVlan,
+					IPVlan: &IPVlanConfig{Mode: "l2", Flag: "bridge"},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:   InterfaceTypeIPVlan,
+					IPVlan: &IPVlanConfig{Mode: "l2", Flag: "bridge"},
+				},
+			},
+		},
+		{
+			name: "user requests passthrough type, cloud provider configures ipvlan type, user wins",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type: "passthrough",
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:   InterfaceTypeIPVlan,
+					IPVlan: &IPVlanConfig{Mode: "l2", Flag: "bridge"},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type: "passthrough",
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {

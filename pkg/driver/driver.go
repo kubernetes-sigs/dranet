@@ -85,11 +85,10 @@ func WithInventory(db inventoryDB) Option {
 	}
 }
 
-// WithDBPath sets the path for the persistent pod config database.
-// If not set, an in-memory store is used.
-func WithDBPath(path string) Option {
+// WithPodConfigStore injects the store for pod device configurations.
+func WithPodConfigStore(store *PodConfigStore) Option {
 	return func(o *NetworkDriver) {
-		o.dbPath = path
+		o.podConfigStore = store
 	}
 }
 
@@ -118,7 +117,6 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
-	dbPath         string // path for persistent bbolt database; empty means in-memory
 
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.
@@ -158,23 +156,9 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		o(plugin)
 	}
 
-	// Initialize the pod config store with optional bbolt checkpoint backend.
-	var checkpointer Checkpointer
-	if plugin.dbPath != "" {
-		var err error
-		checkpointer, err = newBoltCheckpointer(plugin.dbPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open pod config database at %s: %v", plugin.dbPath, err)
-		}
+	if plugin.podConfigStore == nil {
+		return nil, fmt.Errorf("pod config store is required")
 	}
-	store, err := NewPodConfigStore(checkpointer)
-	if err != nil {
-		if checkpointer != nil {
-			checkpointer.Close()
-		}
-		return nil, fmt.Errorf("failed to initialize pod config store: %v", err)
-	}
-	plugin.podConfigStore = store
 
 	driverPluginPath := filepath.Join(plugin.kubeletRootDir, "plugins", driverName)
 	err = os.MkdirAll(driverPluginPath, 0750)
@@ -367,11 +351,6 @@ func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
 	ctxCancel()
 
 	np.nriPlugin.Stop()
-
-	// Close the pod config store.
-	if err := np.podConfigStore.Close(); err != nil {
-		klog.Errorf("Failed to close pod config database: %v", err)
-	}
 
 	klog.Info("Driver stopped.")
 }
