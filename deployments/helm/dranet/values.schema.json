@@ -100,7 +100,7 @@
         },
         "cloudProviderHint": {
           "type": "string",
-          "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "webhook", "NONE"],
+          "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "CKS", "webhook", "NONE"],
           "description": "Hint for the cloud provider plugin; auto-detected if unset"
         },
         "profileProvider": {

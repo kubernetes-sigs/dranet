@@ -23,6 +23,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/coreweave"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 )
 
@@ -153,7 +158,7 @@ func TestSetupProviders(t *testing.T) {
 				endpoint = srv.URL
 			}
 
-			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint)
+			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint, discovery.Dependencies{})
 
 			if (err != nil) != tt.expectErr {
 				t.Errorf("expected error: %v, got: %v", tt.expectErr, err)
@@ -167,5 +172,30 @@ func TestSetupProviders(t *testing.T) {
 				t.Errorf("expected profProv: %v, got: %v", tt.expectProfProv, profProv != nil)
 			}
 		})
+	}
+}
+
+func TestSetupProvidersCKS(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "cks-node",
+		Labels: map[string]string{
+			coreweave.LabelCKSCluster:   "use15",
+			coreweave.LabelFabricFlavor: "infiniband",
+		},
+	}}
+	dependencies := discovery.Dependencies{
+		Nodes:    fake.NewSimpleClientset(node).CoreV1().Nodes(),
+		NodeName: node.Name,
+	}
+
+	cloudInstance, profileProvider, err := setupProviders(context.Background(), "CKS", "cloud", "", dependencies)
+	if err != nil {
+		t.Fatalf("setupProviders() error = %v", err)
+	}
+	if _, ok := cloudInstance.(*coreweave.Instance); !ok {
+		t.Fatalf("setupProviders() cloud instance = %T, want *coreweave.Instance", cloudInstance)
+	}
+	if profileProvider != nil {
+		t.Fatalf("setupProviders() profile provider = %T, want nil", profileProvider)
 	}
 }
