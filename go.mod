@@ -31,15 +31,15 @@ require (
 	golang.org/x/time v0.15.0
 	google.golang.org/api v0.293.0
 	google.golang.org/protobuf v1.36.12
-	k8s.io/api v0.37.0-rc.0
-	k8s.io/apimachinery v0.37.0-rc.0
-	k8s.io/client-go v0.37.0-rc.0
+	k8s.io/api v0.38.0-alpha.0
+	k8s.io/apimachinery v0.38.0-alpha.0
+	k8s.io/client-go v0.38.0-alpha.0
 	k8s.io/cloud-provider-gcp v0.0.0-20250326051131-7056e3facd39
-	k8s.io/component-base v0.37.0-rc.0
-	k8s.io/component-helpers v0.37.0-rc.0
-	k8s.io/dynamic-resource-allocation v0.37.0-rc.0
+	k8s.io/component-base v0.38.0-alpha.0
+	k8s.io/component-helpers v0.38.0-alpha.0
+	k8s.io/dynamic-resource-allocation v0.38.0-alpha.0
 	k8s.io/klog/v2 v2.140.0
-	k8s.io/kubelet v0.37.0-rc.0
+	k8s.io/kubelet v0.38.0-alpha.0
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
 )
