@@ -158,7 +158,11 @@ func TestSetupProviders(t *testing.T) {
 				endpoint = srv.URL
 			}
 
-			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint, discovery.Dependencies{})
+			cloudInst, profProv, err := setupProviders(ctx, providerOptions{
+				cloudProviderHint: tt.cloudProviderHint,
+				profileProvider:   tt.profileProvider,
+				webhookURL:        endpoint,
+			})
 
 			if (err != nil) != tt.expectErr {
 				t.Errorf("expected error: %v, got: %v", tt.expectErr, err)
@@ -184,11 +188,15 @@ func TestSetupProvidersCKS(t *testing.T) {
 		},
 	}}
 	dependencies := discovery.Dependencies{
-		Nodes:    fake.NewSimpleClientset(node).CoreV1().Nodes(),
-		NodeName: node.Name,
+		NodeClient: fake.NewSimpleClientset(node).CoreV1().Nodes(),
+		NodeName:   node.Name,
 	}
 
-	cloudInstance, profileProvider, err := setupProviders(context.Background(), "CKS", "cloud", "", dependencies)
+	cloudInstance, profileProvider, err := setupProviders(context.Background(), providerOptions{
+		cloudProviderHint: "CKS",
+		profileProvider:   "cloud",
+		dependencies:      dependencies,
+	})
 	if err != nil {
 		t.Fatalf("setupProviders() error = %v", err)
 	}

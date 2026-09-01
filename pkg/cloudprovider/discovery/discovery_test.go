@@ -34,8 +34,8 @@ func TestDiscoverCloudProviderDetectsCKS(t *testing.T) {
 		},
 	}}
 	dependencies := Dependencies{
-		Nodes:    fake.NewSimpleClientset(node).CoreV1().Nodes(),
-		NodeName: node.Name,
+		NodeClient: fake.NewSimpleClientset(node).CoreV1().Nodes(),
+		NodeName:   node.Name,
 	}
 
 	if got := DiscoverCloudProviderWithDependencies(context.Background(), "", dependencies); got != CloudProviderHintCKS {
@@ -53,8 +53,8 @@ func TestGetInstancePropertiesCKS(t *testing.T) {
 		},
 	}}
 	dependencies := Dependencies{
-		Nodes:    fake.NewSimpleClientset(node).CoreV1().Nodes(),
-		NodeName: node.Name,
+		NodeClient: fake.NewSimpleClientset(node).CoreV1().Nodes(),
+		NodeName:   node.Name,
 	}
 
 	instance, err := GetInstancePropertiesWithDependencies(context.Background(), CloudProviderHintCKS, "", dependencies)

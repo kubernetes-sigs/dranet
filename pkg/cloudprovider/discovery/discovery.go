@@ -48,8 +48,8 @@ const (
 // Dependencies contains Kubernetes-local inputs used by providers that do not
 // expose a conventional instance metadata service.
 type Dependencies struct {
-	Nodes    corev1client.NodeInterface
-	NodeName string
+	NodeClient corev1client.NodeInterface
+	NodeName   string
 }
 
 // DiscoverCloudProvider probes the environment to detect which cloud provider DRANET is running on.
@@ -60,11 +60,6 @@ func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProvider
 // DiscoverCloudProviderWithDependencies probes the environment using additional
 // Kubernetes-local provider inputs when available.
 func DiscoverCloudProviderWithDependencies(ctx context.Context, webhookURL string, dependencies Dependencies) CloudProviderHint {
-	// CKS is checked first because its authoritative metadata is already in the
-	// Kubernetes Node object. Avoid slower link-local metadata probes on CKS.
-	if coreweave.OnCKS(ctx, dependencies.Nodes, dependencies.NodeName) {
-		return CloudProviderHintCKS
-	}
 	if metadata.OnGCE() {
 		return CloudProviderHintGCE
 	}
@@ -79,6 +74,9 @@ func DiscoverCloudProviderWithDependencies(ctx context.Context, webhookURL strin
 	}
 	if alibaba.OnAlibaba(ctx) {
 		return CloudProviderHintAlibaba
+	}
+	if coreweave.OnCKS(ctx, dependencies.NodeClient, dependencies.NodeName) {
+		return CloudProviderHintCKS
 	}
 	if webhookURL != "" && webhook.OnWebhook(ctx, webhookURL) {
 		return CloudProviderHintWebhook
@@ -106,7 +104,7 @@ func GetInstancePropertiesWithDependencies(ctx context.Context, hint CloudProvid
 	case CloudProviderHintAlibaba:
 		return alibaba.GetInstance(ctx)
 	case CloudProviderHintCKS:
-		return coreweave.GetInstance(ctx, dependencies.Nodes, dependencies.NodeName)
+		return coreweave.GetInstance(ctx, dependencies.NodeClient, dependencies.NodeName)
 	case CloudProviderHintWebhook:
 		if webhookURL == "" {
 			return nil, fmt.Errorf("--webhook-url is required when using the webhook cloud provider")

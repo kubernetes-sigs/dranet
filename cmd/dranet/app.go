@@ -192,11 +192,16 @@ func main() {
 		}
 		opts = append(opts, driver.WithFilter(prg))
 	}
-	providerDependencies := discovery.Dependencies{
-		Nodes:    clientset.CoreV1().Nodes(),
-		NodeName: nodeName,
+	providerOpts := providerOptions{
+		cloudProviderHint: cloudProviderHint,
+		profileProvider:   profileProvider,
+		webhookURL:        webhookURL,
+		dependencies: discovery.Dependencies{
+			NodeClient: clientset.CoreV1().Nodes(),
+			NodeName:   nodeName,
+		},
 	}
-	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL, providerDependencies)
+	cloudInst, profProv, err := setupProviders(ctx, providerOpts)
 	if err != nil {
 		klog.Fatalf("failed to setup providers: %v", err)
 	}
@@ -253,28 +258,35 @@ func printVersion() {
 	klog.Infof("dranet go %s build: %s time: %s", info.GoVersion, vcsRevision, vcsTime)
 }
 
-func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string, dependencies discovery.Dependencies) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
+type providerOptions struct {
+	cloudProviderHint string
+	profileProvider   string
+	webhookURL        string
+	dependencies      discovery.Dependencies
+}
+
+func setupProviders(ctx context.Context, opts providerOptions) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
 	var cloudInst cloudprovider.CloudInstance
 	var profProv cloudprovider.ProfileProvider
 	var err error
 
 	var hint discovery.CloudProviderHint
 	// Auto-discover cloud provider if not explicitly set
-	if cloudProviderHint == "" {
-		hint = discovery.DiscoverCloudProviderWithDependencies(ctx, webhookURL, dependencies)
+	if opts.cloudProviderHint == "" {
+		hint = discovery.DiscoverCloudProviderWithDependencies(ctx, opts.webhookURL, opts.dependencies)
 	} else {
-		hint = discovery.CloudProviderHint(cloudProviderHint)
+		hint = discovery.CloudProviderHint(opts.cloudProviderHint)
 	}
 
 	// Setup the Underlay (Hardware Discovery / Cloud Instance Info)
-	cloudInst, err = discovery.GetInstancePropertiesWithDependencies(ctx, hint, webhookURL, dependencies)
+	cloudInst, err = discovery.GetInstancePropertiesWithDependencies(ctx, hint, opts.webhookURL, opts.dependencies)
 	if err != nil {
 		klog.Infof("failed to initialize cloud provider %q: %v", hint, err)
 		cloudInst = nil
 	}
 
 	// Setup the Overlay (Profile Provider / User Intent)
-	switch profileProvider {
+	switch opts.profileProvider {
 	case "cloud":
 		if p, ok := cloudInst.(cloudprovider.ProfileProvider); ok {
 			profProv = p
@@ -282,27 +294,27 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 			profProv = nil
 		}
 	case "webhook":
-		if webhookURL == "" {
+		if opts.webhookURL == "" {
 			return nil, nil, fmt.Errorf("--webhook-url is required when using the webhook profile provider")
 		}
 		var wh *webhook.WebhookProvider
 		if existing, ok := cloudInst.(*webhook.WebhookProvider); ok {
 			wh = existing
 		} else {
-			wh, err = webhook.NewWebhookProvider(ctx, webhookURL)
+			wh, err = webhook.NewWebhookProvider(ctx, opts.webhookURL)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to initialize webhook profile provider: %v", err)
 			}
 		}
 
 		if !wh.HasProfileProvider() {
-			return nil, nil, fmt.Errorf("webhook at %q does not support ProfileProvider capability", webhookURL)
+			return nil, nil, fmt.Errorf("webhook at %q does not support ProfileProvider capability", opts.webhookURL)
 		}
 		profProv = wh
 	case "none":
 		profProv = nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported profile provider: %s", profileProvider)
+		return nil, nil, fmt.Errorf("unsupported profile provider: %s", opts.profileProvider)
 	}
 
 	return cloudInst, profProv, nil
