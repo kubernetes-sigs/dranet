@@ -101,7 +101,7 @@ func OnCKS(ctx context.Context, nodes corev1client.NodeInterface, nodeName strin
 // device mapping used by CKS per-interface topology labels.
 func GetInstance(ctx context.Context, nodes corev1client.NodeInterface, nodeName string) (cloudprovider.CloudInstance, error) {
 	if nodes == nil {
-		return nil, fmt.Errorf("Kubernetes Node client is required for CKS")
+		return nil, fmt.Errorf("kubernetes Node client is required for CKS")
 	}
 	if nodeName == "" {
 		return nil, fmt.Errorf("node name is required for CKS")
@@ -112,7 +112,7 @@ func GetInstance(ctx context.Context, nodes corev1client.NodeInterface, nodeName
 		return nil, fmt.Errorf("get CKS Node %q: %w", nodeName, err)
 	}
 	if node.Labels[LabelCKSCluster] == "" {
-		return nil, fmt.Errorf("Node %q does not have the %q CKS label", nodeName, LabelCKSCluster)
+		return nil, fmt.Errorf("node %q does not have the %q CKS label", nodeName, LabelCKSCluster)
 	}
 
 	labels := make(map[string]string, len(node.Labels))
