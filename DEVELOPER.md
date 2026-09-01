@@ -80,6 +80,50 @@ kubectl -n kube-system rollout restart ds dranet
 daemonset.apps/dranet restarted
 ```
 
+## Checkpoint database: upgrades and rollbacks
+
+DRANET checkpoints per-device state (`DeviceConfig`) to a node-local bbolt
+database (`--db-path`, default `/var/run/dranet/dranet.db`) so that state that
+cannot be rebuilt from the system — for example a DHCP lease that must be
+released at unprepare time — survives daemon restarts. The database is
+single-writer (bbolt holds an exclusive file lock) and strictly node-local:
+nodes upgrade independently and a mixed-version cluster needs no coordination.
+
+The on-disk layout is versioned through the `meta/schemaVersion` key
+(`checkpointSchemaVersion` in `pkg/driver/pod_device_config_bolt.go`). A
+database without the `meta` bucket predates versioning and is treated as
+version 1. Migrations run one version at a time inside a single bbolt
+transaction together with the version stamp, so an interrupted migration
+rolls back as a unit and is retried on the next start.
+
+### Changing the checkpoint format
+
+`TestDeviceConfigWireFormatGolden` pins the exact bytes on disk. When it fails
+you have two options, in order of preference:
+
+1. **Make the change additive**: new optional fields (`omitempty` pointers)
+   need no version bump. Old entries load with the field unset; older daemons
+   ignore the unknown key. Update `fullDeviceConfig()` and regenerate the
+   golden.
+2. **Bump `checkpointSchemaVersion` and add a `checkpointMigrations` entry**
+   for any non-additive change (renaming, moving or retyping keys, bucket
+   layout changes). Migrations are kept forever, so any old database upgrades
+   directly to any newer daemon.
+
+### Behavior matrix
+
+| Scenario | Behavior |
+|---|---|
+| Upgrade, additive change | Old entries load with new fields unset. Entries are only rewritten on prepare, so mixed shapes coexist harmlessly. |
+| Upgrade, schema bump | Migration chain runs at first open, atomically with the version stamp. Crash mid-migration rolls back and retries on next start. |
+| Rollback, same schema | Unknown keys are ignored in memory but reads never rewrite entries, so newer state stays on disk and a re-upgrade recovers it. Only claims re-prepared while rolled back lose the newer fields. |
+| Rollback across a bump | The daemon refuses to open the database (before any mutation) and crash-loops on that node. Recover by rolling forward, or delete the database file to consciously discard the state (DHCP leases then expire on their own; unprepare steps for already-prepared claims are skipped). |
+| Old/new pod overlap during a rolling update | The second open fails on the file lock after a 1s timeout and the new pod restarts until the old one exits. No corruption is possible. |
+
+Every row is pinned by a test in
+`pkg/driver/pod_device_config_bolt_version_test.go`; change the behavior only
+together with the corresponding test.
+
 ## Troubleshooting
 
 ```
