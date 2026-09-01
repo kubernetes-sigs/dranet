@@ -52,6 +52,11 @@ type Dependencies struct {
 	NodeName   string
 }
 
+type cloudProviderProbe struct {
+	hint  CloudProviderHint
+	match func() bool
+}
+
 // DiscoverCloudProvider probes the environment to detect which cloud provider DRANET is running on.
 func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProviderHint {
 	return DiscoverCloudProviderWithDependencies(ctx, webhookURL, Dependencies{})
@@ -60,26 +65,30 @@ func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProvider
 // DiscoverCloudProviderWithDependencies probes the environment using additional
 // Kubernetes-local provider inputs when available.
 func DiscoverCloudProviderWithDependencies(ctx context.Context, webhookURL string, dependencies Dependencies) CloudProviderHint {
-	if metadata.OnGCE() {
-		return CloudProviderHintGCE
+	return detectCloudProvider(cloudProviderProbes(ctx, webhookURL, dependencies))
+}
+
+func cloudProviderProbes(ctx context.Context, webhookURL string, dependencies Dependencies) []cloudProviderProbe {
+	return []cloudProviderProbe{
+		{hint: CloudProviderHintGCE, match: metadata.OnGCE},
+		{hint: CloudProviderHintAWS, match: func() bool { return aws.OnAWS(ctx) }},
+		{hint: CloudProviderHintAzure, match: func() bool { return azure.OnAzure(ctx) }},
+		{hint: CloudProviderHintOKE, match: func() bool { return oke.OnOKE(ctx) }},
+		{hint: CloudProviderHintAlibaba, match: func() bool { return alibaba.OnAlibaba(ctx) }},
+		{hint: CloudProviderHintCKS, match: func() bool {
+			return coreweave.OnCKS(ctx, dependencies.NodeClient, dependencies.NodeName)
+		}},
+		{hint: CloudProviderHintWebhook, match: func() bool {
+			return webhookURL != "" && webhook.OnWebhook(ctx, webhookURL)
+		}},
 	}
-	if aws.OnAWS(ctx) {
-		return CloudProviderHintAWS
-	}
-	if azure.OnAzure(ctx) {
-		return CloudProviderHintAzure
-	}
-	if oke.OnOKE(ctx) {
-		return CloudProviderHintOKE
-	}
-	if alibaba.OnAlibaba(ctx) {
-		return CloudProviderHintAlibaba
-	}
-	if coreweave.OnCKS(ctx, dependencies.NodeClient, dependencies.NodeName) {
-		return CloudProviderHintCKS
-	}
-	if webhookURL != "" && webhook.OnWebhook(ctx, webhookURL) {
-		return CloudProviderHintWebhook
+}
+
+func detectCloudProvider(probes []cloudProviderProbe) CloudProviderHint {
+	for _, probe := range probes {
+		if probe.match() {
+			return probe.hint
+		}
 	}
 	return CloudProviderHintNone
 }

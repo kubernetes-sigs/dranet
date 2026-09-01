@@ -26,20 +26,36 @@ import (
 	"sigs.k8s.io/dranet/pkg/cloudprovider/coreweave"
 )
 
-func TestDiscoverCloudProviderDetectsCKS(t *testing.T) {
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
-		Name: "cks-node",
-		Labels: map[string]string{
-			coreweave.LabelCKSCluster: "use15",
-		},
-	}}
-	dependencies := Dependencies{
-		NodeClient: fake.NewSimpleClientset(node).CoreV1().Nodes(),
-		NodeName:   node.Name,
+func TestCloudProviderProbeOrder(t *testing.T) {
+	probes := cloudProviderProbes(context.Background(), "", Dependencies{})
+	want := []CloudProviderHint{
+		CloudProviderHintGCE,
+		CloudProviderHintAWS,
+		CloudProviderHintAzure,
+		CloudProviderHintOKE,
+		CloudProviderHintAlibaba,
+		CloudProviderHintCKS,
+		CloudProviderHintWebhook,
 	}
 
-	if got := DiscoverCloudProviderWithDependencies(context.Background(), "", dependencies); got != CloudProviderHintCKS {
-		t.Fatalf("DiscoverCloudProviderWithDependencies() = %q, want %q", got, CloudProviderHintCKS)
+	if len(probes) != len(want) {
+		t.Fatalf("cloudProviderProbes() returned %d probes, want %d", len(probes), len(want))
+	}
+	for i := range want {
+		if probes[i].hint != want[i] {
+			t.Errorf("cloudProviderProbes()[%d].hint = %q, want %q", i, probes[i].hint, want[i])
+		}
+	}
+}
+
+func TestDetectCloudProviderReturnsFirstMatch(t *testing.T) {
+	probes := []cloudProviderProbe{
+		{hint: CloudProviderHintAzure, match: func() bool { return true }},
+		{hint: CloudProviderHintCKS, match: func() bool { return true }},
+	}
+
+	if got := detectCloudProvider(probes); got != CloudProviderHintAzure {
+		t.Fatalf("detectCloudProvider() = %q, want %q", got, CloudProviderHintAzure)
 	}
 }
 
