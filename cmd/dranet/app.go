@@ -273,13 +273,13 @@ func setupProviders(ctx context.Context, opts providerOptions) (cloudprovider.Cl
 	var hint discovery.CloudProviderHint
 	// Auto-discover cloud provider if not explicitly set
 	if opts.cloudProviderHint == "" {
-		hint = discovery.DiscoverCloudProviderWithDependencies(ctx, opts.webhookURL, opts.dependencies)
+		hint = discovery.DiscoverCloudProvider(ctx, opts.webhookURL, opts.dependencies)
 	} else {
 		hint = discovery.CloudProviderHint(opts.cloudProviderHint)
 	}
 
 	// Setup the Underlay (Hardware Discovery / Cloud Instance Info)
-	cloudInst, err = discovery.GetInstancePropertiesWithDependencies(ctx, hint, opts.webhookURL, opts.dependencies)
+	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, opts.webhookURL, opts.dependencies)
 	if err != nil {
 		klog.Infof("failed to initialize cloud provider %q: %v", hint, err)
 		cloudInst = nil

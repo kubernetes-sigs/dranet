@@ -57,14 +57,9 @@ type cloudProviderProbe struct {
 	match func() bool
 }
 
-// DiscoverCloudProvider probes the environment to detect which cloud provider DRANET is running on.
-func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProviderHint {
-	return DiscoverCloudProviderWithDependencies(ctx, webhookURL, Dependencies{})
-}
-
-// DiscoverCloudProviderWithDependencies probes the environment using additional
-// Kubernetes-local provider inputs when available.
-func DiscoverCloudProviderWithDependencies(ctx context.Context, webhookURL string, dependencies Dependencies) CloudProviderHint {
+// DiscoverCloudProvider probes the environment using additional Kubernetes-local
+// provider inputs when available to detect which cloud provider DRANET is running on.
+func DiscoverCloudProvider(ctx context.Context, webhookURL string, dependencies Dependencies) CloudProviderHint {
 	return detectCloudProvider(cloudProviderProbes(ctx, webhookURL, dependencies))
 }
 
@@ -93,14 +88,9 @@ func detectCloudProvider(probes []cloudProviderProbe) CloudProviderHint {
 	return CloudProviderHintNone
 }
 
-// GetInstanceProperties initializes and returns the specified cloud provider instance.
-func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string) (cloudprovider.CloudInstance, error) {
-	return GetInstancePropertiesWithDependencies(ctx, hint, webhookURL, Dependencies{})
-}
-
-// GetInstancePropertiesWithDependencies initializes the specified cloud provider
-// using additional Kubernetes-local provider inputs when available.
-func GetInstancePropertiesWithDependencies(ctx context.Context, hint CloudProviderHint, webhookURL string, dependencies Dependencies) (cloudprovider.CloudInstance, error) {
+// GetInstanceProperties initializes the specified cloud provider using additional
+// Kubernetes-local provider inputs when available.
+func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string, dependencies Dependencies) (cloudprovider.CloudInstance, error) {
 	switch hint {
 	case CloudProviderHintGCE:
 		return gce.GetInstance(ctx)

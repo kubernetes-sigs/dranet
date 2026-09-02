@@ -73,17 +73,17 @@ func TestGetInstancePropertiesCKS(t *testing.T) {
 		NodeName:   node.Name,
 	}
 
-	instance, err := GetInstancePropertiesWithDependencies(context.Background(), CloudProviderHintCKS, "", dependencies)
+	instance, err := GetInstanceProperties(context.Background(), CloudProviderHintCKS, "", dependencies)
 	if err != nil {
-		t.Fatalf("GetInstancePropertiesWithDependencies() error = %v", err)
+		t.Fatalf("GetInstanceProperties() error = %v", err)
 	}
 	if _, ok := instance.(*coreweave.Instance); !ok {
-		t.Fatalf("GetInstancePropertiesWithDependencies() = %T, want *coreweave.Instance", instance)
+		t.Fatalf("GetInstanceProperties() = %T, want *coreweave.Instance", instance)
 	}
 }
 
 func TestGetInstancePropertiesCKSRequiresDependencies(t *testing.T) {
-	if _, err := GetInstanceProperties(context.Background(), CloudProviderHintCKS, ""); err == nil {
+	if _, err := GetInstanceProperties(context.Background(), CloudProviderHintCKS, "", Dependencies{}); err == nil {
 		t.Fatal("GetInstanceProperties() error = nil, want missing Kubernetes dependency error")
 	}
 }
