@@ -4,9 +4,7 @@ date: 2024-12-17T14:47:05Z
 weight: 1
 ---
 
-`DRANET` depends on the Kubernetes feature [Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/), that is beta (disabled by default in Kubernetes ∂v1.32).
-
-In order to enable DRA you need to enable both the [feature gates and the API groups](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#enabling-dynamic-resource-allocation).
+`DRANET` depends on the Kubernetes feature [Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/), that is stable and enabled by default since Kubernetes v1.35.
 
 ## Kubernetes cluster with DRA
 
@@ -21,17 +19,11 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
-  image: kindest/node:v1.33.1
+  image: kindest/node:v1.37.0
 - role: worker
-  image: kindest/node:v1.33.1
+  image: kindest/node:v1.37.0
 - role: worker
-  image: kindest/node:v1.33.1
-featureGates:
-  # Enable the corresponding DRA feature gates
-  DynamicResourceAllocation: true
-  DRAResourceClaimDeviceStatus: true
-runtimeConfig:
-  api/beta : true
+  image: kindest/node:v1.37.0
 ```
 
 ```
@@ -46,9 +38,14 @@ For instructions on setting up DRA on GKE, refer to the official documentation:
 A quick and easy way to find if DRA is enabled is by checking the metrics in the kube-apiserver
 
 ```sh
-kubectl get --raw /metrics | grep kubernetes_feature_enabled | grep DynamicResourceAllocation
+kubectl api-resources --api-group=resource.k8s.io
 
-kubernetes_feature_enabled{name="DynamicResourceAllocation",stage="BETA"} 1
+NAME                     SHORTNAMES   APIVERSION           NAMESPACED   KIND
+deviceclasses                         resource.k8s.io/v1   false        DeviceClass
+devicetaintrules                      resource.k8s.io/v1   false        DeviceTaintRule
+resourceclaims                        resource.k8s.io/v1   true         ResourceClaim
+resourceclaimtemplates                resource.k8s.io/v1   true         ResourceClaimTemplate
+resourceslices                        resource.k8s.io/v1   false        ResourceSlice
 ```
 
 ## Installation

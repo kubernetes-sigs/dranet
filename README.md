@@ -48,10 +48,7 @@ Works](https://dranet.sigs.k8s.io/docs/concepts/howitworks/).
 To get started with DRANET, your Kubernetes cluster needs to have [Dynamic
 Resource Allocation (DRA)
 enabled](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/).
-DRA is beta and is disabled by default in Kubernetes v1.32. You will need to
-enable both the [feature gates and the API
-groups](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#enabling-dynamic-resource-allocation)
-for DRA until it reaches GA.
+DRA is stable since Kubernetes v1.35 and enabled by default. 
 
 ![](site/static/images/dranet.gif)
 
@@ -68,11 +65,11 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
-  image: kindest/node:v1.37
+  image: kindest/node:v1.37.0
 - role: worker
-  image: kindest/node:v1.37
+  image: kindest/node:v1.37.0
 - role: worker
-  image: kindest/node:v1.37
+  image: kindest/node:v1.37.0
 ```
 
 Then to create the cluster:
