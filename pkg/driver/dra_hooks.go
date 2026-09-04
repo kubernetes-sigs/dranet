@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"sort"
 	"strings"
@@ -404,6 +405,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				errorList = append(errorList, err)
 				continue
 			}
+			clearStaleRouteSources(routes, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses)
 			deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 
 			// If VRF is enabled, we do not need to copy the rules from the host
@@ -702,6 +704,26 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 		}
 	}
 	return routes, tables, nil
+}
+
+// clearStaleRouteSources drops the preferred source of copied host routes when
+// that address is not among the addresses the interface gets in the Pod. The
+// kernel rejects a route whose prefsrc is not a local address with EINVAL, and
+// the Pod may get different addresses than the host had (DHCP, or addresses
+// set in the claim). Without a source the kernel picks one itself.
+func clearStaleRouteSources(routes []apis.RouteConfig, addresses []string) {
+	podIPs := sets.New[string]()
+	for _, addr := range addresses {
+		if ip, _, err := net.ParseCIDR(addr); err == nil {
+			podIPs.Insert(ip.String())
+		}
+	}
+	for i := range routes {
+		if routes[i].Source != "" && !podIPs.Has(routes[i].Source) {
+			klog.V(4).Infof("Clearing source %s of route %s: address not assigned in the Pod", routes[i].Source, routes[i].Destination)
+			routes[i].Source = ""
+		}
+	}
 }
 
 // getDeviceNetworkConfig merges the user configuration with the cloud provider configuration and resolves the dynamic profile.

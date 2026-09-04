@@ -1416,3 +1416,59 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 		})
 	}
 }
+
+func TestClearStaleRouteSources(t *testing.T) {
+	testCases := []struct {
+		name        string
+		routes      []apis.RouteConfig
+		addresses   []string
+		wantSources []string
+	}{
+		{
+			name:        "source not assigned in the pod is cleared",
+			routes:      []apis.RouteConfig{{Destination: "172.17.14.0/24", Source: "172.17.14.28"}},
+			addresses:   []string{"172.17.14.101/24"},
+			wantSources: []string{""},
+		},
+		{
+			name:        "source assigned in the pod is kept",
+			routes:      []apis.RouteConfig{{Destination: "172.17.14.0/24", Source: "172.17.14.28"}},
+			addresses:   []string{"172.17.14.28/24"},
+			wantSources: []string{"172.17.14.28"},
+		},
+		{
+			name:        "route without source is untouched",
+			routes:      []apis.RouteConfig{{Destination: "0.0.0.0/0", Gateway: "172.17.14.1"}},
+			addresses:   nil,
+			wantSources: []string{""},
+		},
+		{
+			name:        "source is cleared when the pod has no addresses",
+			routes:      []apis.RouteConfig{{Destination: "10.0.0.0/8", Gateway: "172.17.14.1", Source: "172.17.14.28"}},
+			addresses:   nil,
+			wantSources: []string{""},
+		},
+		{
+			name:        "IPv6 source matches a non-canonical pod address",
+			routes:      []apis.RouteConfig{{Destination: "fd00:10::/64", Source: "fd00:10::1c"}},
+			addresses:   []string{"fd00:0010:0000:0000::001c/64"},
+			wantSources: []string{"fd00:10::1c"},
+		},
+		{
+			name:        "IPv6 source not assigned in the pod is cleared",
+			routes:      []apis.RouteConfig{{Destination: "fd00:10::/64", Source: "fd00:10::1c"}},
+			addresses:   []string{"fd00:10::65/64"},
+			wantSources: []string{""},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearStaleRouteSources(tc.routes, tc.addresses)
+			for i, want := range tc.wantSources {
+				if tc.routes[i].Source != want {
+					t.Errorf("route %d source = %q, want %q", i, tc.routes[i].Source, want)
+				}
+			}
+		})
+	}
+}
