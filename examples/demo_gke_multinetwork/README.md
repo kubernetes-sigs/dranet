@@ -5,13 +5,11 @@ connect to these GCE Networks.
 
 1. Create a cluster
 
-DRA is beta in 1.32, so it requires to explicitly enable the feature.
-
 ```sh
 PROJECT="test-project"
 CLUSTER="test-cluster"
 ZONE="us-central1-c"
-VERSION="1.34"
+VERSION="1.36"
 
 gcloud container clusters create "${CLUSTER}" \
     --cluster-version="${VERSION}" \
