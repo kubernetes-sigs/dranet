@@ -341,12 +341,15 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			klog.V(2).Infof("trying to get network configuration via DHCP")
 			contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
-			ip, routes, err := getDHCP(contextCancel, ifName)
+			ip, routes, lease, err := getDHCP(contextCancel, ifName)
 			if err != nil {
 				errorList = append(errorList, fmt.Errorf("fail to get configuration via DHCP for %s: %w", ifName, err))
 			} else {
 				deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
 				deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
+				if lease != nil {
+					deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
+				}
 			}
 		} else if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
 			// For a passthrough interface with no custom addresses and no DHCP, then use the existing ones
@@ -545,6 +548,20 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 		}
 		for deviceName, devCfg := range podCfg.DeviceConfigs {
 			if devCfg.Claim.Namespace == claim.Namespace && devCfg.Claim.Name == claim.Name {
+				// Give the address back: the client is one-shot, so without
+				// this the server holds it for the whole valid-lifetime even
+				// though nothing uses it any more.
+				if state := devCfg.NetworkInterfaceStateInPod; state != nil && state.DHCPLease != nil {
+					releaseCtx, cancel := context.WithTimeout(context.Background(), dhcpReleaseTimeout)
+					ifName := devCfg.NetworkInterfaceConfigInHost.Interface.Name
+					if err := releaseDHCP(releaseCtx, ifName, state.DHCPLease); err != nil {
+						// Non-fatal: the lease expires on its own, which is the
+						// behaviour without this release. Failing here would
+						// instead block the pod's teardown.
+						klog.Infof("failed to release DHCP lease for claim %v device %s: %v", claim.NamespacedName, deviceName, err)
+					}
+					cancel()
+				}
 				if devCfg.NetworkInterfaceConfigInPod.Profile != "" {
 					if err := np.netdb.ReleaseProfileConfig(deviceName, claim.UID, &devCfg.NetworkInterfaceConfigInPod); err != nil {
 						klog.Errorf("failed to release profile config for claim %v: %v", claim.NamespacedName, err)

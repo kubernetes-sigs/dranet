@@ -63,9 +63,44 @@ type DeviceConfig struct {
 	// Pod's namespace.
 	NetworkInterfaceConfigInPod apis.NetworkConfig `json:"networkInterfaceConfigInPod"`
 
+	// NetworkInterfaceStateInPod holds runtime state the driver derived from
+	// NetworkInterfaceConfigInPod at prepare time and needs back at unprepare
+	// time. It is never part of the user claim schema (pkg/apis). Checkpointed
+	// with the rest of the device config so a daemon restart mid-claim keeps it.
+	NetworkInterfaceStateInPod *NetworkInterfaceState `json:"networkInterfaceStateInPod,omitempty"`
+
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+}
+
+// NetworkInterfaceState is the driver-recorded runtime counterpart of an
+// interface's apis.NetworkConfig: values that only exist once the config has
+// been applied, so they cannot be expressed or rebuilt from the config itself.
+type NetworkInterfaceState struct {
+	// DHCPLease records the lease this claim took, so it can be released when
+	// the claim goes away. The DHCP client is one-shot: without the release the
+	// server keeps the address reserved for the whole valid-lifetime, and fast
+	// claim churn can exhaust the pool long before that.
+	DHCPLease *DHCPLeaseRecord `json:"dhcpLease,omitempty"`
+}
+
+// DHCPLeaseRecord is what a DHCPRELEASE has to carry, taken from the DHCPACK
+// that granted the lease: the server keys the lease by the address and the
+// hardware address, and the release is unicast to the server identifier
+// (RFC 2131 Table 5, §4.4.4).
+type DHCPLeaseRecord struct {
+	// ClientIP is the address the server assigned (yiaddr of the ACK).
+	ClientIP string `json:"clientIP"`
+
+	// ClientMAC is the hardware address the lease was granted to (chaddr of
+	// the ACK). It is recorded rather than read back from the interface at
+	// release time, because the interface's MAC may have changed since.
+	ClientMAC string `json:"clientMAC"`
+
+	// ServerID is the server identifier from the ACK, the address the release
+	// is unicast to.
+	ServerID string `json:"serverID"`
 }
 
 // RDMAConfig contains parameters for setting up an RDMA device associated
