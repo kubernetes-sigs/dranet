@@ -8,6 +8,9 @@ function setup_suite {
   export CLUSTER_NAME="dranet-test-cluster"
   export IMAGE_NAME="registry.k8s.io/networking/dranet"
 
+  # Build test helper binaries
+  make -C "$BATS_TEST_DIRNAME"/.. build-mockpci
+
   # Build the image
   docker build -t "$IMAGE_NAME":test -f Dockerfile "$BATS_TEST_DIRNAME"/.. --load
 
@@ -34,14 +37,14 @@ function setup_suite {
 
   kind load docker-image "$IMAGE_NAME":test --name "$CLUSTER_NAME"
 
-  # Creating BPF and cgroup mounts on the Kind nodes.
+  # Creating BPF mounts on the Kind nodes.
   NODES=$(kind get nodes --name ${CLUSTER_NAME})
   for node in $NODES; do
     docker exec "$node" mount -t bpf bpffs /sys/fs/bpf
     docker exec "$node" mount --make-shared /sys/fs/bpf
   done
 
-  _install=$(sed -e s#"$IMAGE_NAME".*#"$IMAGE_NAME":test# -e 's/--v=4/--v=4\n        - --filter=/' < "$BATS_TEST_DIRNAME"/../install.yaml)
+  _install=$(sed -e s#"$IMAGE_NAME".*#"$IMAGE_NAME":test# -e 's/--v=4/--v=4\n        - --sysfs-root=\/var\/run\/dranet\/sysfs\/sys\n        - --filter=/' < "$BATS_TEST_DIRNAME"/../install.yaml)
   printf '%s' "${_install}" | kubectl apply -f -
   kubectl wait --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet
 

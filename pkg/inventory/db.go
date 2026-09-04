@@ -105,9 +105,18 @@ type DB struct {
 	// deviceAttributeMachineModifiers is used to redirect the upstream
 	// topology helpers to a synthetic sysfs in unit tests.
 	deviceAttributeMachineModifiers []deviceattribute.MachineModifier
+
+	sysfsRoot string
 }
 
 type Option func(*DB)
+
+func WithSysfsRoot(root string) Option {
+	return func(db *DB) {
+		db.sysfsRoot = root
+		SetSysfsRoot(root)
+	}
+}
 
 func WithRateLimiter(limiter *rate.Limiter) Option {
 	return func(db *DB) {
@@ -150,7 +159,7 @@ func WithProfileProvider(profProv cloudprovider.ProfileProvider) Option {
 
 func New(opts ...Option) *DB {
 	db := &DB{
-
+		sysfsRoot:         sysfsRoot,
 		deviceStore:       map[string]resourceapi.Device{},
 		deviceConfigStore: map[string]*apis.NetworkConfig{},
 		rateLimiter:       rate.NewLimiter(rate.Every(defaultMinPollInterval), defaultPollBurst),
@@ -212,9 +221,18 @@ func (db *DB) Run(ctx context.Context) error {
 // It discovers PCI, network, and RDMA devices, adds cloud attributes,
 // filters out default interfaces, and updates the device store.
 func (db *DB) scan() []resourceapi.Device {
-	pciInfo, err := ghw.PCI(
-		ghw.WithDisableTools(),
-	)
+	var pciInfo *ghw.PCIInfo
+	var err error
+	if chroot := ghwChroot(); chroot != "" {
+		pciInfo, err = ghw.PCI(
+			ghw.WithDisableTools(),
+			ghw.WithChroot(chroot),
+		)
+	} else {
+		pciInfo, err = ghw.PCI(
+			ghw.WithDisableTools(),
+		)
+	}
 	if err != nil {
 		klog.Errorf("Could not get PCI devices: %v", err)
 	}
