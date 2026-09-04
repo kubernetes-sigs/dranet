@@ -17,33 +17,33 @@ limitations under the License.
 package apis
 
 import (
+	"maps"
+	"slices"
+
 	"dario.cat/mergo"
+	"k8s.io/utils/ptr"
 )
 
-// MergeNetworkConfig merges a cloud provider configuration into a user configuration.
-// It returns a new *NetworkConfig with the merged result.
-// It follows a strict "User wins" strategy: any scalar setting defined in the user config
-// overrides the cloud provider config. For slices, the two configurations are combined,
-// but duplicates are resolved in favor of the user config.
-// The user parameter is assumed to be non-nil. The cloud parameter can be nil, resulting in
-// a copy of the user parameter.
+// MergeNetworkConfig combines a provider configuration with a user configuration.
+// A nil input is treated as an empty configuration.
+// User values, including explicit pointer zero values, override provider values.
+// Slices are combined, duplicates keep user values, and neither input is changed.
 func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
+	if user == nil {
+		user = &NetworkConfig{}
+	}
 	if cloud == nil {
-		copy := *user
-		return &copy
+		cloud = &NetworkConfig{}
 	}
 
-	merged := &NetworkConfig{}
-
-	// Start with the cloud configuration as the base
-	if err := mergo.Merge(merged, cloud); err != nil {
-		return &NetworkConfig{} // or log error? We'll just return nil or early? Let's just return what we have.
-	}
+	merged := deepCopyNetworkConfig(cloud)
+	userCopy := deepCopyNetworkConfig(user)
 
 	// Merge the user configuration on top, overriding cloud settings and appending slices.
-	if err := mergo.Merge(merged, user, mergo.WithOverride, mergo.WithAppendSlice); err != nil {
+	if err := mergo.Merge(merged, userCopy, mergo.WithOverride, mergo.WithAppendSlice); err != nil {
 		return &NetworkConfig{}
 	}
+	applyUserPointerOverrides(&merged.Interface, &userCopy.Interface)
 
 	// Deduplicate slices where order or uniqueness matters.
 	// For addresses, we just unique them.
@@ -62,6 +62,78 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 	}
 
 	return merged
+}
+
+func deepCopyNetworkConfig(config *NetworkConfig) *NetworkConfig {
+	if config == nil {
+		return nil
+	}
+
+	// Keep this copy in sync with mutable fields in types.go.
+	copy := *config
+	copy.Interface.Addresses = slices.Clone(config.Interface.Addresses)
+	copy.Interface.DHCP = clonePointer(config.Interface.DHCP)
+	copy.Interface.MTU = clonePointer(config.Interface.MTU)
+	copy.Interface.HardwareAddr = clonePointer(config.Interface.HardwareAddr)
+	copy.Interface.GSOMaxSize = clonePointer(config.Interface.GSOMaxSize)
+	copy.Interface.GROMaxSize = clonePointer(config.Interface.GROMaxSize)
+	copy.Interface.GSOIPv4MaxSize = clonePointer(config.Interface.GSOIPv4MaxSize)
+	copy.Interface.GROIPv4MaxSize = clonePointer(config.Interface.GROIPv4MaxSize)
+	copy.Interface.DisableEBPFPrograms = clonePointer(config.Interface.DisableEBPFPrograms)
+	copy.Interface.Forwarding = clonePointer(config.Interface.Forwarding)
+	copy.Interface.ARPIgnore = clonePointer(config.Interface.ARPIgnore)
+	copy.Interface.ARPAnnounce = clonePointer(config.Interface.ARPAnnounce)
+	if config.Interface.VRF != nil {
+		vrf := *config.Interface.VRF
+		vrf.Table = clonePointer(config.Interface.VRF.Table)
+		copy.Interface.VRF = &vrf
+	}
+	if config.Interface.IPVlan != nil {
+		ipvlan := *config.Interface.IPVlan
+		copy.Interface.IPVlan = &ipvlan
+	}
+
+	copy.Routes = slices.Clone(config.Routes)
+	copy.Rules = slices.Clone(config.Rules)
+	copy.Neighbors = slices.Clone(config.Neighbors)
+	if config.Ethtool != nil {
+		ethtool := *config.Ethtool
+		ethtool.Features = maps.Clone(config.Ethtool.Features)
+		ethtool.PrivateFlags = maps.Clone(config.Ethtool.PrivateFlags)
+		copy.Ethtool = &ethtool
+	}
+
+	return &copy
+}
+
+func applyUserPointerOverrides(merged, user *InterfaceConfig) {
+	overridePointer(&merged.DHCP, user.DHCP)
+	overridePointer(&merged.MTU, user.MTU)
+	overridePointer(&merged.HardwareAddr, user.HardwareAddr)
+	overridePointer(&merged.GSOMaxSize, user.GSOMaxSize)
+	overridePointer(&merged.GROMaxSize, user.GROMaxSize)
+	overridePointer(&merged.GSOIPv4MaxSize, user.GSOIPv4MaxSize)
+	overridePointer(&merged.GROIPv4MaxSize, user.GROIPv4MaxSize)
+	overridePointer(&merged.DisableEBPFPrograms, user.DisableEBPFPrograms)
+	overridePointer(&merged.Forwarding, user.Forwarding)
+	overridePointer(&merged.ARPIgnore, user.ARPIgnore)
+	overridePointer(&merged.ARPAnnounce, user.ARPAnnounce)
+	if user.VRF != nil && user.VRF.Table != nil {
+		overridePointer(&merged.VRF.Table, user.VRF.Table)
+	}
+}
+
+func clonePointer[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	return ptr.To(*value)
+}
+
+func overridePointer[T any](destination **T, source *T) {
+	if source != nil {
+		*destination = clonePointer(source)
+	}
 }
 
 // deduplicateStrings compacts a slice of strings keeping the last occurrence
