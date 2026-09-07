@@ -116,6 +116,93 @@ func TestGetDeviceAttributes(t *testing.T) {
 				AttrAzureInterconnectGroupID: {StringValue: ptr.To("2deed8b4-d1e9-42be-a40a-9882201aa9f5")},
 			},
 		},
+		{
+			name: "matching interface includes subnet",
+			instance: &AzureInstance{
+				VMSize: "Standard_ND128isr_GB300_v6",
+				Interfaces: []networkInterface{
+					{
+						MacAddress: "000D3AF806EC",
+						IPv4: ipv4Config{
+							Subnet: []subnet{{Address: "10.144.133.128", Prefix: "26"}},
+						},
+					},
+				},
+			},
+			id: cloudprovider.DeviceIdentifiers{MAC: "00:0d:3a:f8:06:ec"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				AttrAzureVMSize: {StringValue: ptr.To("Standard_ND128isr_GB300_v6")},
+				AttrAzureSubnet: {StringValue: ptr.To("10.144.133.128/26")},
+			},
+		},
+		{
+			name: "subnet is selected from matching interface",
+			instance: &AzureInstance{
+				Interfaces: []networkInterface{
+					{
+						MacAddress: "AABBCCDDEEFF",
+						IPv4: ipv4Config{
+							Subnet: []subnet{{Address: "10.0.0.0", Prefix: "24"}},
+						},
+					},
+					{
+						MacAddress: "001122334455",
+						IPv4: ipv4Config{
+							Subnet: []subnet{{Address: "192.168.1.0", Prefix: "24"}},
+						},
+					},
+				},
+			},
+			id: cloudprovider.DeviceIdentifiers{MAC: "00-11-22-33-44-55"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				AttrAzureSubnet: {StringValue: ptr.To("192.168.1.0/24")},
+			},
+		},
+		{
+			name: "missing device MAC omits subnet",
+			instance: &AzureInstance{
+				Interfaces: []networkInterface{
+					{
+						MacAddress: "001122334455",
+						IPv4: ipv4Config{
+							Subnet: []subnet{{Address: "192.168.1.0", Prefix: "24"}},
+						},
+					},
+				},
+			},
+			id:   cloudprovider.DeviceIdentifiers{Name: "dev1"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+		},
+		{
+			name: "unmatched interface omits subnet",
+			instance: &AzureInstance{
+				Interfaces: []networkInterface{
+					{
+						MacAddress: "AABBCCDDEEFF",
+						IPv4: ipv4Config{
+							Subnet: []subnet{{Address: "10.0.0.0", Prefix: "24"}},
+						},
+					},
+				},
+			},
+			id:   cloudprovider.DeviceIdentifiers{MAC: "00:11:22:33:44:55"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+		},
+		{
+			name: "incomplete subnet metadata is omitted",
+			instance: &AzureInstance{
+				Interfaces: []networkInterface{
+					{
+						MacAddress: "001122334455",
+						IPv4: ipv4Config{
+							Subnet: []subnet{{Address: "192.168.1.0"}},
+						},
+					},
+				},
+			},
+			id:   cloudprovider.DeviceIdentifiers{MAC: "00:11:22:33:44:55"},
+			want: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{},
+		},
 	}
 
 	for _, tt := range tests {

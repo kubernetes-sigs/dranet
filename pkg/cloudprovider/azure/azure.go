@@ -45,6 +45,7 @@ const (
 	AttrAzureVMSize                 = AzureAttrPrefix + "/" + "vmSize"
 	AttrAzureInterconnectGroupID    = AzureAttrPrefix + "/" + "interconnectGroupId"
 	AttrAzureInterconnectSubgroupID = AzureAttrPrefix + "/" + "interconnectSubgroupId"
+	AttrAzureSubnet                 = AzureAttrPrefix + "/" + "subnet"
 
 	// imdsEndpoint is the Azure Instance Metadata Service endpoint.
 	imdsEndpoint = "http://169.254.169.254/metadata/instance"
@@ -122,8 +123,8 @@ type AzureInstance struct {
 }
 
 // GetDeviceAttributes returns Azure-specific attributes for a device.
-// PlacementGroupID and VMSize are node-level properties that apply to all
-// devices on the node.
+// Node-level properties apply to all devices on the node. The subnet is
+// device-specific and is matched using the device MAC address.
 func (a *AzureInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	attributes := make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
 
@@ -141,6 +142,24 @@ func (a *AzureInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) 
 
 	if a.InterconnectSubgroupID != "" {
 		attributes[AttrAzureInterconnectSubgroupID] = resourceapi.DeviceAttribute{StringValue: &a.InterconnectSubgroupID}
+	}
+
+	if id.MAC == "" {
+		return attributes
+	}
+
+	normalizedMAC := normalizeMAC(id.MAC)
+	for i := range a.Interfaces {
+		if normalizeMAC(a.Interfaces[i].MacAddress) != normalizedMAC || len(a.Interfaces[i].IPv4.Subnet) == 0 {
+			continue
+		}
+
+		subnet := a.Interfaces[i].IPv4.Subnet[0]
+		if subnet.Address != "" && subnet.Prefix != "" {
+			subnetCIDR := subnet.Address + "/" + subnet.Prefix
+			attributes[AttrAzureSubnet] = resourceapi.DeviceAttribute{StringValue: &subnetCIDR}
+		}
+		break
 	}
 
 	return attributes
