@@ -585,11 +585,11 @@ EOF
 spec:
   template:
     spec:
-      affinity: {}
+      affinity:
 EOF
 )
   kubectl label node "$NODE_NAME" e2e-test-do-not-schedule-
-  kubectl wait --namespace=kube-system --for=condition=Ready pod -l app=dranet --field-selector spec.nodeName="$NODE_NAME" --timeout=60s
+  kubectl wait --namespace=kube-system --for=create --for=condition=Ready pod -l app=dranet --field-selector spec.nodeName="$NODE_NAME" --timeout=60s
 
   # The driver should asynchronously process the cleanup after the restart.
   # Inspect the bbolt database again to verify the pod configs have been deleted.

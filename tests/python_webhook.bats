@@ -31,7 +31,7 @@ setup_file() {
   
   # Delete dranet pods to restart them with new config
   kubectl --context kind-dranet-test-cluster delete pods -n kube-system -l app=dranet
-  kubectl --context kind-dranet-test-cluster wait --for=condition=ready pods --namespace=kube-system -l app=dranet --timeout=120s
+  kubectl --context kind-dranet-test-cluster wait --for=create --for=condition=ready pods --namespace=kube-system -l app=dranet --timeout=120s
 }
 
 teardown_file() {

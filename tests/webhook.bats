@@ -6,7 +6,7 @@ load 'test_helper/bats-assert/load'
 setup_file() {
   export BATS_TEST_TIMEOUT=300
   kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/whereabouts_upstream.yaml
-  kubectl -n kube-system wait --for=condition=ready pods -l app=whereabouts --timeout=120s
+  kubectl -n kube-system wait --for=create --for=condition=ready pods -l app=whereabouts --timeout=120s
 
 	# Build and load webhook image
 	docker build --load -t dranet/webhook-whereabouts:test -f "$BATS_TEST_DIRNAME"/../cmd/webhook-whereabouts/Dockerfile "$BATS_TEST_DIRNAME"/../
@@ -14,7 +14,7 @@ setup_file() {
 
 	# Deploy whereabouts webhook daemonset and configmap
 	kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/whereabouts_webhook_daemonset.yaml
-	kubectl -n kube-system wait --for=condition=ready pods -l app=whereabouts-webhook --timeout=120s
+	kubectl -n kube-system wait --for=create --for=condition=ready pods -l app=whereabouts-webhook --timeout=120s
 
   kubectl patch daemonset dranet -n kube-system --type=json -p='[
     {"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--profile-provider=webhook"},
@@ -24,10 +24,10 @@ setup_file() {
   
   # Delete dranet pods to restart them with new config
   kubectl delete pods -n kube-system -l app=dranet
-  kubectl wait --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet --timeout=120s
+  kubectl wait --for=create --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet --timeout=120s
   # Restart dranet pods again to load the new config
   kubectl delete pods -n kube-system -l app=dranet
-  kubectl wait --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet --timeout=120s
+  kubectl wait --for=create --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet --timeout=120s
 }
 
 teardown_file() {
