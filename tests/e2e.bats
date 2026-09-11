@@ -13,6 +13,7 @@ teardown() {
   cleanup_dummy_interfaces
   cleanup_veth_interfaces
   cleanup_bpf_programs
+  cleanup_mock_pci_devices
   # The driver is rate limited to updates with interval of atleast 5 seconds. So
   # we need to sleep for an equivalent amount of time to ensure state from a
   # previous test is cleared up and old (non-existent) devices have been removed
@@ -80,6 +81,20 @@ cleanup_veth_interfaces() {
 
 cleanup_bpf_programs() {
   docker exec "$CLUSTER_NAME"-worker2 bash -c "rm -rf /sys/fs/bpf/* || true"
+}
+
+cleanup_mock_pci_devices() {
+  for node in "$CLUSTER_NAME"-worker "$CLUSTER_NAME"-worker2; do
+    docker cp "$BATS_TEST_DIRNAME"/../bin/mockpci "${node}":/usr/local/bin/mockpci 2>/dev/null || true
+    docker exec "$node" mockpci cleanup 2>/dev/null || true
+  done
+}
+
+setup_mock_pci_device() {
+  local node="$1"
+  shift
+  docker cp "$BATS_TEST_DIRNAME"/../bin/mockpci "${node}":/usr/local/bin/mockpci
+  docker exec "$node" mockpci add "$@"
 }
 
 # ---- SETUP HELPERS ----
@@ -820,3 +835,95 @@ EOF
   kubectl patch daemonset dranet -n kube-system --type='json' -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/args\", \"value\": $ORIGINAL_ARGS}]"
   kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
 }
+
+@test "mockpci: PCIe device discovery with Mellanox vendor, NUMA node, and RDMA attributes in ResourceSlice" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  local IFACE_NAME="mlx0"
+  local PCI_BDF="0000:00:10.0"
+  local DEV_NAME="pci-0000-00-10-0"
+  local RDMA_DEV="rxe0"
+
+  setup_mock_pci_device "$NODE_NAME" \
+    --name "$IFACE_NAME" \
+    --pci-address "$PCI_BDF" \
+    --vendor "0x15b3" \
+    --device "0x101b" \
+    --driver "mlx5_core" \
+    --numa-node 0 \
+    --rdma-device "$RDMA_DEV"
+
+  # 1. Wait for ResourceSlice to publish the mock PCI device with Mellanox vendor
+  for attempt in {1..6}; do
+    run kubectl get resourceslices --field-selector spec.nodeName="$NODE_NAME" \
+      -o jsonpath="{.items[0].spec.devices[?(@.name=='$DEV_NAME')].attributes.dra\.net\/pciVendor.string}"
+    if [ "$status" -eq 0 ] && [[ "$output" == *"Mellanox"* ]]; then
+      break
+    fi
+    sleep 2
+  done
+
+  assert_success
+  assert_output --partial "Mellanox"
+
+  # 2. Check PCI Address
+  run kubectl get resourceslices --field-selector spec.nodeName="$NODE_NAME" \
+    -o jsonpath="{.items[0].spec.devices[?(@.name=='$DEV_NAME')].attributes.dra\.net\/pciAddress.string}"
+  assert_success
+  assert_output "$PCI_BDF"
+
+  # 3. Check PCI Device Product name resolved via pcidb
+  run kubectl get resourceslices --field-selector spec.nodeName="$NODE_NAME" \
+    -o jsonpath="{.items[0].spec.devices[?(@.name=='$DEV_NAME')].attributes.dra\.net\/pciDevice.string}"
+  assert_success
+  assert_output --partial "ConnectX-6"
+
+  # 4. Check in-kernel RDMA capability and RDMA device name
+  run kubectl get resourceslices --field-selector spec.nodeName="$NODE_NAME" \
+    -o jsonpath="{.items[0].spec.devices[?(@.name=='$DEV_NAME')].attributes.dra\.net\/rdma.bool}"
+  assert_success
+  assert_output "true"
+
+  run kubectl get resourceslices --field-selector spec.nodeName="$NODE_NAME" \
+    -o jsonpath="{.items[0].spec.devices[?(@.name=='$DEV_NAME')].attributes.dra\.net\/rdmaDevice.string}"
+  assert_success
+  assert_output "$RDMA_DEV"
+
+  # 5. Check Interface name
+  run kubectl get resourceslices --field-selector spec.nodeName="$NODE_NAME" \
+    -o jsonpath="{.items[0].spec.devices[?(@.name=='$DEV_NAME')].attributes.dra\.net\/ifName.string}"
+  assert_success
+  assert_output "$IFACE_NAME"
+}
+
+@test "mockpci: PCIe device allocation and container network attachment via ResourceClaim" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  local IFACE_NAME="mlx0"
+  local PCI_BDF="0000:00:10.0"
+  local RDMA_DEV="rxe0"
+
+  setup_mock_pci_device "$NODE_NAME" \
+    --name "$IFACE_NAME" \
+    --pci-address "$PCI_BDF" \
+    --vendor "0x15b3" \
+    --device "0x101b" \
+    --driver "mlx5_core" \
+    --numa-node 0 \
+    --rdma-device "$RDMA_DEV"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_mock_pci.yaml
+  wait_for_ready_pods app=pod-mock-pci 30s
+
+  run kubectl exec pod-mock-pci -- ip addr show mockpci0
+  assert_success
+  assert_output --partial "169.254.169.50"
+
+  run kubectl get resourceclaims mock-pci-interface-static-ip -o=jsonpath='{.status.devices[0].networkData.ips[*]}'
+  assert_success
+  assert_output --partial "169.254.169.50"
+}
+
+
+
+
+
