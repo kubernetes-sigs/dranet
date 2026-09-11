@@ -6,7 +6,6 @@ require (
 	cloud.google.com/go/compute v1.67.0
 	cloud.google.com/go/compute/metadata v0.9.0
 	cloud.google.com/go/container v1.54.0
-	dario.cat/mergo v1.0.2
 	github.com/Mellanox/rdmamap v1.2.0
 	github.com/aws-neuron/connected-device-maps-over-efa-for-neuron v1.1.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
