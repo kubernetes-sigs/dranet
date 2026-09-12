@@ -25,6 +25,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
 
@@ -35,8 +36,18 @@ type Handle struct {
 	*netlink.Handle
 }
 
+// defaultFamilies narrows the netlink default (ROUTE, XFRM, NETFILTER) to
+// NETLINK_ROUTE, the only family used through these handles. Opening the
+// others fails on nodes where xfrm_user or nfnetlink cannot be loaded.
+func defaultFamilies(nlFamilies []int) []int {
+	if len(nlFamilies) == 0 {
+		return []int{unix.NETLINK_ROUTE}
+	}
+	return nlFamilies
+}
+
 func NewHandle(nlFamilies ...int) (Handle, error) {
-	nlh, err := netlink.NewHandle(nlFamilies...)
+	nlh, err := netlink.NewHandle(defaultFamilies(nlFamilies)...)
 	if err != nil {
 		return Handle{}, err
 	}
@@ -44,7 +55,7 @@ func NewHandle(nlFamilies ...int) (Handle, error) {
 }
 
 func NewHandleAt(ns netns.NsHandle, nlFamilies ...int) (Handle, error) {
-	nlh, err := netlink.NewHandleAt(ns, nlFamilies...)
+	nlh, err := netlink.NewHandleAt(ns, defaultFamilies(nlFamilies)...)
 	if err != nil {
 		return Handle{}, err
 	}
