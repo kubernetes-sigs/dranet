@@ -55,6 +55,8 @@ type fakeInventoryDB struct {
 	GetRDMADeviceNameFunc    func(deviceName string) (string, error)
 	GetProfileConfigFunc     func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
 	ReleaseProfileConfigFunc func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
+	profileCalls             atomic.Int32
+	releaseProfileCalls      atomic.Int32
 }
 
 func newFakeInventoryDB() *fakeInventoryDB {
@@ -109,6 +111,7 @@ func (m *fakeInventoryDB) RequestRescan() {
 }
 
 func (m *fakeInventoryDB) GetProfileConfig(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+	m.profileCalls.Add(1)
 	if m.GetProfileConfigFunc != nil {
 		return m.GetProfileConfigFunc(deviceName, claim, config)
 	}
@@ -116,6 +119,7 @@ func (m *fakeInventoryDB) GetProfileConfig(deviceName string, claim *resourcev1.
 }
 
 func (m *fakeInventoryDB) ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error {
+	m.releaseProfileCalls.Add(1)
 	if m.ReleaseProfileConfigFunc != nil {
 		return m.ReleaseProfileConfigFunc(deviceName, claimUID, config)
 	}

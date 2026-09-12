@@ -236,14 +236,29 @@ wait_for_ready_pods() {
   run kubectl exec pod-ipvlan -- ip -d link show dummy0
   assert_success
   assert_output --partial "ipvlan"
+  # Link settings from the claim are applied to the child.
+  assert_output --partial "mtu 1400"
+  assert_output --partial "gso_max_size 32768"
+  assert_output --partial "gro_max_size 32768"
+  assert_output --partial "gso_ipv4_max_size 32768"
+  assert_output --partial "gro_ipv4_max_size 32768"
 
   run kubectl exec pod-ipvlan -- ip addr show dummy0
   assert_success
   assert_output --partial "169.254.200.10"
 
-  # The parent interface still exists on the host.
+  # ARP sysctls from the claim are applied to the child.
+  run kubectl exec pod-ipvlan -- cat /proc/sys/net/ipv4/conf/dummy0/arp_ignore
+  assert_success
+  assert_output "1"
+  run kubectl exec pod-ipvlan -- cat /proc/sys/net/ipv4/conf/dummy0/arp_announce
+  assert_success
+  assert_output "2"
+
+  # The parent interface still exists on the host and keeps its own MTU.
   run docker exec "$CLUSTER_NAME"-worker ip link show dummy0
   assert_success
+  assert_output --partial "mtu 1500"
 }
 
 @test "validate pbr configuration with ipvlan subinterface" {

@@ -56,6 +56,15 @@ func TestValidateConfig(t *testing.T) {
 	invalidInterfaceConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth/0"}}
 	invalidRouteConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0"}, Routes: []RouteConfig{{Destination: "invalid-cidr"}}}
 	invalidRuleConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0"}, Rules: []RuleConfig{{Source: "invalid-cidr"}}}
+	ipvlanSettingsConf := NetworkConfig{Interface: InterfaceConfig{
+		Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"192.168.1.1/24"},
+		MTU: ptr.To[int32](1400), GSOMaxSize: ptr.To[int32](65536), GROMaxSize: ptr.To[int32](65536),
+		GSOIPv4MaxSize: ptr.To[int32](65536), GROIPv4MaxSize: ptr.To[int32](65536),
+		ARPIgnore: ptr.To[int32](1), ARPAnnounce: ptr.To[int32](2), DHCP: ptr.To(false),
+	}}
+	ipvlanHardwareAddrConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"192.168.1.1/24"}, HardwareAddr: ptr.To("00:11:22:33:44:55")}}
+	ipvlanLowMTUConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"192.168.1.1/24"}, MTU: ptr.To[int32](67)}}
+	ipvlanARPRangeConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"192.168.1.1/24"}, ARPIgnore: ptr.To[int32](9)}}
 
 	tests := []struct {
 		name        string
@@ -130,6 +139,33 @@ func TestValidateConfig(t *testing.T) {
 			expectErr:   true,
 			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: "my-vrf"}}, Rules: []RuleConfig{{Table: 100}}},
 			errContains: []string{"rules are not supported when VRF is enabled"},
+		},
+		{
+			name:        "ipvlan with mtu, offload sizes, arp settings and dhcp false",
+			raw:         newRawExtension(t, ipvlanSettingsConf),
+			expectErr:   false,
+			expectedCfg: &ipvlanSettingsConf,
+		},
+		{
+			name:        "ipvlan with hardwareAddr",
+			raw:         newRawExtension(t, ipvlanHardwareAddrConf),
+			expectErr:   true,
+			expectedCfg: &ipvlanHardwareAddrConf,
+			errContains: []string{"interface: hardwareAddr and dhcp are not supported for subinterface types (type: IPVLAN)"},
+		},
+		{
+			name:        "ipvlan with mtu below minimum",
+			raw:         newRawExtension(t, ipvlanLowMTUConf),
+			expectErr:   true,
+			expectedCfg: &ipvlanLowMTUConf,
+			errContains: []string{"interface.mtu: must be at least 68, got 67"},
+		},
+		{
+			name:        "ipvlan with invalid arpIgnore",
+			raw:         newRawExtension(t, ipvlanARPRangeConf),
+			expectErr:   true,
+			expectedCfg: &ipvlanARPRangeConf,
+			errContains: []string{"interface.arpIgnore: must be one of 0, 1, 2, 3, or 8, got 9"},
 		},
 	}
 
@@ -514,11 +550,10 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name:      "mtu is rejected",
+			name:      "mtu is accepted",
 			cfg:       &InterfaceConfig{Type: "IPVLAN", MTU: ptr.To[int32](1500)},
 			fieldPath: "iface",
-			expectErr: true,
-			errCount:  1,
+			expectErr: false,
 		},
 		{
 			name:      "hardwareAddr is rejected",
@@ -528,18 +563,16 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
-			name:      "gso size is rejected",
-			cfg:       &InterfaceConfig{Type: "IPVLAN", GSOMaxSize: ptr.To[int32](65536)},
+			name:      "gso and gro sizes are accepted",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", GSOMaxSize: ptr.To[int32](65536), GROMaxSize: ptr.To[int32](65536), GSOIPv4MaxSize: ptr.To[int32](65536), GROIPv4MaxSize: ptr.To[int32](65536)},
 			fieldPath: "iface",
-			expectErr: true,
-			errCount:  1,
+			expectErr: false,
 		},
 		{
-			name:      "arp settings are rejected",
-			cfg:       &InterfaceConfig{Type: "IPVLAN", ARPIgnore: ptr.To[int32](1)},
+			name:      "arp settings are accepted",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", ARPIgnore: ptr.To[int32](1), ARPAnnounce: ptr.To[int32](2)},
 			fieldPath: "iface",
-			expectErr: true,
-			errCount:  1,
+			expectErr: false,
 		},
 		{
 			name:      "addressing dhcp is rejected",
@@ -556,8 +589,14 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
-			name:      "multiple unsupported fields is one error",
-			cfg:       &InterfaceConfig{Type: "IPVLAN", MTU: ptr.To[int32](1500), ARPIgnore: ptr.To[int32](1)},
+			name:      "dhcp false is accepted",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", DHCP: ptr.To(false)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "hardwareAddr and dhcp is one error",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", HardwareAddr: ptr.To("00:1A:2B:3C:4D:5E"), Addressing: AddressingModeDHCP},
 			fieldPath: "iface",
 			expectErr: true,
 			errCount:  1,
@@ -1013,12 +1052,12 @@ func TestNetworkConfigValidate(t *testing.T) {
 			name: "rejects fields unsupported on a subinterface",
 			config: &NetworkConfig{
 				Interface: InterfaceConfig{
-					Type: InterfaceTypeIPVLAN,
-					MTU:  ptr.To[int32](1500),
+					Type:         InterfaceTypeIPVLAN,
+					HardwareAddr: ptr.To("00:1A:2B:3C:4D:5E"),
 				},
 			},
 			expectErr:   true,
-			errContains: []string{"not yet supported for subinterface types"},
+			errContains: []string{"not supported for subinterface types"},
 		},
 		{
 			name: "rejects an invalid address contributed to the merged config",

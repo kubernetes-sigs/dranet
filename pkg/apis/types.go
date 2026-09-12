@@ -77,9 +77,12 @@ type InterfaceConfig struct {
 	DHCP *bool `json:"dhcp,omitempty"`
 
 	// MTU is the Maximum Transmission Unit for the interface.
+	// An IPVLAN subinterface must not exceed the parent MTU. When unset, the
+	// child inherits the parent MTU.
 	MTU *int32 `json:"mtu,omitempty"`
 
-	// HardwareAddr is the MAC address of the interface.
+	// HardwareAddr is the MAC address of the interface. Passthrough only: an
+	// IPVLAN subinterface always uses its parent's MAC address.
 	HardwareAddr *string `json:"hardwareAddr,omitempty"`
 
 	// GSOMaxSize sets the maximum Generic Segmentation Offload size for IPv6.

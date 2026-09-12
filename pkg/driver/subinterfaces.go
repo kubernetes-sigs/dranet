@@ -42,7 +42,9 @@ var ipvlanFlagToNetlink = map[apis.IPVlanFlag]netlink.IPVlanFlag{
 	apis.IPVlanFlagBridge: netlink.IPVLAN_FLAG_BRIDGE,
 }
 
-func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandle, config apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
+// addIPVlan creates an IPVLAN child of parentLink inside containerNs, applies
+// the interface settings, and deletes the child again if any later step fails.
+func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandle, config apis.InterfaceConfig) (networkData *resourceapi.NetworkDeviceData, err error) {
 	mode := netlink.IPVLAN_MODE_L2
 	flag := netlink.IPVLAN_FLAG_BRIDGE
 	if config.IPVlan != nil {
@@ -63,6 +65,13 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 	}
 	tempName := hex.EncodeToString(b)
 
+	// Open the handle before creating the link so a handle failure cannot leak the child.
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get netlink handle: %w", err)
+	}
+	defer nhNs.Close()
+
 	ipvlan := &netlink.IPVlan{
 		LinkAttrs: netlink.LinkAttrs{
 			Name:        tempName,
@@ -72,30 +81,49 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 		Mode: mode,
 		Flag: flag,
 	}
+	// The kernel applies the MTU on creation. Without it the child inherits the parent MTU.
+	if config.MTU != nil {
+		ipvlan.MTU = int(*config.MTU)
+	}
 
 	if err := netlink.LinkAdd(ipvlan); err != nil {
 		// If a user creates a macvlan and ipvlan on same parent, only one slave iface can be active at a time.
 		return nil, fmt.Errorf("failed to create the %s ipvlan interface: %v", ifName, err)
 	}
 
-	// Get handle in container namespace to configure IPs and bring the link UP.
-	nhNs, err := nlwrap.NewHandleAt(containerNs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get netlink handle: %w", err)
-	}
-	defer nhNs.Close()
+	// Delete the child on any later failure so it never outlives a failed setup.
+	// Until the lookup below succeeds the delete resolves the temp name, after it the index.
+	rollbackLink := netlink.Link(ipvlan)
+	defer func() {
+		if err == nil {
+			return
+		}
+		if delErr := nhNs.LinkDel(rollbackLink); delErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to delete the %s ipvlan interface after a setup failure: %w", ifName, delErr))
+		}
+	}()
 
 	nsLink, err := nhNs.LinkByName(tempName)
 	if err != nil {
 		return nil, fmt.Errorf("link not found for interface %s: %w", tempName, err)
 	}
+	rollbackLink = nsLink
 
 	// Rename back to ifName now that the link is created in the pod netns.
 	if err := nhNs.LinkSetName(nsLink, ifName); err != nil {
 		return nil, fmt.Errorf("failed to rename interface %s to %s: %w", tempName, ifName, err)
 	}
 
-	networkData := &resourceapi.NetworkDeviceData{
+	if err := applyOffloadSizes(nhNs, nsLink, ifName, config); err != nil {
+		return nil, err
+	}
+
+	// Apply before the link comes up so it never answers ARP with the wrong policy.
+	if err := applyInterfaceARPConfig(containerNs, ifName, config); err != nil {
+		return nil, fmt.Errorf("failed to apply ARP configuration to interface %s: %w", ifName, err)
+	}
+
+	networkData = &resourceapi.NetworkDeviceData{
 		InterfaceName:   ifName,
 		HardwareAddress: nsLink.Attrs().HardwareAddr.String(),
 	}
@@ -113,12 +141,37 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 		networkData.IPs = append(networkData.IPs, address)
 	}
 
-	err = nhNs.LinkSetUp(nsLink)
-	if err != nil {
+	if err := nhNs.LinkSetUp(nsLink); err != nil {
 		return nil, fmt.Errorf("failed to set up interface %s: %w", ifName, err)
 	}
 
 	return networkData, nil
+}
+
+// applyOffloadSizes sets the requested GSO and GRO limits on the child. The kernel
+// rejects a GSO size above the inherited TSO maximum and a GRO size above GRO_MAX_SIZE.
+func applyOffloadSizes(nhNs nlwrap.Handle, link netlink.Link, ifName string, config apis.InterfaceConfig) error {
+	if config.GSOMaxSize != nil {
+		if err := nhNs.LinkSetGSOMaxSize(link, int(*config.GSOMaxSize)); err != nil {
+			return fmt.Errorf("failed to set gso_max_size %d on interface %s: %w", *config.GSOMaxSize, ifName, err)
+		}
+	}
+	if config.GROMaxSize != nil {
+		if err := nhNs.LinkSetGROMaxSize(link, int(*config.GROMaxSize)); err != nil {
+			return fmt.Errorf("failed to set gro_max_size %d on interface %s: %w", *config.GROMaxSize, ifName, err)
+		}
+	}
+	if config.GSOIPv4MaxSize != nil {
+		if err := nhNs.LinkSetGSOIPv4MaxSize(link, int(*config.GSOIPv4MaxSize)); err != nil {
+			return fmt.Errorf("failed to set gso_ipv4_max_size %d on interface %s: %w", *config.GSOIPv4MaxSize, ifName, err)
+		}
+	}
+	if config.GROIPv4MaxSize != nil {
+		if err := nhNs.LinkSetGROIPv4MaxSize(link, int(*config.GROIPv4MaxSize)); err != nil {
+			return fmt.Errorf("failed to set gro_ipv4_max_size %d on interface %s: %w", *config.GROIPv4MaxSize, ifName, err)
+		}
+	}
+	return nil
 }
 
 // nsCreateSubinterface creates a subinterface (currently supports IPVLAN) of hostIfName
@@ -133,6 +186,11 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis
 	parentLink, err := nlwrap.LinkByName(hostIfName)
 	if err != nil {
 		return nil, fmt.Errorf("could not find parent interface %s on host: %w", hostIfName, err)
+	}
+
+	// The kernel does not check a child MTU against its parent, so check it here.
+	if config.MTU != nil && int(*config.MTU) > parentLink.Attrs().MTU {
+		return nil, fmt.Errorf("requested MTU %d for %s subinterface %s exceeds parent interface %s MTU %d", *config.MTU, config.Type, config.Name, hostIfName, parentLink.Attrs().MTU)
 	}
 
 	// Make sure the parent link is up on the host, otherwise subinterfaces cannot transmit traffic.

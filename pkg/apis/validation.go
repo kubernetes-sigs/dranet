@@ -420,15 +420,12 @@ func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
 	return allErrors
 }
 
-// validateSubinterfaceOnlyConfig checks that a NetworkConfig does not contain
-// network-specific fields that are meaningless for a subinterface (e.g. IPVLAN).
+// validateSubinterfaceOnlyConfig rejects the fields not supported on a subinterface
+// (e.g. IPVLAN): hardwareAddr, because an IPVLAN child always uses its parent's MAC
+// address, and DHCP, because its client runs on the host parent and the child path is untested.
 func validateSubinterfaceOnlyConfig(cfg *InterfaceConfig, fieldPath string) (allErrors []error) {
-	if cfg.MTU != nil || cfg.HardwareAddr != nil ||
-		cfg.GSOMaxSize != nil || cfg.GROMaxSize != nil ||
-		cfg.GSOIPv4MaxSize != nil || cfg.GROIPv4MaxSize != nil ||
-		cfg.ARPIgnore != nil || cfg.ARPAnnounce != nil ||
-		cfg.Addressing == AddressingModeDHCP || (cfg.DHCP != nil && *cfg.DHCP) {
-		allErrors = append(allErrors, fmt.Errorf("%s: mtu, hardwareAddr, gso/gro sizes, arpIgnore, arpAnnounce and dhcp are not yet supported for subinterface types (type: %s)", fieldPath, cfg.Type))
+	if cfg.HardwareAddr != nil || cfg.Addressing == AddressingModeDHCP || (cfg.DHCP != nil && *cfg.DHCP) {
+		allErrors = append(allErrors, fmt.Errorf("%s: hardwareAddr and dhcp are not supported for subinterface types (type: %s): an IPVLAN child uses its parent's MAC address, and DHCP on a subinterface is unsupported and untested", fieldPath, cfg.Type))
 	}
 	return allErrors
 }

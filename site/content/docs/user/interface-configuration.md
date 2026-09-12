@@ -39,14 +39,26 @@ type InterfaceConfig struct {
 	// If not specified, DRANET may use or derive a name from the original interface.
 	Name string `json:"name,omitempty"`
 
+	// Type selects how the allocated device is presented to the Pod:
+	//   - "Passthrough" (default): the network device itself is moved into the
+	//     Pod's network namespace.
+	//   - "IPVLAN": the device stays in the host namespace and an IPVLAN
+	//     subinterface is created on top of it inside the Pod.
+	// It may be set by the cloud provider or in the user's ResourceClaim.
+	// If empty, it is treated as "Passthrough".
+	Type InterfaceType `json:"type,omitempty"`
+
 	// Addresses is a list of IP addresses in CIDR format (e.g., "192.168.1.10/24")
 	// to be assigned to the interface.
 	Addresses []string `json:"addresses,omitempty"`
 
 	// MTU is the Maximum Transmission Unit for the interface.
+	// An IPVLAN subinterface must not exceed the parent MTU. When unset, the
+	// child inherits the parent MTU.
 	MTU *int32 `json:"mtu,omitempty"`
 
-	// HardwareAddr is the MAC address of the interface.
+	// HardwareAddr is the MAC address of the interface. Passthrough only: an
+	// IPVLAN subinterface always uses its parent's MAC address.
 	HardwareAddr *string `json:"hardwareAddr,omitempty"`
 
 	// GSOMaxSize sets the maximum Generic Segmentation Offload size for IPv6.
@@ -82,9 +94,10 @@ type InterfaceConfig struct {
 ```
 
 * **name** (string, optional): The logical name that the interface will have inside the Pod (e.g., "eth0", "enp0s3"). If not specified, DRANET will keep the original name if compliant.
+* **type** (string, optional): How the device is presented to the Pod. `Passthrough` (the default) moves the device into the Pod. `IPVLAN` keeps the device on the host and creates an IPVLAN subinterface on top of it inside the Pod.
 * **addresses** ([]string, optional): A list of IP addresses in CIDR format (e.g., "192.168.1.10/24", "2001:db8::1/64") to be assigned to the interface.
-* **mtu** (int32, optional): The Maximum Transmission Unit for the interface.
-* **hardwareAddr** (string, optional): The MAC address of the interface.
+* **mtu** (int32, optional): The Maximum Transmission Unit for the interface. For an `IPVLAN` subinterface the value must not exceed the parent MTU. When omitted, the child inherits the parent MTU.
+* **hardwareAddr** (string, optional): The MAC address of the interface. Passthrough only. An `IPVLAN` subinterface always uses its parent's MAC address, so the field is rejected.
 * **gsoMaxSize** (int32, optional): The maximum Generic Segmentation Offload size for IPv6.
 * **groMaxSize** (int32, optional): The maximum Generic Receive Offload size for IPv6.
 * **gsoIPv4MaxSize** (int32, optional): The maximum Generic Segmentation Offload size for IPv4.
@@ -104,6 +117,38 @@ for both settings. A per-interface setting cannot reduce the effective value bel
 `conf/all`. New IPv4 network namespaces normally inherit `conf/all` and `conf/default`
 from the initial network namespace, subject to `net.core.devconf_inherit_init_net`.
 DRANET only changes the per-interface value.
+
+##### IPVLAN subinterfaces
+
+An `IPVLAN` subinterface is created inside the Pod network namespace on top of the
+host device. The `mtu`, GSO and GRO sizes, `arpIgnore`, and `arpAnnounce` settings apply
+to the child. They work the same way as on a passthrough interface. The child inherits
+the TSO maximum of its parent. The kernel rejects a GSO size above that maximum. It also
+rejects a GRO size above the global kernel maximum. A later change of the parent MTU
+resets the child MTU to the new parent value.
+
+A minimal claim configuration that requests an IPVLAN subinterface:
+
+```yaml
+config:
+- opaque:
+    driver: dra.net
+    parameters:
+      interface:
+        type: "IPVLAN"
+        name: "net1"
+        addresses:
+        - "192.0.2.10/24"
+        mtu: 1400
+        arpIgnore: 1
+        arpAnnounce: 2
+```
+
+Two settings are not supported for subinterfaces and are rejected by validation:
+
+* `hardwareAddr`: the child always uses the parent MAC address.
+* DHCP addressing: unsupported and untested. The DHCP client runs on the host parent
+  interface before the subinterface exists.
 
 #### Route Configuration (RouteConfig)
 

@@ -753,12 +753,14 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claim *resourceap
 	}
 	mergedConf := apis.MergeNetworkConfig(userConf, cloudConf)
 
+	profileAllocated := false
 	if mergedConf.Profile != "" {
 		profileConf, err := np.netdb.GetProfileConfig(device, claim, mergedConf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get profile config: %v", err)
 		}
 		mergedConf = apis.MergeNetworkConfig(mergedConf, profileConf)
+		profileAllocated = true
 	}
 
 	// The user configuration was already validated when the claim was parsed, but
@@ -767,7 +769,15 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claim *resourceap
 	// and validate the configuration that is actually going to be applied, so a bad
 	// provider config fails here with a clear error instead of partially applying.
 	if errs := mergedConf.Validate(); len(errs) > 0 {
-		return nil, fmt.Errorf("merged network config for device %s is invalid: %v", device, errs)
+		err := fmt.Errorf("merged network config for device %s is invalid: %v", device, errs)
+		// The profile allocated state before validation ran. Release it now so a
+		// retried Prepare does not leak it.
+		if profileAllocated {
+			if relErr := np.netdb.ReleaseProfileConfig(device, claim.UID, mergedConf); relErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to release profile config: %w", relErr))
+			}
+		}
+		return nil, err
 	}
 	return mergedConf, nil
 }

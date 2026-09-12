@@ -33,6 +33,13 @@ spec:
             type: "IPVLAN"
             addresses:
             - "169.254.200.10/24"
+            mtu: 1400
+            gsoMaxSize: 32768
+            groMaxSize: 32768
+            gsoIPv4MaxSize: 32768
+            groIPv4MaxSize: 32768
+            arpIgnore: 1
+            arpAnnounce: 2
 ---
 apiVersion: v1
 kind: Pod

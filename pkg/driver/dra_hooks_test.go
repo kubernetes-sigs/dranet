@@ -33,6 +33,7 @@ import (
 	resourcev1 "k8s.io/api/resource/v1"
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -1051,7 +1052,9 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 		claim         *resourcev1.ResourceClaim
 		setupDB       func(*fakeInventoryDB)
 		wantErr       string
+		wantErrAlso   string
 		wantPodConfig *PodConfig
+		check         func(t *testing.T, db *fakeInventoryDB)
 	}{
 		{
 			name: "single IB-only device builds RDMA config successfully",
@@ -1368,6 +1371,231 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 			},
 		},
 		{
+			name: "provider-selected subinterface rejects a user hardwareAddr",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-hwaddr", Namespace: "default", Name: "claim-subif-hwaddr"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-hwaddr"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+							Config: []resourcev1.DeviceAllocationConfiguration{{
+								Source: resourcev1.AllocationConfigSourceClaim,
+								DeviceConfiguration: resourcev1.DeviceConfiguration{
+									Opaque: &resourcev1.OpaqueDeviceConfiguration{
+										Driver:     testDriverName,
+										Parameters: runtime.RawExtension{Raw: []byte(`{"interface":{"hardwareAddr":"00:11:22:33:44:55"}}`)},
+									},
+								},
+							}},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				// The user config passed validation as passthrough; the provider selects IPVLAN.
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: "IPVLAN", Addresses: []string{"10.24.3.5/32"}}}, true
+				}
+			},
+			wantErr: "hardwareAddr and dhcp are not supported for subinterface types",
+		},
+		{
+			name: "provider-selected subinterface rejects user dhcp before any dhcp request",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-dhcp", Namespace: "default", Name: "claim-subif-dhcp"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-dhcp"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+							Config: []resourcev1.DeviceAllocationConfiguration{{
+								Source: resourcev1.AllocationConfigSourceClaim,
+								DeviceConfiguration: resourcev1.DeviceConfiguration{
+									Opaque: &resourcev1.OpaqueDeviceConfiguration{
+										Driver:     testDriverName,
+										Parameters: runtime.RawExtension{Raw: []byte(`{"interface":{"addressing":"DHCP"}}`)},
+									},
+								},
+							}},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: "IPVLAN"}}, true
+				}
+			},
+			wantErr: "hardwareAddr and dhcp are not supported for subinterface types",
+		},
+		{
+			name: "profile-selected subinterface rejects a user hardwareAddr and releases the profile",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-hwaddr-profile", Namespace: "default", Name: "claim-subif-hwaddr-profile"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-hwaddr-profile"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+							Config: []resourcev1.DeviceAllocationConfiguration{{
+								Source: resourcev1.AllocationConfigSourceClaim,
+								DeviceConfiguration: resourcev1.DeviceConfiguration{
+									Opaque: &resourcev1.OpaqueDeviceConfiguration{
+										Driver:     testDriverName,
+										Parameters: runtime.RawExtension{Raw: []byte(`{"interface":{"hardwareAddr":"00:11:22:33:44:55"}}`)},
+									},
+								},
+							}},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				// Only the profile resolution introduces the subinterface type.
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Profile: "cloud-managed"}, true
+				}
+				db.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: "IPVLAN", Addresses: []string{"10.24.3.5/32"}}}, nil
+				}
+			},
+			wantErr: "hardwareAddr and dhcp are not supported for subinterface types",
+			// Nothing is stored, and the allocation is released right away.
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.releaseProfileCalls.Load(); got != 1 {
+					t.Errorf("ReleaseProfileConfig calls = %d, want 1", got)
+				}
+			},
+		},
+		{
+			name: "provider-selected subinterface with a profile rejects hardwareAddr and releases the allocated profile",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-hwaddr-noalloc", Namespace: "default", Name: "claim-subif-hwaddr-noalloc"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-hwaddr-noalloc"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+							Config: []resourcev1.DeviceAllocationConfiguration{{
+								Source: resourcev1.AllocationConfigSourceClaim,
+								DeviceConfiguration: resourcev1.DeviceConfiguration{
+									Opaque: &resourcev1.OpaqueDeviceConfiguration{
+										Driver:     testDriverName,
+										Parameters: runtime.RawExtension{Raw: []byte(`{"interface":{"hardwareAddr":"00:11:22:33:44:55"}}`)},
+									},
+								},
+							}},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Profile: "cloud-managed", Interface: apis.InterfaceConfig{Type: "IPVLAN"}}, true
+				}
+				db.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addresses: []string{"10.24.3.5/32"}}}, nil
+				}
+			},
+			wantErr: "hardwareAddr and dhcp are not supported for subinterface types",
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.profileCalls.Load(); got != 1 {
+					t.Errorf("GetProfileConfig calls = %d, want 1", got)
+				}
+				if got := db.releaseProfileCalls.Load(); got != 1 {
+					t.Errorf("ReleaseProfileConfig calls = %d, want 1", got)
+				}
+			},
+		},
+		{
+			name: "profile-selected subinterface reports a failed profile release",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-hwaddr-relfail", Namespace: "default", Name: "claim-subif-hwaddr-relfail"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-hwaddr-relfail"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+							Config: []resourcev1.DeviceAllocationConfiguration{{
+								Source: resourcev1.AllocationConfigSourceClaim,
+								DeviceConfiguration: resourcev1.DeviceConfiguration{
+									Opaque: &resourcev1.OpaqueDeviceConfiguration{
+										Driver:     testDriverName,
+										Parameters: runtime.RawExtension{Raw: []byte(`{"interface":{"hardwareAddr":"00:11:22:33:44:55"}}`)},
+									},
+								},
+							}},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Profile: "cloud-managed"}, true
+				}
+				db.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: "IPVLAN", Addresses: []string{"10.24.3.5/32"}}}, nil
+				}
+				db.ReleaseProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error {
+					return fmt.Errorf("release boom")
+				}
+			},
+			// The validation error must survive next to the release error.
+			wantErr:     "hardwareAddr and dhcp are not supported for subinterface types",
+			wantErrAlso: "failed to release profile config: release boom",
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.releaseProfileCalls.Load(); got != 1 {
+					t.Errorf("ReleaseProfileConfig calls = %d, want 1", got)
+				}
+			},
+		},
+		{
 			name: "subinterface with provider-advertised profile resolves addresses and PBR",
 			claim: &resourcev1.ResourceClaim{
 				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-implicit", Namespace: "default", Name: "claim-subif-implicit"},
@@ -1471,6 +1699,11 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 			} else if gotResult.Err != nil {
 				t.Fatalf("prepareResourceClaim() unexpected error = %v", gotResult.Err)
 			}
+			if tc.wantErrAlso != "" {
+				if gotResult.Err == nil || !strings.Contains(gotResult.Err.Error(), tc.wantErrAlso) {
+					t.Fatalf("prepareResourceClaim() error = %v, want error also containing %q", gotResult.Err, tc.wantErrAlso)
+				}
+			}
 
 			var gotPodConfig *PodConfig
 			if len(tc.claim.Status.ReservedFor) > 0 {
@@ -1483,6 +1716,9 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 			opts := []cmp.Option{cmpopts.EquateEmpty(), cmpopts.IgnoreFields(PodConfig{}, "LastNRIActivity")}
 			if diff := cmp.Diff(tc.wantPodConfig, gotPodConfig, opts...); diff != "" {
 				t.Errorf("PodConfig mismatch (-want +got):\n%s", diff)
+			}
+			if tc.check != nil {
+				tc.check(t, fakeDB)
 			}
 		})
 	}
