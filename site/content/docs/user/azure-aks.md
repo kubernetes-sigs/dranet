@@ -26,6 +26,8 @@ Scheduling is driven entirely by the `ResourceSlice` objects each driver publish
 
 dranet queries the Azure Instance Metadata Service (IMDS) at startup and attaches Azure-specific attributes to every device it publishes, including `azure.dra.net/placementGroupId` and `azure.dra.net/vmSize`. VMs in **different placement groups do not share an InfiniBand fabric**, and this is not visible from node labels or GPU-driver attributes. The `placementGroupId` attribute lets a CEL selector constrain a multi-node job to a single IB fabric.
 
+For interfaces matched to Azure IMDS by MAC address, `azure.dra.net/ipv4Subnet` contains the device’s IPv4 subnet CIDR (for example, `10.144.133.128/26`). This attribute is device-specific and is omitted when the device MAC, matching interface, or subnet address and prefix are unavailable. It does not describe an IPv6 subnet. The node-level Azure attributes remain available independently of subnet metadata.
+
 On Azure GPU SKUs the ConnectX VFs are often in **InfiniBand mode** with no Ethernet netdev. dranet discovers them by recording the RDMA link name (`rdmaDevice`) on the PCI device (a device is IB-only when it has a non-empty `rdmaDevice` and no `ifName`), and at pod start injects exactly the allocated `/dev/infiniband/uverbsN` character devices into the container. This enforces per-workload NIC isolation without `privileged: true`.
 
 ### Usage pattern

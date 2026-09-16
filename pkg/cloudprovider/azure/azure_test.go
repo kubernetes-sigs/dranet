@@ -215,6 +215,85 @@ func TestGetDeviceAttributes(t *testing.T) {
 	}
 }
 
+func TestGetDeviceAttributesMissingSubnet(t *testing.T) {
+	tests := []struct {
+		name   string
+		mac    string
+		ifaces []networkInterface
+	}{
+		{name: "network metadata unavailable", mac: "00:11:22:33:44:55"},
+		{
+			name: "device and metadata MAC both missing",
+			ifaces: []networkInterface{{IPv4: ipv4Config{
+				Subnet: []subnet{{Address: "10.0.0.0", Prefix: "24"}},
+			}}},
+		},
+		{
+			name:   "matching interface has no subnets",
+			mac:    "00:11:22:33:44:55",
+			ifaces: []networkInterface{{MacAddress: "001122334455"}},
+		},
+		{
+			name: "matching interface has prefix but no address",
+			mac:  "00:11:22:33:44:55",
+			ifaces: []networkInterface{{MacAddress: "001122334455", IPv4: ipv4Config{
+				Subnet: []subnet{{Prefix: "24"}},
+			}}},
+		},
+		{
+			name: "matching interface has address but no prefix",
+			mac:  "00:11:22:33:44:55",
+			ifaces: []networkInterface{{MacAddress: "001122334455", IPv4: ipv4Config{
+				Subnet: []subnet{{Address: "10.0.0.0"}},
+			}}},
+		},
+		{
+			name: "only IPv6 addresses available",
+			mac:  "00:11:22:33:44:55",
+			ifaces: []networkInterface{{MacAddress: "001122334455", IPv6: ipv6Config{
+				IPAddress: []ipv6Address{{PrivateIPAddress: "2001:db8::1"}},
+			}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instance := &AzureInstance{
+				VMSize:                 "Standard_D4s_v3",
+				PlacementGroupID:       "placement",
+				InterconnectGroupID:    "group",
+				InterconnectSubgroupID: "subgroup",
+				Interfaces:             tt.ifaces,
+			}
+			want := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				AttrAzureVMSize:                 {StringValue: ptr.To(instance.VMSize)},
+				AttrAzurePlacementGroupID:       {StringValue: ptr.To(instance.PlacementGroupID)},
+				AttrAzureInterconnectGroupID:    {StringValue: ptr.To(instance.InterconnectGroupID)},
+				AttrAzureInterconnectSubgroupID: {StringValue: ptr.To(instance.InterconnectSubgroupID)},
+			}
+			got := instance.GetDeviceAttributes(cloudprovider.DeviceIdentifiers{MAC: tt.mac})
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Fatalf("missing subnet must preserve node attributes (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGetDeviceAttributesSubnetsArePerDevice(t *testing.T) {
+	instance := &AzureInstance{Interfaces: []networkInterface{
+		{MacAddress: "001122AABBCC", IPv4: ipv4Config{Subnet: []subnet{{Address: "10.0.0.0", Prefix: "24"}}}},
+		{MacAddress: "001122DDEEFF", IPv4: ipv4Config{Subnet: []subnet{{Address: "10.1.0.0", Prefix: "16"}}}},
+	}}
+	first := instance.GetDeviceAttributes(cloudprovider.DeviceIdentifiers{MAC: "00:11:22:aa:bb:cc"})
+	second := instance.GetDeviceAttributes(cloudprovider.DeviceIdentifiers{MAC: "00-11-22-DD-EE-FF"})
+	wantSubnets := []string{"10.0.0.0/24", "10.1.0.0/16"}
+	for i, attrs := range []map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{first, second} {
+		got := attrs[AttrAzureIPv4Subnet].StringValue
+		if got == nil || *got != wantSubnets[i] {
+			t.Errorf("device %d: subnet = %v, want %s", i, got, wantSubnets[i])
+		}
+	}
+}
+
 func TestGetDeviceConfig(t *testing.T) {
 	userns.Run(t, testGetDeviceConfig_Namespaced, syscall.CLONE_NEWNET)
 }
