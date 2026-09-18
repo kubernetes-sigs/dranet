@@ -151,8 +151,6 @@ func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*re
 // prepareResourceClaim gets all the configuration required to be applied at runtime and passes it downs to the handlers.
 // This happens in the kubelet so it can be a "slow" operation, so we can execute fast in RunPodsandbox, that happens in the
 // container runtime and has strong expectactions to be executed fast (default hook timeout is 2 seconds).
-//
-// TODO(#290): This function has grown too large and needs to be split apart.
 func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	klog.V(2).Infof("PrepareResourceClaim Claim %s/%s", claim.Namespace, claim.Name)
 	start := time.Now()
@@ -205,287 +203,9 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		if result.Driver != np.driverName {
 			continue
 		}
-		requestName := result.Request
-		userConf := &apis.NetworkConfig{}
-		for _, config := range claim.Status.Allocation.Devices.Config {
-			// Check there is a config associated to this device
-			if config.Opaque == nil ||
-				config.Opaque.Driver != np.driverName ||
-				len(config.Requests) > 0 && !slices.Contains(config.Requests, requestName) {
-				continue
-			}
-			// Check if there is a custom configuration
-			conf, errs := apis.ValidateConfig(&config.Opaque.Parameters)
-			if len(errs) > 0 {
-				errorList = append(errorList, errs...)
-				continue
-			}
-			// TODO: define a strategy for multiple configs
-			if conf != nil {
-				userConf = conf
-				break
-			}
-		}
-
-		mergedConf, err := np.getDeviceNetworkConfig(result.Device, claim, userConf)
-		if err != nil {
+		if err := np.prepareDevice(ctx, nlHandle, claim, podUID, result, rulesByTable); err != nil {
 			errorList = append(errorList, err)
-			continue
 		}
-
-		netconf := *mergedConf
-
-		klog.V(4).Infof("PrepareResourceClaim %s/%s final Configuration %#v", claim.Namespace, claim.Name, netconf)
-		// Query the local discovery database (netdb) for the card's clean attributes
-		var deviceSnapshot *resourceapi.Device
-		if device, ok := np.netdb.GetDevice(result.Device); ok {
-			deviceSnapshot = &device
-		} else {
-			klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
-		}
-
-		deviceCfg := DeviceConfig{
-			Claim: types.NamespacedName{
-				Namespace: claim.Namespace,
-				Name:      claim.Name,
-			},
-			NetworkInterfaceConfigInPod: netconf,
-			DeviceSnapshot:              deviceSnapshot,
-		}
-
-		// Store early to guarantee profile cleanup on subsequent failures within this loop.
-		// If the preparation fails later, Kubelet will call UnprepareResourceClaims,
-		// which will find this early config and release the allocated profile.
-		if netconf.Profile != "" {
-			if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
-				errorList = append(errorList, fmt.Errorf("failed to persist early device config for pod %s device %s: %v", podUID, result.Device, err))
-				// If we can't store it, we MUST release it immediately to prevent a leak.
-				if relErr := np.netdb.ReleaseProfileConfig(result.Device, claim.UID, &netconf); relErr != nil {
-					klog.Errorf("failed to rollback profile config for claim %v device %v: %v", claim.UID, result.Device, relErr)
-				}
-				continue
-			}
-		}
-
-		// IB-only path: device has RDMA capability but no netdev interface.
-		if np.netdb.IsIBOnlyDevice(result.Device) {
-			// Reject any network-specific config fields for RDMA-only devices.
-			for _, config := range claim.Status.Allocation.Devices.Config {
-				if config.Opaque == nil ||
-					config.Opaque.Driver != np.driverName ||
-					len(config.Requests) > 0 && !slices.Contains(config.Requests, requestName) {
-					continue
-				}
-				if errs := apis.ValidateRDMAOnlyConfig(&config.Opaque.Parameters); len(errs) > 0 {
-					errorList = append(errorList, errs...)
-				}
-			}
-			if len(errorList) > 0 {
-				continue
-			}
-			rdmaDevName, err := np.netdb.GetRDMADeviceName(result.Device)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("failed to get RDMA device name for IB-only device %s: %v", result.Device, err))
-				continue
-			}
-			deviceCfg.RDMADevice = buildRDMAConfig(rdmaDevName)
-			if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
-				errorList = append(errorList, fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err))
-			}
-			klog.V(4).Infof("IB-only claim resources for pod %s : %#v", podUID, deviceCfg)
-			continue
-		}
-
-		ifName, err := np.netdb.GetNetInterfaceName(result.Device)
-		if err != nil {
-			errorList = append(errorList, fmt.Errorf("failed to get network interface name for device %s: %v", result.Device, err))
-			continue
-		}
-		// Get Network configuration and merge it
-		link, err := nlHandle.LinkByName(ifName)
-		if err != nil {
-			errorList = append(errorList, fmt.Errorf("failed to get netlink to interface %s: %v", ifName, err))
-			continue
-		}
-		deviceCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
-
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
-			// If the interface name was not explicitly overridden, use the same
-			// interface name within the pod's network namespace.
-			deviceCfg.NetworkInterfaceConfigInPod.Interface.Name = ifName
-		}
-
-		// For SR-IOV VFs, the requested MTU must not exceed the parent PF's MTU.
-		// Otherwise the claim is rejected so the Pod fails fast instead of being
-		// created with an illegal MTU configuration.
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.MTU != nil && inventory.IsSriovVf(ifName) {
-			pfName, err := inventory.GetPFInterfaceName(ifName)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("failed to determine parent PF for SR-IOV VF %s: %v", ifName, err))
-				continue
-			}
-			pfLink, err := nlHandle.LinkByName(pfName)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("failed to get netlink to parent PF %s of VF %s: %v", pfName, ifName, err))
-				continue
-			}
-			requestedMTU := int(*deviceCfg.NetworkInterfaceConfigInPod.Interface.MTU)
-			if err := validateVFMTU(ifName, pfName, requestedMTU, pfLink.Attrs().MTU); err != nil {
-				errorList = append(errorList, err)
-				continue
-			}
-		}
-
-		// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
-		// ... but we DO NOT apply them in the root namespace
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeDHCP {
-			klog.V(2).Infof("trying to get network configuration via DHCP")
-			contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-			ip, routes, lease, err := getDHCP(contextCancel, ifName)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("fail to get configuration via DHCP for %s: %w", ifName, err))
-			} else {
-				deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
-				deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
-				if lease != nil {
-					deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
-				}
-			}
-		} else if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
-			// For a passthrough interface with no custom addresses and no DHCP, then use the existing ones
-			// get the existing IP addresses
-			nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err))
-			} else {
-				for _, address := range nlAddresses {
-					// Only move IP addresses with global scope because those are not host-specific, auto-configured,
-					// or have limited network scope, making them unsuitable inside the container namespace.
-					// Ref: https://www.ietf.org/rfc/rfc3549.txt
-					if address.Scope != unix.RT_SCOPE_UNIVERSE {
-						continue
-					}
-					deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = append(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses, address.IPNet.String())
-				}
-			}
-		}
-
-		// Obtain the existing supported ethtool features and validate the config
-		if deviceCfg.NetworkInterfaceConfigInPod.Ethtool != nil {
-			client, err := newEthtoolClient(0)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("fail to create ethtool client %v", err))
-				continue
-			}
-			defer client.Close()
-
-			ifFeatures, err := client.GetFeatures(ifName)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("fail to get ethtool features %v", err))
-				continue
-			}
-
-			// translate features to the actual kernel names
-			ethtoolFeatures := map[string]bool{}
-			for feature, value := range deviceCfg.NetworkInterfaceConfigInPod.Ethtool.Features {
-				aliases := ifFeatures.Get(feature)
-				if len(aliases) == 0 {
-					errorList = append(errorList, fmt.Errorf("feature %s not supported by interface", feature))
-					continue
-				}
-				for _, alias := range aliases {
-					ethtoolFeatures[alias] = value
-				}
-			}
-			deviceCfg.NetworkInterfaceConfigInPod.Ethtool.Features = ethtoolFeatures
-		}
-
-		// For non-subinterface type, obtain the routes and rules associated with the interface.
-		if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-			routes, tables, err := getRouteInfo(nlHandle, ifName, link)
-			if err != nil {
-				errorList = append(errorList, err)
-				continue
-			}
-			clearStaleRouteSources(routes, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses)
-			deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
-
-			// If VRF is enabled, we do not need to copy the rules from the host
-			// because the VRF handles the routing table lookup.
-			if deviceCfg.NetworkInterfaceConfigInPod.Interface.VRF == nil {
-				for _, table := range tables.UnsortedList() {
-					if rules, ok := rulesByTable[table]; ok {
-						klog.V(5).Infof("Adding %d rules for table %d associated with interface %s", len(rules), table, ifName)
-						deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, rules...)
-						// Avoid adding the same rule twice
-						delete(rulesByTable, table)
-					}
-				}
-			}
-		}
-
-		// Obtain the neighbors associated to the interface
-		neighs, err := nlHandle.NeighList(link.Attrs().Index, netlink.FAMILY_ALL)
-		if err != nil {
-			klog.Infof("failed to get neighbors for interface %s: %v", ifName, err)
-		}
-		for _, neigh := range neighs {
-			if neigh.IP == nil || neigh.HardwareAddr == nil {
-				continue
-			}
-			// We are only interested in permanent neighbor entries
-			if neigh.State != netlink.NUD_PERMANENT {
-				continue
-			}
-			neighCfg := apis.NeighborConfig{
-				Destination:  neigh.IP.String(),
-				HardwareAddr: neigh.HardwareAddr.String(),
-			}
-			deviceCfg.NetworkInterfaceConfigInPod.Neighbors = append(deviceCfg.NetworkInterfaceConfigInPod.Neighbors, neighCfg)
-		}
-
-		// A subinterface has no host addresses to inherit, so its addresses must
-		// come from the user config, a profile, or be explicitly waived via
-		// Addressing: Unnumbered. Routing (including any policy based routing) is
-		// owned by the user or the provider profile; the driver never synthesizes
-		// routes or rules.
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-			iface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
-			if len(iface.Addresses) == 0 && iface.Addressing != apis.AddressingModeUnnumbered {
-				errorList = append(errorList, fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: Unnumbered", result.Device, iface.Type))
-				continue
-			}
-			if iface.Addressing == apis.AddressingModeUnnumbered {
-				klog.V(2).Infof("device %s: unnumbered %s interface requested; skipping address and route configuration", result.Device, iface.Type)
-			}
-		}
-
-		// Get RDMA configuration: link and char devices
-		if rdmaDev, err := inventory.GetRdmaDevice(ifName); err == nil && rdmaDev != "" {
-			if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && !np.rdmaSharedMode {
-				errorList = append(errorList, fmt.Errorf("device %s: interface type %q (subinterface) is not supported with exclusive RDMA mode; use shared RDMA mode", result.Device, deviceCfg.NetworkInterfaceConfigInPod.Interface.Type))
-				continue
-			}
-			klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
-			deviceCfg.RDMADevice = buildRDMAConfig(rdmaDev)
-		}
-
-		// Remove the pinned programs before the NRI hooks since it
-		// has to walk the entire bpf virtual filesystem and is slow
-		// TODO: check if there is some other way to do this
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms != nil &&
-			*deviceCfg.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms {
-			err := unpinBPFPrograms(ifName)
-			if err != nil {
-				klog.Infof("error unpinning ebpf programs for %s : %v", ifName, err)
-			}
-		}
-
-		if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
-			errorList = append(errorList, fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err))
-		}
-		klog.V(4).Infof("Claim Resources for pod %s : %#v", podUID, deviceCfg)
 	}
 
 	if len(errorList) > 0 {
@@ -497,6 +217,303 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 	}
 	return kubeletplugin.PrepareResult{}
+}
+
+// prepareDevice resolves, validates, and persists the configuration of an allocated
+// device for a specific pod.
+// If the device configuration has already been stored for the given pod, it reuses
+// the existing configuration. If an error occurs after dynamic profile has been
+// allocated but before the device is committed to the store, those resources are
+// automatically rolled back.
+//
+// TODO(#290): This function has grown too large and needs to be split apart.
+func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Handle, claim *resourceapi.ResourceClaim, podUID types.UID, result resourceapi.DeviceRequestAllocationResult, rulesByTable map[int][]apis.RuleConfig) error {
+	// Idempotency check: reuse the device configuration if it already exists, as a
+	// second resolution would allocate new profile resources and leak the stored ones.
+	if _, ok := np.podConfigStore.GetDeviceConfig(podUID, result.Device); ok {
+		klog.V(4).Infof("device %s of pod %s is already prepared, reusing the stored configuration", result.Device, podUID)
+		return nil
+	}
+
+	requestName := result.Request
+	userConf := &apis.NetworkConfig{}
+	var configErrors []error
+	for _, config := range claim.Status.Allocation.Devices.Config {
+		// Check there is a config associated to this device
+		if config.Opaque == nil ||
+			config.Opaque.Driver != np.driverName ||
+			len(config.Requests) > 0 && !slices.Contains(config.Requests, requestName) {
+			continue
+		}
+		// Check if there is a custom configuration
+		conf, errs := apis.ValidateConfig(&config.Opaque.Parameters)
+		if len(errs) > 0 {
+			configErrors = append(configErrors, errs...)
+			continue
+		}
+		// TODO: define a strategy for multiple configs
+		if conf != nil {
+			userConf = conf
+			break
+		}
+	}
+	if len(configErrors) > 0 {
+		return errors.Join(configErrors...)
+	}
+
+	mergedConf, err := np.getDeviceNetworkConfig(result.Device, claim, userConf)
+	if err != nil {
+		return err
+	}
+
+	netconf := *mergedConf
+
+	// deviceCommitted tracks whether the device config reached maturity and was persisted
+	// to the store. If the preparation fails in the middle, the deferred function will
+	// release the profile config to avoid leakage.
+	deviceCommitted := false
+	if netconf.Profile != "" {
+		defer func() {
+			if !deviceCommitted {
+				if err := np.netdb.ReleaseProfileConfig(result.Device, claim.UID, &netconf); err != nil {
+					klog.Errorf("failed to release profile config for claim %v device %v: %v", claim.UID, result.Device, err)
+				}
+			}
+		}()
+	}
+
+	klog.V(4).Infof("PrepareResourceClaim %s/%s final Configuration %#v", claim.Namespace, claim.Name, netconf)
+	// Query the local discovery database (netdb) for the card's clean attributes
+	var deviceSnapshot *resourceapi.Device
+	if device, ok := np.netdb.GetDevice(result.Device); ok {
+		deviceSnapshot = &device
+	} else {
+		klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
+	}
+
+	deviceCfg := DeviceConfig{
+		Claim: types.NamespacedName{
+			Namespace: claim.Namespace,
+			Name:      claim.Name,
+		},
+		NetworkInterfaceConfigInPod: netconf,
+		DeviceSnapshot:              deviceSnapshot,
+	}
+
+	// IB-only path: device has RDMA capability but no netdev interface.
+	if np.netdb.IsIBOnlyDevice(result.Device) {
+		// Reject any network-specific config fields for RDMA-only devices.
+		var rdmaConfigErrors []error
+		for _, config := range claim.Status.Allocation.Devices.Config {
+			if config.Opaque == nil ||
+				config.Opaque.Driver != np.driverName ||
+				len(config.Requests) > 0 && !slices.Contains(config.Requests, requestName) {
+				continue
+			}
+			if errs := apis.ValidateRDMAOnlyConfig(&config.Opaque.Parameters); len(errs) > 0 {
+				rdmaConfigErrors = append(rdmaConfigErrors, errs...)
+			}
+		}
+		if len(rdmaConfigErrors) > 0 {
+			return errors.Join(rdmaConfigErrors...)
+		}
+		rdmaDevName, err := np.netdb.GetRDMADeviceName(result.Device)
+		if err != nil {
+			return fmt.Errorf("failed to get RDMA device name for IB-only device %s: %v", result.Device, err)
+		}
+		deviceCfg.RDMADevice = buildRDMAConfig(rdmaDevName)
+		if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
+			return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
+		}
+		deviceCommitted = true
+		klog.V(4).Infof("IB-only claim resources for pod %s : %#v", podUID, deviceCfg)
+		return nil
+	}
+
+	ifName, err := np.netdb.GetNetInterfaceName(result.Device)
+	if err != nil {
+		return fmt.Errorf("failed to get network interface name for device %s: %v", result.Device, err)
+	}
+	// Get Network configuration and merge it
+	link, err := nlHandle.LinkByName(ifName)
+	if err != nil {
+		return fmt.Errorf("failed to get netlink to interface %s: %v", ifName, err)
+	}
+	deviceCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
+
+	if deviceCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
+		// If the interface name was not explicitly overridden, use the same
+		// interface name within the pod's network namespace.
+		deviceCfg.NetworkInterfaceConfigInPod.Interface.Name = ifName
+	}
+
+	// For SR-IOV VFs, the requested MTU must not exceed the parent PF's MTU.
+	// Otherwise the claim is rejected so the Pod fails fast instead of being
+	// created with an illegal MTU configuration.
+	if deviceCfg.NetworkInterfaceConfigInPod.Interface.MTU != nil && inventory.IsSriovVf(ifName) {
+		pfName, err := inventory.GetPFInterfaceName(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to determine parent PF for SR-IOV VF %s: %v", ifName, err)
+		}
+		pfLink, err := nlHandle.LinkByName(pfName)
+		if err != nil {
+			return fmt.Errorf("failed to get netlink to parent PF %s of VF %s: %v", pfName, ifName, err)
+		}
+		requestedMTU := int(*deviceCfg.NetworkInterfaceConfigInPod.Interface.MTU)
+		if err := validateVFMTU(ifName, pfName, requestedMTU, pfLink.Attrs().MTU); err != nil {
+			return err
+		}
+	}
+
+	// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
+	// ... but we DO NOT apply them in the root namespace
+	if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeDHCP {
+		klog.V(2).Infof("trying to get network configuration via DHCP")
+		contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		ip, routes, lease, err := getDHCP(contextCancel, ifName)
+		if err != nil {
+			return fmt.Errorf("fail to get configuration via DHCP for %s: %w", ifName, err)
+		}
+		deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
+		if lease != nil {
+			deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
+		}
+	} else if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
+		// For a passthrough interface with no custom addresses and no DHCP, then use the existing ones
+		// get the existing IP addresses
+		nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			return fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err)
+		}
+		for _, address := range nlAddresses {
+			// Only move IP addresses with global scope because those are not host-specific, auto-configured,
+			// or have limited network scope, making them unsuitable inside the container namespace.
+			// Ref: https://www.ietf.org/rfc/rfc3549.txt
+			if address.Scope != unix.RT_SCOPE_UNIVERSE {
+				continue
+			}
+			deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = append(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses, address.IPNet.String())
+		}
+	}
+
+	// Obtain the existing supported ethtool features and validate the config
+	if deviceCfg.NetworkInterfaceConfigInPod.Ethtool != nil {
+		client, err := newEthtoolClient(0)
+		if err != nil {
+			return fmt.Errorf("fail to create ethtool client %v", err)
+		}
+		defer client.Close()
+
+		ifFeatures, err := client.GetFeatures(ifName)
+		if err != nil {
+			return fmt.Errorf("fail to get ethtool features %v", err)
+		}
+
+		// translate features to the actual kernel names
+		ethtoolFeatures := map[string]bool{}
+		var featureErrors []error
+		for feature, value := range deviceCfg.NetworkInterfaceConfigInPod.Ethtool.Features {
+			aliases := ifFeatures.Get(feature)
+			if len(aliases) == 0 {
+				featureErrors = append(featureErrors, fmt.Errorf("feature %s not supported by interface", feature))
+				continue
+			}
+			for _, alias := range aliases {
+				ethtoolFeatures[alias] = value
+			}
+		}
+		if len(featureErrors) > 0 {
+			return errors.Join(featureErrors...)
+		}
+		deviceCfg.NetworkInterfaceConfigInPod.Ethtool.Features = ethtoolFeatures
+	}
+
+	// For non-subinterface type, obtain the routes and rules associated with the interface.
+	if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
+		routes, tables, err := getRouteInfo(nlHandle, ifName, link)
+		if err != nil {
+			return err
+		}
+		clearStaleRouteSources(routes, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses)
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
+
+		// If VRF is enabled, we do not need to copy the rules from the host
+		// because the VRF handles the routing table lookup.
+		if deviceCfg.NetworkInterfaceConfigInPod.Interface.VRF == nil {
+			for _, table := range tables.UnsortedList() {
+				if rules, ok := rulesByTable[table]; ok {
+					klog.V(5).Infof("Adding %d rules for table %d associated with interface %s", len(rules), table, ifName)
+					deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, rules...)
+					// Avoid adding the same rule twice
+					delete(rulesByTable, table)
+				}
+			}
+		}
+	}
+
+	// Obtain the neighbors associated to the interface
+	neighs, err := nlHandle.NeighList(link.Attrs().Index, netlink.FAMILY_ALL)
+	if err != nil {
+		klog.Infof("failed to get neighbors for interface %s: %v", ifName, err)
+	}
+	for _, neigh := range neighs {
+		if neigh.IP == nil || neigh.HardwareAddr == nil {
+			continue
+		}
+		// We are only interested in permanent neighbor entries
+		if neigh.State != netlink.NUD_PERMANENT {
+			continue
+		}
+		neighCfg := apis.NeighborConfig{
+			Destination:  neigh.IP.String(),
+			HardwareAddr: neigh.HardwareAddr.String(),
+		}
+		deviceCfg.NetworkInterfaceConfigInPod.Neighbors = append(deviceCfg.NetworkInterfaceConfigInPod.Neighbors, neighCfg)
+	}
+
+	// A subinterface has no host addresses to inherit, so its addresses must
+	// come from the user config, a profile, or be explicitly waived via
+	// Addressing: Unnumbered. Routing (including any policy based routing) is
+	// owned by the user or the provider profile; the driver never synthesizes
+	// routes or rules.
+	if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
+		iface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
+		if len(iface.Addresses) == 0 && iface.Addressing != apis.AddressingModeUnnumbered {
+			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: Unnumbered", result.Device, iface.Type)
+		}
+		if iface.Addressing == apis.AddressingModeUnnumbered {
+			klog.V(2).Infof("device %s: unnumbered %s interface requested; skipping address and route configuration", result.Device, iface.Type)
+		}
+	}
+
+	// Get RDMA configuration: link and char devices
+	if rdmaDev, err := inventory.GetRdmaDevice(ifName); err == nil && rdmaDev != "" {
+		if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && !np.rdmaSharedMode {
+			return fmt.Errorf("device %s: interface type %q (subinterface) is not supported with exclusive RDMA mode; use shared RDMA mode", result.Device, deviceCfg.NetworkInterfaceConfigInPod.Interface.Type)
+		}
+		klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
+		deviceCfg.RDMADevice = buildRDMAConfig(rdmaDev)
+	}
+
+	// Remove the pinned programs before the NRI hooks since it
+	// has to walk the entire bpf virtual filesystem and is slow
+	// TODO: check if there is some other way to do this
+	if deviceCfg.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms != nil &&
+		*deviceCfg.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms {
+		err := unpinBPFPrograms(ifName)
+		if err != nil {
+			klog.Infof("error unpinning ebpf programs for %s : %v", ifName, err)
+		}
+	}
+
+	if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
+		return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
+	}
+	deviceCommitted = true
+	klog.V(4).Infof("Claim Resources for pod %s : %#v", podUID, deviceCfg)
+	return nil
 }
 
 func (np *NetworkDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {

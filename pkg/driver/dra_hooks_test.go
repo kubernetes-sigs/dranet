@@ -588,7 +588,9 @@ func TestDynamicProfiles(t *testing.T) {
 		}
 	})
 
-	t.Run("Early Store Profile Release on Subsequent Failure", func(t *testing.T) {
+	t.Run("Profile Release on Subsequent Failure", func(t *testing.T) {
+		released := false
+		var releasedConfig *apis.NetworkConfig
 		fakeDB := newFakeInventoryDB()
 		fakeDB.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return &apis.NetworkConfig{
@@ -599,6 +601,14 @@ func TestDynamicProfiles(t *testing.T) {
 		}
 		fakeDB.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
 			return &apis.NetworkConfig{Profile: "my-profile"}, true
+		}
+		fakeDB.ReleaseProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error {
+			released = true
+			releasedConfig = config
+			if claimUID != "claim-uid-leak" {
+				t.Errorf("Expected claimUID 'claim-uid-leak', got %v", claimUID)
+			}
+			return nil
 		}
 		// Cause a failure AFTER GetProfileConfig
 		fakeDB.GetNetInterfaceNameFunc = func(deviceName string) (string, error) {
@@ -642,14 +652,15 @@ func TestDynamicProfiles(t *testing.T) {
 			t.Fatalf("Expected simulated failure, got %v", res["claim-uid-leak"].Err)
 		}
 
-		// Verify the early device config was stored so Kubelet's call to UnprepareResourceClaims will clean it up
-		podCfg, ok := np.podConfigStore.GetPodConfig("pod-uid-leak")
-		if !ok {
-			t.Fatalf("Expected pod config to be stored early")
+		// Ensure the deferred cleanup released allocated profile resources and left no store state.
+		if !released {
+			t.Errorf("Expected the profile config to be released")
 		}
-		devCfg := podCfg.DeviceConfigs["device-1"]
-		if devCfg.NetworkInterfaceConfigInPod.Profile != "my-profile" {
-			t.Errorf("Expected profile 'my-profile' to be saved for cleanup, got '%v'", devCfg.NetworkInterfaceConfigInPod.Profile)
+		if releasedConfig == nil || len(releasedConfig.Interface.Addresses) != 1 || releasedConfig.Interface.Addresses[0] != "10.0.0.1/24" {
+			t.Errorf("Expected the allocated address to be released, got %v", releasedConfig)
+		}
+		if _, ok := np.podConfigStore.GetPodConfig("pod-uid-leak"); ok {
+			t.Errorf("Expected no pod config to be stored for a failed preparation")
 		}
 	})
 }
@@ -1048,13 +1059,14 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name          string
-		claim         *resourcev1.ResourceClaim
-		setupDB       func(*fakeInventoryDB)
-		wantErr       string
-		wantErrAlso   string
-		wantPodConfig *PodConfig
-		check         func(t *testing.T, db *fakeInventoryDB)
+		name                string
+		claim               *resourcev1.ResourceClaim
+		setupDB             func(*fakeInventoryDB)
+		storedDeviceConfigs map[string]DeviceConfig
+		wantErr             string
+		wantErrAlso         string
+		wantPodConfig       *PodConfig
+		check               func(t *testing.T, db *fakeInventoryDB)
 	}{
 		{
 			name: "single IB-only device builds RDMA config successfully",
@@ -1674,6 +1686,85 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "already prepared device is reused without resolving it again",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-prepared", Namespace: "default", Name: "claim-prepared"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-prepared"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Profile: "cloud-managed"}, true
+				}
+				db.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+					t.Errorf("profile must not be allocated again for a device that is already prepared")
+					return &apis.NetworkConfig{
+						Interface: apis.InterfaceConfig{Addresses: []string{"10.0.0.2/24"}},
+					}, nil
+				}
+			},
+			storedDeviceConfigs: map[string]DeviceConfig{
+				"net-dev-0": {
+					Claim: types.NamespacedName{
+						Namespace: "default",
+						Name:      "claim-prepared",
+					},
+					DeviceSnapshot: &resourcev1.Device{Name: "net-dev-0"},
+					NetworkInterfaceConfigInHost: apis.NetworkConfig{
+						Interface: apis.InterfaceConfig{
+							Name: "dummy0",
+						},
+					},
+					NetworkInterfaceConfigInPod: apis.NetworkConfig{
+						Profile: "cloud-managed",
+						Interface: apis.InterfaceConfig{
+							Name:      "dummy0",
+							Addresses: []string{"10.0.0.1/24"},
+						},
+					},
+				},
+			},
+			wantPodConfig: &PodConfig{
+				DeviceConfigs: map[string]DeviceConfig{
+					"net-dev-0": {
+						Claim: types.NamespacedName{
+							Namespace: "default",
+							Name:      "claim-prepared",
+						},
+						DeviceSnapshot: &resourcev1.Device{Name: "net-dev-0"},
+						NetworkInterfaceConfigInHost: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{
+								Name: "dummy0",
+							},
+						},
+						NetworkInterfaceConfigInPod: apis.NetworkConfig{
+							Profile: "cloud-managed",
+							Interface: apis.InterfaceConfig{
+								Name: "dummy0",
+								// The address should be the pre-stored address rather than the newly set address.
+								Addresses: []string{"10.0.0.1/24"},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1688,6 +1779,12 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 				driverName:     testDriverName,
 				podConfigStore: mustNewPodConfigStore(),
 				eventRecorder:  record.NewFakeRecorder(100),
+			}
+
+			for deviceName, deviceConfig := range tc.storedDeviceConfigs {
+				if err := np.podConfigStore.SetDeviceConfig(tc.claim.Status.ReservedFor[0].UID, deviceName, deviceConfig); err != nil {
+					t.Fatalf("failed to seed the pod config store: %v", err)
+				}
 			}
 
 			gotResult := np.prepareResourceClaim(ctx, tc.claim)
