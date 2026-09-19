@@ -19,16 +19,25 @@ package oke
 import (
 	"cmp"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/unix"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -60,7 +69,49 @@ const (
 	imdsRefreshInterval      = 5 * time.Minute
 	// imdsRequestTimeout limits each request, at startup and in the background.
 	imdsRequestTimeout = 5 * time.Second
+
+	// Oracle Cloud Agent names the RDMA fabric interfaces rdmaN.
+	rdmaNicPrefix = "rdma"
+
+	// okeRDMAProfile is advertised for every Ethernet RDMA NIC and resolved
+	// by this provider into an IPvlan child with a deterministic address.
+	okeRDMAProfile = "oke-rdma"
+	// okeRDMASBRTableBase plus the RDMA NIC index is the routing table of a child.
+	// TableIDForName hashes into 1000 to 1999 and can collide between two
+	// RDMA NICs of one pod; the RDMA NIC index cannot.
+	okeRDMASBRTableBase = 100
+	// okeRDMAParentIPv4CIDR is the OCA RDMA network when rdma_network.json
+	// is not mounted.
+	okeRDMAParentIPv4CIDR = "10.224.0.0/12"
+	// okeRDMAChildIPv4CIDR holds one child per parent at the parent's offset.
+	// It avoids the parent /12 and the OKE pod CIDR 10.240.0.0/12.
+	okeRDMAChildIPv4CIDR = "10.222.0.0/15"
+
+	// Oracle Cloud Agent files that describe the RDMA address assignment.
+	ocaRDMANetworkFileName     = "rdma_network.json"
+	ocaRDMAFeaturesFileName    = "rdma_features_enable.json"
+	ocaIPv4AddressModeClassic  = "classic"
+	ocaIPv4AddressModeSerial   = "host-serial"
+	ocaIPv4AddressModeTopology = "topology"
 )
+
+// Tests point these at a temporary directory or a fake.
+var (
+	sysClassNet         = "/sys/class/net"
+	sysfsPCIDevices     = "/sys/bus/pci/devices"
+	procSysNetIPv4Conf  = "/proc/sys/net/ipv4/conf"
+	ocaConfigDir        = "/etc/oracle-cloud-agent/plugins/oci-hpc/oci-hpc-configure"
+	ibCoreNetnsModeFile = "/sys/module/ib_core/parameters/netns_mode"
+	interfaceAddresses  = func(ifName string) ([]net.Addr, error) {
+		iface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			return nil, err
+		}
+		return iface.Addrs()
+	}
+)
+
+var okeRDMAChildIPv4Range = netip.MustParsePrefix(okeRDMAChildIPv4CIDR)
 
 // imdsHostRDMATopologyData contains the RDMA topology fields from the
 // /opc/v2/host/ response. IMDS populates them only for instances in a
@@ -93,10 +144,44 @@ type imdsInstanceMetadata struct {
 	Shape string `json:"shape"`
 }
 
+// imdsVNICMetadata contains the fields used from one /opc/v2/vnics/ entry.
+type imdsVNICMetadata struct {
+	PrivateIP       string `json:"privateIp"`
+	SubnetCidrBlock string `json:"subnetCidrBlock"`
+}
+
 // rdmaFabric describes the RDMA fabric of the instance.
 type rdmaFabric struct {
 	IPv6   bool
 	Planes int64
+}
+
+// primaryVNIC is the IPv4 address and subnet of the primary VNIC. OCA derives
+// the RDMA NIC addresses from them.
+type primaryVNIC struct {
+	IPv4   netip.Addr
+	Subnet netip.Prefix
+}
+
+// ocaRDMAConfig is the input Oracle Cloud Agent used to assign the RDMA
+// addresses, read from its optional configuration files.
+type ocaRDMAConfig struct {
+	parentIPv4Range netip.Prefix
+	// ipv4AddressMode is empty when the features file was not read.
+	ipv4AddressMode string
+}
+
+type ocaRDMANetworkFile struct {
+	RDMANetwork []struct {
+		DefaultSettings struct {
+			RDMANetwork string `json:"rdma_network"`
+		} `json:"default-settings"`
+	} `json:"rdma-network"`
+}
+
+type ocaRDMAFeaturesFile struct {
+	HostSerialIPv4 bool `json:"host_serial_based_rdma_ips"`
+	TopologyIPv4   bool `json:"ipv4_topology_based_rdma_ips"`
 }
 
 // okeMetadata is one immutable snapshot of the instance metadata.
@@ -109,17 +194,30 @@ type okeMetadata struct {
 	GpuMemoryFabric string
 	Shape           string
 	RDMAFabric      *rdmaFabric
+	// PrimaryVNIC is read once, on a node with Ethernet RDMA NICs. It is nil
+	// until that read succeeds.
+	PrimaryVNIC *primaryVNIC
 }
 
 type metadataFetcher func(context.Context) (*okeMetadata, error)
 
-var _ cloudprovider.CloudInstance = (*OKEInstance)(nil)
+var (
+	_ cloudprovider.CloudInstance   = (*OKEInstance)(nil)
+	_ cloudprovider.ProfileProvider = (*OKEInstance)(nil)
+)
 
 // OKEInstance holds the OKE instance metadata and refreshes it from IMDS in
 // the background.
 type OKEInstance struct {
-	metadata             atomic.Pointer[okeMetadata]
-	fetchMetadata        metadataFetcher
+	metadata      atomic.Pointer[okeMetadata]
+	fetchMetadata metadataFetcher
+	// The next two are set once in start, before the refresh loop starts.
+	ocaConfig ocaRDMAConfig
+	// addressFallback identifies RDMA NICs by their OCA address on a node
+	// whose RDMA NICs do not carry the rdmaN name.
+	addressFallback bool
+	// layoutValidated is set once the classic host layout check has passed.
+	layoutValidated      atomic.Bool
 	initialRetryInterval time.Duration
 	initialWait          time.Duration
 	refreshInterval      time.Duration
@@ -128,6 +226,8 @@ type OKEInstance struct {
 func newOKEInstance(metadata *okeMetadata, fetch metadataFetcher) *OKEInstance {
 	instance := &OKEInstance{
 		fetchMetadata:        fetch,
+		ocaConfig:            defaultOCARDMAConfig(),
+		addressFallback:      true,
 		initialRetryInterval: imdsInitialRetryInterval,
 		initialWait:          imdsInitialWait,
 		refreshInterval:      imdsRefreshInterval,
@@ -196,10 +296,212 @@ func ocidSuffix(s string) (string, error) {
 	return suffix, nil
 }
 
-// GetDeviceConfig returns nil as OCI does not provide device-specific
-// network configuration through IMDS.
+// GetDeviceConfig advertises the OKE profile with the IPvlan type for an
+// Ethernet RDMA NIC, so the RDMA NIC never moves into a pod. An RDMA NIC on an IPv6
+// fabric gets no profile and moves into the pod as before, because the
+// profile has no IPv6 support yet.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
+	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	if err != nil || !o.isRDMANic(ifName) {
+		return nil
+	}
+	if metadata := o.metadata.Load(); metadata != nil && metadata.RDMAFabric != nil && metadata.RDMAFabric.IPv6 {
+		return nil
+	}
+	return &apis.NetworkConfig{
+		Profile:   okeRDMAProfile,
+		Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN},
+	}
+}
+
+// GetProfileConfig resolves the OKE profile into an IPvlan child with the
+// deterministic address and its source routing. It returns an error, which
+// Kubernetes retries, until the metadata and the OCA parent address exist.
+func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+	if config == nil {
+		return nil, errors.New("OKE profile configuration is required")
+	}
+	if config.Profile != okeRDMAProfile {
+		return nil, fmt.Errorf("unsupported OKE profile %q", config.Profile)
+	}
+	if err := validateOKEProfileRequest(&config.Interface); err != nil {
+		return nil, err
+	}
+
+	metadata := o.metadata.Load()
+	switch {
+	case metadata == nil || metadata.RDMAFabric == nil:
+		return nil, errors.New("OKE RDMA fabric data is not available yet")
+	case metadata.RDMAFabric.IPv6:
+		return nil, errors.New("the OKE profile does not support an IPv6 RDMA fabric yet")
+	case metadata.PrimaryVNIC == nil:
+		return nil, errors.New("OKE primary VNIC metadata is not available yet")
+	}
+	mode := o.ocaConfig.ipv4AddressMode
+	if mode != "" && mode != ocaIPv4AddressModeClassic {
+		return nil, fmt.Errorf("the OKE profile does not support OCA IPv4 address mode %q", mode)
+	}
+
+	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	if err != nil {
+		return nil, err
+	}
+	hardwareType, err := interfaceHardwareType(ifName)
+	if err != nil {
+		return nil, err
+	}
+	if hardwareType != unix.ARPHRD_ETHER {
+		return nil, fmt.Errorf("the OKE profile requires an Ethernet parent, but %s has ARPHRD type %d", ifName, hardwareType)
+	}
+	// The sysctl reads are cheap and can reject the request before any
+	// address read, which costs a netlink dump.
+	arpIgnore, arpAnnounce, err := parentARPPolicy(ifName, config.Interface.ARPIgnore, config.Interface.ARPAnnounce)
+	if err != nil {
+		return nil, err
+	}
+
+	vnic, parentRange := metadata.PrimaryVNIC, o.ocaConfig.parentIPv4Range
+	addresses, err := interfaceIPv4Addresses(ifName)
+	if err != nil {
+		return nil, err
+	}
+	index, err := resolveRDMANicIndex(ifName, addressIn(addresses, parentRange), vnic, parentRange)
+	if err != nil {
+		return nil, err
+	}
+	parentAddr, childAddr, err := deriveRDMAIPv4(vnic, index, parentRange)
+	if err != nil {
+		return nil, fmt.Errorf("could not derive the OKE child address for %s: %w", ifName, err)
+	}
+	if err := checkParentAddress(ifName, addresses, parentAddr); err != nil {
+		return nil, err
+	}
+	// Without the features file the address mode is a guess. Check the whole
+	// host once before trusting it.
+	if mode == "" && !o.layoutValidated.Load() {
+		if err := o.validateClassicHostLayout(vnic); err != nil {
+			return nil, fmt.Errorf("could not validate the OCA classic IPv4 layout: %w", err)
+		}
+		o.layoutValidated.Store(true)
+	}
+
+	result := &apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{
+			Type:        apis.InterfaceTypeIPVLAN,
+			Addresses:   []string{netip.PrefixFrom(childAddr, okeRDMAChildIPv4Range.Bits()).String()},
+			ARPIgnore:   arpIgnore,
+			ARPAnnounce: arpAnnounce,
+		},
+	}
+	// Routing is user-owned when the claim carries routes, rules, or a VRF.
+	if len(config.Routes) > 0 || len(config.Rules) > 0 || config.Interface.VRF != nil {
+		return result, nil
+	}
+	table := okeRDMASBRTableBase + index
+	result.Routes = []apis.RouteConfig{{
+		Destination: okeRDMAChildIPv4CIDR,
+		Source:      childAddr.String(),
+		Scope:       unix.RT_SCOPE_LINK,
+		Table:       table,
+	}}
+	result.Rules = []apis.RuleConfig{{
+		Priority: apis.SourceRoutingRulePriority,
+		Source:   netip.PrefixFrom(childAddr, childAddr.BitLen()).String(),
+		Table:    table,
+	}}
+	return result, nil
+}
+
+// ReleaseProfileConfig has nothing to free: the child address is deterministic.
+func (o *OKEInstance) ReleaseProfileConfig(cloudprovider.DeviceIdentifiers, types.UID, *apis.NetworkConfig) error {
 	return nil
+}
+
+// validateOKEProfileRequest rejects the claim settings the OKE profile does
+// not support. An RDMA NIC stays on the host, so a passthrough request is an
+// error. The driver folds the deprecated dhcp field into Addressing first.
+func validateOKEProfileRequest(iface *apis.InterfaceConfig) error {
+	if iface.Type == apis.InterfaceTypePassthrough {
+		return errors.New("the OKE profile does not move an RDMA NIC into a pod; remove interface.type: Passthrough")
+	}
+	if iface.Addressing == apis.AddressingModeDHCP {
+		return errors.New("the OKE profile does not support DHCP addressing")
+	}
+	if iface.Addressing == apis.AddressingModeUnnumbered {
+		return errors.New("the OKE profile does not support unnumbered addressing")
+	}
+	if len(iface.Addresses) > 0 {
+		return errors.New("the OKE profile assigns the child address; remove interface.addresses")
+	}
+	return nil
+}
+
+// resolveRDMANicIndex returns the RDMA NIC index from the rdmaN name, or
+// inverts it from the live OCA address of an RDMA NIC without that name.
+func resolveRDMANicIndex(ifName string, address netip.Addr, vnic *primaryVNIC, parentRange netip.Prefix) (int, error) {
+	if index, ok := rdmaNicIndex(ifName); ok {
+		return index, nil
+	}
+	if !address.IsValid() {
+		return 0, fmt.Errorf("interface %s has no address in the OCA RDMA network %s yet", ifName, parentRange)
+	}
+	index, err := rdmaNicIndexFromAddress(vnic, address, parentRange)
+	if err != nil {
+		return 0, fmt.Errorf("interface %s: %w", ifName, err)
+	}
+	klog.V(2).Infof("OKE RDMA NIC index %d of %s comes from its address %s", index, ifName, address)
+	return index, nil
+}
+
+// parentARPPolicy fills the ARP settings the claim leaves unset from the
+// parent, so the child answers ARP the way OCA configured the RDMA NIC.
+func parentARPPolicy(ifName string, arpIgnore, arpAnnounce *int32) (*int32, *int32, error) {
+	var err error
+	if arpIgnore == nil {
+		if arpIgnore, err = readARPSysctl(ifName, "arp_ignore"); err != nil {
+			return nil, nil, err
+		}
+	}
+	if arpAnnounce == nil {
+		if arpAnnounce, err = readARPSysctl(ifName, "arp_announce"); err != nil {
+			return nil, nil, err
+		}
+	}
+	var missing []string
+	if arpIgnore == nil {
+		missing = append(missing, "interface.arpIgnore")
+	}
+	if arpAnnounce == nil {
+		missing = append(missing, "interface.arpAnnounce")
+	}
+	if len(missing) > 0 {
+		fields := strings.Join(missing, " and ")
+		return nil, nil, fmt.Errorf("the OKE profile could not read %s from host interface %s; set %s in the claim", fields, ifName, fields)
+	}
+	return arpIgnore, arpAnnounce, nil
+}
+
+// readARPSysctl returns nil without an error when the setting does not exist.
+func readARPSysctl(ifName, setting string) (*int32, error) {
+	name := filepath.Join(procSysNetIPv4Conf, ifName, setting)
+	data, err := os.ReadFile(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not read %s: %w", name, err)
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse %s: %w", name, err)
+	}
+	if setting == "arp_ignore" && value != 0 && value != 1 && value != 2 && value != 3 && value != 8 {
+		return nil, fmt.Errorf("%s has unsupported value %d", name, value)
+	}
+	if setting == "arp_announce" && (value < 0 || value > 2) {
+		return nil, fmt.Errorf("%s has unsupported value %d", name, value)
+	}
+	return ptr.To(int32(value)), nil
 }
 
 // OnOKE returns true if running on an Oracle Cloud Infrastructure instance.
@@ -296,10 +598,12 @@ func metadataFromIMDS(host *imdsHostMetadata, instance *imdsInstanceMetadata) *o
 	return metadata
 }
 
-// fetchOKEMetadata reads the host and instance endpoints independently and
-// builds a snapshot from the ones that answered. A host failure returns the
-// snapshot together with the error, so start keeps polling for the host data.
-func fetchOKEMetadata(ctx context.Context, client *http.Client, endpoint string) (*okeMetadata, error) {
+// fetchOKEMetadata reads the host, instance, and vnics endpoints independently
+// and builds a snapshot from the ones that answered. The vnics read happens
+// only while the primary VNIC is unknown on a node with RDMA NICs. A host or VNIC
+// failure returns the snapshot together with the error, so start keeps polling
+// for the required data. An instance failure is only logged.
+func fetchOKEMetadata(ctx context.Context, client *http.Client, endpoint string, needVNIC bool) (*okeMetadata, error) {
 	host := &imdsHostMetadata{}
 	hostErr := queryIMDS(ctx, client, endpoint+"/host/", host)
 	if hostErr != nil {
@@ -308,15 +612,63 @@ func fetchOKEMetadata(ctx context.Context, client *http.Client, endpoint string)
 	}
 
 	instance := &imdsInstanceMetadata{}
-	if err := queryIMDS(ctx, client, endpoint+"/instance/", instance); err != nil {
-		if hostErr != nil {
-			return nil, fmt.Errorf("%w; %w", hostErr, err)
-		}
-		klog.Warningf("Could not query OCI IMDS instance metadata: %v", err)
+	instanceErr := queryIMDS(ctx, client, endpoint+"/instance/", instance)
+	if instanceErr != nil {
 		instance = nil
 	}
 
-	return metadataFromIMDS(host, instance), hostErr
+	var vnic *primaryVNIC
+	var vnicErr error
+	if needVNIC {
+		var vnics []imdsVNICMetadata
+		if vnicErr = queryIMDS(ctx, client, endpoint+"/vnics/", &vnics); vnicErr == nil {
+			vnic, vnicErr = parsePrimaryVNIC(vnics)
+		}
+		if vnicErr == nil && vnic == nil {
+			vnicErr = errors.New("OCI IMDS primary VNIC has no IPv4 address yet")
+		}
+	}
+
+	if host == nil && instance == nil && vnic == nil {
+		return nil, errors.Join(hostErr, instanceErr, vnicErr)
+	}
+	if instanceErr != nil {
+		klog.Warningf("Could not query OCI IMDS instance metadata: %v", instanceErr)
+	}
+	metadata := metadataFromIMDS(host, instance)
+	metadata.PrimaryVNIC = vnic
+	return metadata, errors.Join(hostErr, vnicErr)
+}
+
+// parsePrimaryVNIC returns the IPv4 data of the first entry, the primary VNIC.
+// OCA reads the same entry. It returns nil without an error when the primary
+// VNIC has no IPv4 address.
+func parsePrimaryVNIC(vnics []imdsVNICMetadata) (*primaryVNIC, error) {
+	if len(vnics) == 0 {
+		return nil, errors.New("OCI IMDS vnics response is empty")
+	}
+	primary := vnics[0]
+	if primary.PrivateIP == "" {
+		return nil, nil
+	}
+	ip, err := netip.ParseAddr(primary.PrivateIP)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse primary VNIC address %q: %w", primary.PrivateIP, err)
+	}
+	if !ip.Is4() {
+		return nil, nil
+	}
+	if primary.SubnetCidrBlock == "" {
+		return nil, errors.New("OCI IMDS vnics response does not contain subnetCidrBlock")
+	}
+	subnet, err := netip.ParsePrefix(primary.SubnetCidrBlock)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse primary VNIC subnet %q: %w", primary.SubnetCidrBlock, err)
+	}
+	if !subnet.Addr().Is4() {
+		return nil, nil
+	}
+	return &primaryVNIC{IPv4: ip, Subnet: subnet.Masked()}, nil
 }
 
 // mergeMetadata keeps the last non-empty value for a field that next omits.
@@ -334,6 +686,9 @@ func mergeMetadata(current, next *okeMetadata) *okeMetadata {
 	merged.Shape = cmp.Or(merged.Shape, current.Shape)
 	if merged.RDMAFabric == nil {
 		merged.RDMAFabric = current.RDMAFabric
+	}
+	if merged.PrimaryVNIC == nil {
+		merged.PrimaryVNIC = current.PrimaryVNIC
 	}
 	return &merged
 }
@@ -393,7 +748,21 @@ func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
 // ctx ends.
 func (o *OKEInstance) start(ctx context.Context, client *http.Client, endpoint string) (*OKEInstance, error) {
 	o.fetchMetadata = func(ctx context.Context) (*okeMetadata, error) {
-		return fetchOKEMetadata(ctx, client, endpoint)
+		// The primary VNIC is read until known, and only on a node with
+		// RDMA NICs. The RDMA NIC check repeats, because an RDMA NIC can appear or get its
+		// OCA address after startup.
+		current := o.metadata.Load()
+		needVNIC := (current == nil || current.PrimaryVNIC == nil) && o.hasRDMANic()
+		return fetchOKEMetadata(ctx, client, endpoint, needVNIC)
+	}
+	// The OCA files are static per boot. Read them once, before the RDMA NIC
+	// check, because the parent range identifies unnamed RDMA NICs.
+	o.ocaConfig = loadOCARDMAConfig(ocaConfigDir)
+	o.addressFallback = !hasNamedRDMANic()
+	// The driver rejects IPvlan children in exclusive mode. Say so once here
+	// instead of on the first failed claim.
+	if o.hasRDMANic() && rdmaExclusiveNetnsMode() {
+		klog.Warningf("The RDMA subsystem runs in exclusive network namespace mode; the OKE profile creates IPvlan children, so claims for RDMA NICs fail until the node uses shared mode (ib_core netns_mode=1)")
 	}
 
 	var lastErr error
@@ -413,4 +782,378 @@ func (o *OKEInstance) start(ctx context.Context, client *http.Client, endpoint s
 	}
 	go o.refreshLoop(ctx)
 	return o, nil
+}
+
+// rdmaExclusiveNetnsMode reports whether the ib_core module parameter says
+// exclusive mode. A missing or unreadable value counts as shared, like the
+// driver's own fallback.
+func rdmaExclusiveNetnsMode() bool {
+	data, err := os.ReadFile(ibCoreNetnsModeFile)
+	if err != nil {
+		return false
+	}
+	value := strings.TrimSpace(string(data))
+	return value == "N" || value == "0"
+}
+
+// hasNamedRDMANic reports whether the node has an Ethernet rdmaN interface.
+func hasNamedRDMANic() bool {
+	entries, err := os.ReadDir(sysClassNet)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if _, ok := rdmaNicIndex(entry.Name()); !ok {
+			continue
+		}
+		if hardwareType, err := interfaceHardwareType(entry.Name()); err == nil && hardwareType == unix.ARPHRD_ETHER {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRDMANic reports whether the node has an Ethernet RDMA NIC.
+func (o *OKEInstance) hasRDMANic() bool {
+	entries, err := os.ReadDir(sysClassNet)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if o.isRDMANic(entry.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRDMANic reports whether ifName is an Ethernet RDMA NIC: it has the rdmaN
+// name or, on a node without such names, an address in the OCA RDMA network.
+// The VCN NICs are Mellanox devices too, so hardware is not enough.
+func (o *OKEInstance) isRDMANic(ifName string) bool {
+	hardwareType, err := interfaceHardwareType(ifName)
+	if err != nil || hardwareType != unix.ARPHRD_ETHER {
+		return false
+	}
+	if _, ok := rdmaNicIndex(ifName); ok {
+		return true
+	}
+	if !o.addressFallback {
+		return false
+	}
+	addresses, err := interfaceIPv4Addresses(ifName)
+	return err == nil && addressIn(addresses, o.ocaConfig.parentIPv4Range).IsValid()
+}
+
+// rdmaNicIndex returns the RDMA NIC index encoded in an rdmaN name. OCA
+// assigns the name and the RDMA NIC address from the same table entry.
+func rdmaNicIndex(ifName string) (int, bool) {
+	digits, ok := strings.CutPrefix(ifName, rdmaNicPrefix)
+	if !ok {
+		return 0, false
+	}
+	index, err := strconv.ParseUint(digits, 10, 31)
+	if err != nil {
+		return 0, false
+	}
+	return int(index), true
+}
+
+// interfaceIPv4Addresses returns the non-link-local IPv4 addresses of ifName.
+func interfaceIPv4Addresses(ifName string) ([]netip.Addr, error) {
+	addresses, err := interfaceAddresses(ifName)
+	if err != nil {
+		return nil, fmt.Errorf("could not read addresses for %s: %w", ifName, err)
+	}
+	var result []netip.Addr
+	for _, address := range addresses {
+		ipNet, ok := address.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		addr, ok := netip.AddrFromSlice(ipNet.IP)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		if !addr.Is4() || addr.IsLinkLocalUnicast() {
+			continue
+		}
+		result = append(result, addr)
+	}
+	return result, nil
+}
+
+// addressIn returns the first address inside prefix, or an invalid address.
+func addressIn(addresses []netip.Addr, prefix netip.Prefix) netip.Addr {
+	for _, address := range addresses {
+		if prefix.Contains(address) {
+			return address
+		}
+	}
+	return netip.Addr{}
+}
+
+// checkParentAddress requires the derived OCA address among the live ones.
+// No address is retryable, because OCA may assign it later. A different
+// address means the layout is not the one derived.
+func checkParentAddress(ifName string, addresses []netip.Addr, expected netip.Addr) error {
+	for _, address := range addresses {
+		if address == expected {
+			return nil
+		}
+	}
+	if len(addresses) > 0 {
+		return fmt.Errorf("interface %s has address %s, but the derived OCA address is %s", ifName, addresses[0], expected)
+	}
+	return fmt.Errorf("interface %s does not have the expected OCA address %s yet", ifName, expected)
+}
+
+// validateClassicHostLayout checks every RDMA NIC that holds an OCA address
+// against the classic formula. One RDMA NIC can match by coincidence under
+// another OCA address mode; a whole host cannot.
+func (o *OKEInstance) validateClassicHostLayout(vnic *primaryVNIC) error {
+	parentRange := o.ocaConfig.parentIPv4Range
+	entries, err := os.ReadDir(sysClassNet)
+	if err != nil {
+		return fmt.Errorf("could not read network interfaces: %w", err)
+	}
+	checked := 0
+	for _, entry := range entries {
+		ifName := entry.Name()
+		if !o.isRDMANic(ifName) {
+			continue
+		}
+		addresses, err := interfaceIPv4Addresses(ifName)
+		if err != nil {
+			return err
+		}
+		address := addressIn(addresses, parentRange)
+		if !address.IsValid() {
+			// OCA has not configured this RDMA NIC yet.
+			continue
+		}
+		index, err := resolveRDMANicIndex(ifName, address, vnic, parentRange)
+		if err != nil {
+			return err
+		}
+		expected, _, err := deriveOCAParentIPv4(vnic, index, parentRange)
+		if err != nil {
+			return fmt.Errorf("could not derive the OCA address for %s: %w", ifName, err)
+		}
+		if address != expected {
+			return fmt.Errorf("interface %s has address %s, but the derived OCA address is %s", ifName, address, expected)
+		}
+		checked++
+	}
+	if checked == 0 {
+		return errors.New("no Ethernet RDMA NIC holds an OCA address yet")
+	}
+	return nil
+}
+
+func ipv4ToUint32(addr netip.Addr) uint32 {
+	bytes := addr.As4()
+	return binary.BigEndian.Uint32(bytes[:])
+}
+
+func uint32ToIPv4(value uint32) netip.Addr {
+	var bytes [4]byte
+	binary.BigEndian.PutUint32(bytes[:], value)
+	return netip.AddrFrom4(bytes)
+}
+
+func validateVNIC(vnic *primaryVNIC) error {
+	if vnic == nil {
+		return errors.New("OKE primary VNIC metadata is not available")
+	}
+	if !vnic.IPv4.Is4() || !vnic.Subnet.Addr().Is4() {
+		return errors.New("OKE primary VNIC has no IPv4 address")
+	}
+	if !vnic.Subnet.Contains(vnic.IPv4) {
+		return fmt.Errorf("primary VNIC address %s is outside its subnet %s", vnic.IPv4, vnic.Subnet)
+	}
+	return nil
+}
+
+// deriveOCAParentIPv4 computes the address that OCA classic mode assigns to
+// one RDMA NIC,
+// parent = base + nicIndex*subnetSize + (vnicIP - vnicSubnetBase),
+// and the offset of that address inside the OCA RDMA network.
+func deriveOCAParentIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Prefix) (netip.Addr, uint64, error) {
+	if err := validateVNIC(vnic); err != nil {
+		return netip.Addr{}, 0, err
+	}
+	if !parentRange.IsValid() || !parentRange.Addr().Is4() || parentRange != parentRange.Masked() {
+		return netip.Addr{}, 0, fmt.Errorf("OCA RDMA network %s is not a masked IPv4 prefix", parentRange)
+	}
+	subnet := vnic.Subnet
+	if subnet.Overlaps(parentRange) {
+		return netip.Addr{}, 0, fmt.Errorf("primary VNIC subnet %s overlaps the OCA RDMA network %s", subnet, parentRange)
+	}
+	blockSize := uint64(1) << (32 - subnet.Bits())
+	hostPosition := uint64(ipv4ToUint32(vnic.IPv4) - ipv4ToUint32(subnet.Addr()))
+	offset := uint64(nicIndex)*blockSize + hostPosition
+	if offset >= uint64(1)<<(32-parentRange.Bits()) {
+		return netip.Addr{}, 0, fmt.Errorf("RDMA NIC index %d with a /%d primary VNIC subnet is outside the OCA RDMA network %s", nicIndex, subnet.Bits(), parentRange)
+	}
+	return uint32ToIPv4(ipv4ToUint32(parentRange.Addr()) + uint32(offset)), offset, nil
+}
+
+// deriveRDMAIPv4 computes the OCA parent and the Dranet child address of one
+// RDMA NIC. The child keeps the parent offset inside the child range.
+func deriveRDMAIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Prefix) (netip.Addr, netip.Addr, error) {
+	parent, offset, err := deriveOCAParentIPv4(vnic, nicIndex, parentRange)
+	if err != nil {
+		return netip.Addr{}, netip.Addr{}, err
+	}
+	childRange := okeRDMAChildIPv4Range
+	if parentRange.Overlaps(childRange) {
+		return netip.Addr{}, netip.Addr{}, fmt.Errorf("OCA RDMA network %s overlaps the Dranet child range %s", parentRange, childRange)
+	}
+	// A VNIC subnet inside the child range would collide with child addresses.
+	if vnic.Subnet.Overlaps(childRange) {
+		return netip.Addr{}, netip.Addr{}, fmt.Errorf("primary VNIC subnet %s overlaps the Dranet child range %s", vnic.Subnet, childRange)
+	}
+	if offset >= uint64(1)<<(32-childRange.Bits()) {
+		return netip.Addr{}, netip.Addr{}, fmt.Errorf("RDMA NIC index %d with a /%d primary VNIC subnet is outside the child range %s", nicIndex, vnic.Subnet.Bits(), childRange)
+	}
+	child := uint32ToIPv4(ipv4ToUint32(childRange.Addr()) + uint32(offset))
+	return parent, child, nil
+}
+
+// rdmaNicIndexFromAddress inverts the classic formula for a parent without an
+// rdmaN name. The remainder of the offset must equal the host position of the
+// primary VNIC, which rejects an address that OCA did not derive for this host.
+func rdmaNicIndexFromAddress(vnic *primaryVNIC, address netip.Addr, parentRange netip.Prefix) (int, error) {
+	if err := validateVNIC(vnic); err != nil {
+		return 0, err
+	}
+	if !parentRange.Contains(address) {
+		return 0, fmt.Errorf("address %s is outside the OCA RDMA network %s", address, parentRange)
+	}
+	subnet := vnic.Subnet
+	blockSize := uint64(1) << (32 - subnet.Bits())
+	hostPosition := uint64(ipv4ToUint32(vnic.IPv4) - ipv4ToUint32(subnet.Addr()))
+	offset := uint64(ipv4ToUint32(address) - ipv4ToUint32(parentRange.Addr()))
+	if offset%blockSize != hostPosition {
+		return 0, fmt.Errorf("address %s does not match the primary VNIC position %d in a /%d subnet", address, hostPosition, subnet.Bits())
+	}
+	return int(offset / blockSize), nil
+}
+
+func defaultOCARDMAConfig() ocaRDMAConfig {
+	return ocaRDMAConfig{parentIPv4Range: netip.MustParsePrefix(okeRDMAParentIPv4CIDR)}
+}
+
+// parseOCARDMANetwork reads rdma-network[0].default-settings.rdma_network,
+// the only field OCA uses for the RDMA network.
+func parseOCARDMANetwork(data []byte) (netip.Prefix, error) {
+	var file ocaRDMANetworkFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return netip.Prefix{}, fmt.Errorf("could not parse %s: %w", ocaRDMANetworkFileName, err)
+	}
+	if len(file.RDMANetwork) == 0 {
+		return netip.Prefix{}, fmt.Errorf("%s has no rdma-network entries", ocaRDMANetworkFileName)
+	}
+	value := file.RDMANetwork[0].DefaultSettings.RDMANetwork
+	if value == "" {
+		return netip.Prefix{}, fmt.Errorf("%s does not contain rdma_network", ocaRDMANetworkFileName)
+	}
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("could not parse rdma_network %q: %w", value, err)
+	}
+	if !prefix.Addr().Is4() {
+		return netip.Prefix{}, fmt.Errorf("rdma_network %q is not an IPv4 prefix", value)
+	}
+	if prefix != prefix.Masked() {
+		return netip.Prefix{}, fmt.Errorf("rdma_network %q is not a masked prefix", value)
+	}
+	return prefix, nil
+}
+
+// parseOCARDMAFeatures maps the OCA feature flags to the IPv4 address mode.
+func parseOCARDMAFeatures(data []byte) (string, error) {
+	var file ocaRDMAFeaturesFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return "", fmt.Errorf("could not parse %s: %w", ocaRDMAFeaturesFileName, err)
+	}
+	if file.HostSerialIPv4 {
+		return ocaIPv4AddressModeSerial, nil
+	}
+	if file.TopologyIPv4 {
+		return ocaIPv4AddressModeTopology, nil
+	}
+	return ocaIPv4AddressModeClassic, nil
+}
+
+// loadOCARDMAConfig reads the optional OCA files from dir. A missing or
+// unusable file keeps the default, because a wrong guess only fails claims
+// through the parent address check and never disables the provider.
+func loadOCARDMAConfig(dir string) ocaRDMAConfig {
+	config := defaultOCARDMAConfig()
+
+	networkPath := filepath.Join(dir, ocaRDMANetworkFileName)
+	data, err := os.ReadFile(networkPath)
+	switch {
+	case err == nil:
+		prefix, parseErr := parseOCARDMANetwork(data)
+		if parseErr != nil {
+			klog.Warningf("Could not use OCA RDMA network file %s; using %s: %v", networkPath, config.parentIPv4Range, parseErr)
+		} else {
+			config.parentIPv4Range = prefix
+			klog.Infof("Using OCA RDMA network %s from %s", prefix, networkPath)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		klog.V(2).Infof("OCA RDMA network file %s is not mounted; using %s", networkPath, config.parentIPv4Range)
+	default:
+		klog.Warningf("Could not read OCA RDMA network file %s; using %s: %v", networkPath, config.parentIPv4Range, err)
+	}
+
+	featuresPath := filepath.Join(dir, ocaRDMAFeaturesFileName)
+	data, err = os.ReadFile(featuresPath)
+	switch {
+	case err == nil:
+		mode, parseErr := parseOCARDMAFeatures(data)
+		if parseErr != nil {
+			klog.Warningf("Could not use OCA RDMA features file %s; assuming classic IPv4 mode: %v", featuresPath, parseErr)
+		} else {
+			config.ipv4AddressMode = mode
+			klog.Infof("Using OCA RDMA IPv4 address mode %s from %s", mode, featuresPath)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		klog.V(2).Infof("OCA RDMA features file %s is not mounted; assuming classic IPv4 mode", featuresPath)
+	default:
+		klog.Warningf("Could not read OCA RDMA features file %s; assuming classic IPv4 mode: %v", featuresPath, err)
+	}
+
+	return config
+}
+
+func interfaceHardwareType(ifName string) (int, error) {
+	name := filepath.Join(sysClassNet, ifName, "type")
+	data, err := os.ReadFile(name)
+	if err != nil {
+		return 0, fmt.Errorf("could not read %s: %w", name, err)
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("could not parse %s: %w", name, err)
+	}
+	return value, nil
+}
+
+func interfaceNameForPCIAddress(pciAddress string) (string, error) {
+	if pciAddress == "" {
+		return "", errors.New("device has no PCI address")
+	}
+	entries, err := os.ReadDir(filepath.Join(sysfsPCIDevices, pciAddress, "net"))
+	if err != nil {
+		return "", fmt.Errorf("could not read network interfaces for PCI device %s: %w", pciAddress, err)
+	}
+	if len(entries) != 1 {
+		return "", fmt.Errorf("expected one network interface for PCI device %s, got %d", pciAddress, len(entries))
+	}
+	return entries[0].Name(), nil
 }
