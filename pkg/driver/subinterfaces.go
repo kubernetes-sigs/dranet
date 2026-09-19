@@ -118,9 +118,10 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 		return nil, err
 	}
 
-	// Apply before the link comes up so it never answers ARP with the wrong policy.
-	if err := applyInterfaceARPConfig(containerNs, ifName, config); err != nil {
-		return nil, fmt.Errorf("failed to apply ARP configuration to interface %s: %w", ifName, err)
+	// Apply before the link comes up so it never answers ARP or accepts router
+	// advertisements with the wrong policy.
+	if err := applyInterfaceSysctlConfig(containerNs, ifName, config); err != nil {
+		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s: %w", ifName, err)
 	}
 
 	networkData = &resourceapi.NetworkDeviceData{

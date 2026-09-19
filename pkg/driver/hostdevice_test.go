@@ -99,17 +99,20 @@ func Test_nhNetdev(t *testing.T) {
 	if err := netlink.LinkSetUp(link); err != nil {
 		t.Fatalf("Failed to add veth link %s in ns %s: %v", ifaceName, nsName, err)
 	}
+	// The MTU stays at or above the IPv6 minimum of 1280. Below it the kernel
+	// creates no IPv6 settings for the interface, so accept_ra cannot be applied.
 	config := apis.InterfaceConfig{
 		Name:           "dranet0",
 		Addresses:      []string{"192.168.7.7/32"},
-		MTU:            ptr.To[int32](1234),
+		MTU:            ptr.To[int32](1300),
 		HardwareAddr:   ptr.To("00:11:22:33:44:55"),
 		GSOMaxSize:     ptr.To[int32](1024),
 		GROMaxSize:     ptr.To[int32](1025),
 		GSOIPv4MaxSize: ptr.To[int32](1026),
 		GROIPv4MaxSize: ptr.To[int32](1027),
-		ARPIgnore:      ptr.To[int32](1),
-		ARPAnnounce:    ptr.To[int32](2),
+		ARPIgnore:      ptr.To[int32](3),
+		ARPAnnounce:    ptr.To[int32](1),
+		AcceptRA:       ptr.To[int32](2),
 	}
 
 	deviceData, err := nsAttachNetdev(ifaceName, containerNsPath, config)
@@ -162,20 +165,22 @@ func Test_nhNetdev(t *testing.T) {
 		// lo is the control: it shares the namespace but has no config, so it
 		// shows the namespace default the moved interface would have kept.
 		for _, tc := range []struct {
+			family  string
 			setting string
 			want    int
 		}{
-			{"arp_ignore", int(*config.ARPIgnore)},
-			{"arp_announce", int(*config.ARPAnnounce)},
+			{"ipv4", "arp_ignore", int(*config.ARPIgnore)},
+			{"ipv4", "arp_announce", int(*config.ARPAnnounce)},
+			{"ipv6", "accept_ra", int(*config.AcceptRA)},
 		} {
-			got, err := sysctl.New().GetSysctl(fmt.Sprintf("net/ipv4/conf/%s/%s", config.Name, tc.setting))
+			got, err := sysctl.New().GetSysctl(fmt.Sprintf("net/%s/conf/%s/%s", tc.family, config.Name, tc.setting))
 			if err != nil {
 				t.Fatalf("failed to read %s in pod namespace: %v", tc.setting, err)
 			}
 			if got != tc.want {
 				t.Errorf("%s = %d, want %d", tc.setting, got, tc.want)
 			}
-			baseline, err := sysctl.New().GetSysctl(fmt.Sprintf("net/ipv4/conf/lo/%s", tc.setting))
+			baseline, err := sysctl.New().GetSysctl(fmt.Sprintf("net/%s/conf/lo/%s", tc.family, tc.setting))
 			if err != nil {
 				t.Fatalf("failed to read baseline %s in pod namespace: %v", tc.setting, err)
 			}

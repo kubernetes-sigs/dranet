@@ -137,10 +137,11 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		return nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
 	}
 
-	// Apply before the link comes up so it never answers ARP with the wrong policy.
-	if err := applyInterfaceARPConfig(containerNs, ifName, interfaceConfig); err != nil {
+	// Apply before the link comes up so it never answers ARP or accepts router
+	// advertisements with the wrong policy.
+	if err := applyInterfaceSysctlConfig(containerNs, ifName, interfaceConfig); err != nil {
 		rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName)
-		return nil, fmt.Errorf("failed to apply ARP configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
+		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
 	}
 
 	networkData := &resourceapi.NetworkDeviceData{

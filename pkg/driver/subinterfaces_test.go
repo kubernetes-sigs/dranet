@@ -191,6 +191,7 @@ func TestSubinterface_IPVlan(t *testing.T) {
 		GROIPv4MaxSize: ptr.To[int32](1027),
 		ARPIgnore:      ptr.To[int32](1),
 		ARPAnnounce:    ptr.To[int32](2),
+		AcceptRA:       ptr.To[int32](0),
 	}
 
 	deviceData, err := nsCreateSubinterface(env.parent, env.nsPath, config)
@@ -251,20 +252,22 @@ func TestSubinterface_IPVlan(t *testing.T) {
 		// lo is the control: it shares the namespace but has no config, so it
 		// shows the namespace default the child would have kept.
 		for _, tc := range []struct {
+			family  string
 			setting string
 			want    int
 		}{
-			{"arp_ignore", int(*config.ARPIgnore)},
-			{"arp_announce", int(*config.ARPAnnounce)},
+			{"ipv4", "arp_ignore", int(*config.ARPIgnore)},
+			{"ipv4", "arp_announce", int(*config.ARPAnnounce)},
+			{"ipv6", "accept_ra", int(*config.AcceptRA)},
 		} {
-			got, err := sysctl.New().GetSysctl(fmt.Sprintf("net/ipv4/conf/%s/%s", config.Name, tc.setting))
+			got, err := sysctl.New().GetSysctl(fmt.Sprintf("net/%s/conf/%s/%s", tc.family, config.Name, tc.setting))
 			if err != nil {
 				t.Fatalf("failed to read %s in the pod namespace: %v", tc.setting, err)
 			}
 			if got != tc.want {
 				t.Errorf("%s = %d, want %d", tc.setting, got, tc.want)
 			}
-			baseline, err := sysctl.New().GetSysctl(fmt.Sprintf("net/ipv4/conf/lo/%s", tc.setting))
+			baseline, err := sysctl.New().GetSysctl(fmt.Sprintf("net/%s/conf/lo/%s", tc.family, tc.setting))
 			if err != nil {
 				t.Fatalf("failed to read baseline %s in the pod namespace: %v", tc.setting, err)
 			}

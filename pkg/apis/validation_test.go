@@ -167,6 +167,13 @@ func TestValidateConfig(t *testing.T) {
 			expectedCfg: &ipvlanARPRangeConf,
 			errContains: []string{"interface.arpIgnore: must be one of 0, 1, 2, 3, or 8, got 9"},
 		},
+		{
+			// The literal field name pins the JSON contract.
+			name:        "acceptRA parses under its JSON name",
+			raw:         &runtime.RawExtension{Raw: []byte(`{"interface":{"name":"eth0","acceptRA":2}}`)},
+			expectErr:   false,
+			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2)}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -405,6 +412,51 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
+			name:      "valid acceptRA",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "valid acceptRA at range bounds",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "invalid acceptRA (too large)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](3)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid acceptRA (negative)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](-1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "valid acceptRA (1)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "acceptRA with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "acceptRA with mtu at the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1280)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "multiple errors",
 			cfg:       &InterfaceConfig{Name: "eth/0", Addresses: []string{"badip"}, MTU: ptr.To[int32](0)},
 			fieldPath: "iface",
@@ -575,6 +627,12 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "acceptRA is accepted",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "addressing dhcp is rejected",
 			cfg:       &InterfaceConfig{Type: "IPVLAN", Addressing: AddressingModeDHCP},
 			fieldPath: "iface",
@@ -615,11 +673,12 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 	}
 }
 
-func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
+func TestValidateRDMAOnlyConfigRejectsInterfaceSettings(t *testing.T) {
 	tests := []struct {
 		name      string
 		raw       string
 		expectErr bool
+		wantErr   string
 	}{
 		{
 			name:      "arpIgnore is rejected",
@@ -630,6 +689,13 @@ func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
 			name:      "arpAnnounce is rejected",
 			raw:       `{"interface":{"arpAnnounce":2}}`,
 			expectErr: true,
+		},
+		{
+			name:      "acceptRA is rejected",
+			raw:       `{"interface":{"acceptRA":2}}`,
+			expectErr: true,
+			// A strict-unmarshal error would also count as an error, so pin the reason.
+			wantErr: "interface configuration is not supported",
 		},
 		{
 			name:      "type is rejected",
@@ -652,6 +718,17 @@ func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
 			errs := ValidateRDMAOnlyConfig(&runtime.RawExtension{Raw: []byte(tt.raw)})
 			if (len(errs) > 0) != tt.expectErr {
 				t.Errorf("ValidateRDMAOnlyConfig() expectErr %v, got errors: %v", tt.expectErr, errs)
+			}
+			if tt.wantErr != "" {
+				found := false
+				for _, err := range errs {
+					if strings.Contains(err.Error(), tt.wantErr) {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("ValidateRDMAOnlyConfig() errors = %v, want one containing %q", errs, tt.wantErr)
+				}
 			}
 		})
 	}

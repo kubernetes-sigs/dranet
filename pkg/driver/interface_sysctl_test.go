@@ -51,7 +51,7 @@ func (f *failingSetSysctl) SetSysctl(setting string, value int) error {
 	return f.Fake.SetSysctl(setting, value)
 }
 
-func TestHasARPConfig(t *testing.T) {
+func TestHasInterfaceSysctlConfig(t *testing.T) {
 	tests := []struct {
 		name            string
 		interfaceConfig apis.InterfaceConfig
@@ -73,6 +73,16 @@ func TestHasARPConfig(t *testing.T) {
 			want:            true,
 		},
 		{
+			name:            "accept ra only",
+			interfaceConfig: apis.InterfaceConfig{AcceptRA: ptr.To[int32](2)},
+			want:            true,
+		},
+		{
+			name:            "accept ra zero is still requested",
+			interfaceConfig: apis.InterfaceConfig{AcceptRA: ptr.To[int32](0)},
+			want:            true,
+		},
+		{
 			name:            "zero values are still requested",
 			interfaceConfig: apis.InterfaceConfig{ARPIgnore: ptr.To[int32](0), ARPAnnounce: ptr.To[int32](0)},
 			want:            true,
@@ -80,29 +90,41 @@ func TestHasARPConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := hasARPConfig(tt.interfaceConfig); got != tt.want {
-				t.Errorf("hasARPConfig() = %v, want %v", got, tt.want)
+			if got := hasInterfaceSysctlConfig(tt.interfaceConfig); got != tt.want {
+				t.Errorf("hasInterfaceSysctlConfig() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestApplyInterfaceARPWithSysctl(t *testing.T) {
+func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 	tests := []struct {
 		name            string
 		interfaceConfig apis.InterfaceConfig
 		want            map[string]int
 	}{
 		{
-			name: "both settings",
+			name: "all settings",
 			interfaceConfig: apis.InterfaceConfig{
 				ARPIgnore:   ptr.To[int32](1),
 				ARPAnnounce: ptr.To[int32](2),
+				AcceptRA:    ptr.To[int32](0),
 			},
 			want: map[string]int{
 				"net/ipv4/conf/rdma0/arp_ignore":   1,
 				"net/ipv4/conf/rdma0/arp_announce": 2,
+				"net/ipv6/conf/rdma0/accept_ra":    0,
 			},
+		},
+		{
+			name:            "only accept_ra",
+			interfaceConfig: apis.InterfaceConfig{AcceptRA: ptr.To[int32](1)},
+			want:            map[string]int{"net/ipv6/conf/rdma0/accept_ra": 1},
+		},
+		{
+			name:            "only accept_ra zero is written",
+			interfaceConfig: apis.InterfaceConfig{AcceptRA: ptr.To[int32](0)},
+			want:            map[string]int{"net/ipv6/conf/rdma0/accept_ra": 0},
 		},
 		{
 			name:            "only arp_ignore",
@@ -123,17 +145,17 @@ func TestApplyInterfaceARPWithSysctl(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sysctls := sysctltesting.NewFake()
-			if err := applyInterfaceARPWithSysctl(sysctls, "rdma0", tt.interfaceConfig); err != nil {
-				t.Fatalf("applyInterfaceARPWithSysctl() error: %v", err)
+			if err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", tt.interfaceConfig); err != nil {
+				t.Fatalf("applyInterfaceSysctlsWithSysctl() error: %v", err)
 			}
 			if diff := cmp.Diff(tt.want, sysctls.Settings); diff != "" {
-				t.Errorf("applyInterfaceARPWithSysctl() settings mismatch (-want +got):\n%s", diff)
+				t.Errorf("applyInterfaceSysctlsWithSysctl() settings mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
 
-func TestApplyInterfaceARPWithSysctlReturnsSetErrors(t *testing.T) {
+func TestApplyInterfaceSysctlsWithSysctlReturnsSetErrors(t *testing.T) {
 	sysctls := &failingSetSysctl{
 		Fake:    sysctltesting.NewFake(),
 		setting: "net/ipv4/conf/rdma0/arp_ignore",
@@ -143,23 +165,43 @@ func TestApplyInterfaceARPWithSysctlReturnsSetErrors(t *testing.T) {
 		ARPAnnounce: ptr.To[int32](2),
 	}
 
-	err := applyInterfaceARPWithSysctl(sysctls, "rdma0", interfaceConfig)
+	err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", interfaceConfig)
 	if err == nil || !strings.Contains(err.Error(), sysctls.setting) {
-		t.Fatalf("applyInterfaceARPWithSysctl() error = %v, want error naming %s", err, sysctls.setting)
+		t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want error naming %s", err, sysctls.setting)
 	}
 	// A failed setting must not stop the remaining ones from being applied.
 	if len(sysctls.Settings) != 1 {
-		t.Errorf("applyInterfaceARPWithSysctl() applied %d settings, want 1", len(sysctls.Settings))
+		t.Errorf("applyInterfaceSysctlsWithSysctl() applied %d settings, want 1", len(sysctls.Settings))
 	}
 }
 
-func TestApplyInterfaceARPConfigNoConfigDoesNotEnterNamespace(t *testing.T) {
-	if err := applyInterfaceARPConfig(netns.None(), "rdma0", apis.InterfaceConfig{Name: "rdma0"}); err != nil {
-		t.Fatalf("applyInterfaceARPConfig() error: %v", err)
+func TestApplyInterfaceSysctlsWithSysctlReturnsIPv6SetErrors(t *testing.T) {
+	sysctls := &failingSetSysctl{
+		Fake:    sysctltesting.NewFake(),
+		setting: "net/ipv6/conf/rdma0/accept_ra",
+	}
+	interfaceConfig := apis.InterfaceConfig{
+		ARPIgnore: ptr.To[int32](1),
+		AcceptRA:  ptr.To[int32](2),
+	}
+
+	err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", interfaceConfig)
+	if err == nil || !strings.Contains(err.Error(), sysctls.setting) {
+		t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want error naming %s", err, sysctls.setting)
+	}
+	// The IPv4 setting before the failing IPv6 one is still applied.
+	if len(sysctls.Settings) != 1 {
+		t.Errorf("applyInterfaceSysctlsWithSysctl() applied %d settings, want 1", len(sysctls.Settings))
 	}
 }
 
-func TestApplyInterfaceARPConfigUsesOpenNamespace(t *testing.T) {
+func TestApplyInterfaceSysctlConfigNoConfigDoesNotEnterNamespace(t *testing.T) {
+	if err := applyInterfaceSysctlConfig(netns.None(), "rdma0", apis.InterfaceConfig{Name: "rdma0"}); err != nil {
+		t.Fatalf("applyInterfaceSysctlConfig() error: %v", err)
+	}
+}
+
+func TestApplyInterfaceSysctlConfigUsesOpenNamespace(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("Test requires root privileges.")
 	}
@@ -177,7 +219,7 @@ func TestApplyInterfaceARPConfigUsesOpenNamespace(t *testing.T) {
 	if _, err := rand.Read(rndString); err != nil {
 		t.Fatalf("failed to generate random name: %v", err)
 	}
-	nsName := fmt.Sprintf("arp-%x", rndString)
+	nsName := fmt.Sprintf("sysctl-%x", rndString)
 	targetNs, err := netns.NewNamed(nsName)
 	if err != nil {
 		t.Fatalf("failed to create network namespace: %v", err)
@@ -193,8 +235,8 @@ func TestApplyInterfaceARPConfigUsesOpenNamespace(t *testing.T) {
 	}
 
 	config := apis.InterfaceConfig{ARPIgnore: ptr.To[int32](1)}
-	if err := applyInterfaceARPConfig(targetNs, "lo", config); err != nil {
-		t.Fatalf("applyInterfaceARPConfig() with an open namespace handle failed: %v", err)
+	if err := applyInterfaceSysctlConfig(targetNs, "lo", config); err != nil {
+		t.Fatalf("applyInterfaceSysctlConfig() with an open namespace handle failed: %v", err)
 	}
 
 	if err := netns.Set(targetNs); err != nil {
