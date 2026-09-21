@@ -273,7 +273,59 @@ func pciAddressForNetInterface(ifName string) (*pciAddress, error) {
 	return address, nil
 }
 
-const sysInfinibandPath = "/sys/class/infiniband/"
+const (
+	sysInfinibandPath = "/sys/class/infiniband/"
+	// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-bus-pci
+	sysBusPCIDevicesPath = "/sys/bus/pci/devices/"
+	// linkLayerEthernet is what an RDMA device reports when its transport rides
+	// a netdev (RoCE, iWARP). A real InfiniBand port reports "InfiniBand".
+	linkLayerEthernet = "Ethernet"
+	// pciBaseClassNetwork is the PCI base class of a network controller.
+	pciBaseClassNetwork = "02"
+)
+
+// rdmaHasEthernetPort reports whether any port of an RDMA device has an
+// Ethernet link layer. Every port is checked because link layers are per
+// port: a VPI adapter (mlx4) can run port 1 as InfiniBand and port 2 as
+// Ethernet. /sys/class/infiniband is netns-tagged, but in the default shared
+// RDMA netns mode an RDMA device stays bound to the host namespace (the
+// kernel refuses to move it and mirrors it into other namespaces with compat
+// devices), so this still reads while the device's netdev lives in a pod's
+// namespace.
+func rdmaHasEthernetPort(basePath, rdmaDevName string) bool {
+	portsDir := filepath.Join(basePath, rdmaDevName, "ports")
+	ports, err := os.ReadDir(portsDir)
+	if err != nil {
+		klog.V(4).Infof("Could not list ports of RDMA device %s: %v", rdmaDevName, err)
+		return false
+	}
+	for _, port := range ports {
+		body, err := os.ReadFile(filepath.Join(portsDir, port.Name(), "link_layer"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(body)) == linkLayerEthernet {
+			return true
+		}
+	}
+	return false
+}
+
+// pciBaseClass reads the base class byte of a PCI device ("02" for a network
+// controller), "" when it cannot be read. Unlike the device's net/ directory
+// this is not netns-tagged.
+func pciBaseClass(basePath, pciAddr string) string {
+	body, err := os.ReadFile(filepath.Join(basePath, pciAddr, "class"))
+	if err != nil {
+		klog.V(4).Infof("Could not read the PCI class of %s: %v", pciAddr, err)
+		return ""
+	}
+	class := strings.TrimPrefix(strings.TrimSpace(string(body)), "0x")
+	if len(class) < 2 {
+		return ""
+	}
+	return class[:2]
+}
 
 // pciAddressForRDMADevice resolves the PCI address for an RDMA device by
 // following the sysfs device symlink. For example, /sys/class/infiniband/erdma_0/device
