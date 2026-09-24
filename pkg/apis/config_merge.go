@@ -17,44 +17,37 @@ limitations under the License.
 package apis
 
 import (
-	"dario.cat/mergo"
+	"maps"
+	"slices"
+
+	"k8s.io/utils/ptr"
 )
 
-// MergeNetworkConfig merges a cloud provider configuration into a user configuration.
-// It returns a new *NetworkConfig with the merged result.
-// It follows a strict "User wins" strategy: any scalar setting defined in the user config
-// overrides the cloud provider config. For slices, the two configurations are combined,
-// but duplicates are resolved in favor of the user config.
-// The user parameter is assumed to be non-nil. The cloud parameter can be nil, resulting in
-// a copy of the user parameter.
+// MergeNetworkConfig combines a provider configuration with a user configuration.
+// A nil input is treated as an empty configuration.
+// User values, including explicit pointer zero values, override provider values.
+// Slices are combined, duplicates keep user values, and neither input is changed.
+//
+// Every field is merged by name on purpose. The coverage tests in
+// config_merge_coverage_test.go fail when a field is not merged or is aliased.
 func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
+	if user == nil {
+		user = &NetworkConfig{}
+	}
 	if cloud == nil {
-		copy := *user
-		return &copy
+		cloud = &NetworkConfig{}
 	}
 
-	merged := &NetworkConfig{}
-
-	// Start with the cloud configuration as the base
-	if err := mergo.Merge(merged, cloud); err != nil {
-		return &NetworkConfig{} // or log error? We'll just return nil or early? Let's just return what we have.
+	// Provider entries come first and user entries last, so the dedupe
+	// functions, which keep the last occurrence, keep the user entry.
+	merged := &NetworkConfig{
+		Profile:   firstNonEmpty(user.Profile, cloud.Profile),
+		Interface: mergeInterfaceConfig(&user.Interface, &cloud.Interface),
+		Routes:    deduplicateRoutes(append(slices.Clone(cloud.Routes), user.Routes...)),
+		Rules:     deduplicateRules(append(slices.Clone(cloud.Rules), user.Rules...)),
+		Neighbors: deduplicateNeighbors(append(slices.Clone(cloud.Neighbors), user.Neighbors...)),
+		Ethtool:   mergeEthtool(user.Ethtool, cloud.Ethtool),
 	}
-
-	// Merge the user configuration on top, overriding cloud settings and appending slices.
-	if err := mergo.Merge(merged, user, mergo.WithOverride, mergo.WithAppendSlice); err != nil {
-		return &NetworkConfig{}
-	}
-
-	// Deduplicate slices where order or uniqueness matters.
-	// For addresses, we just unique them.
-	merged.Interface.Addresses = deduplicateStrings(merged.Interface.Addresses)
-
-	// For Routes, deduplicate by destination and table (user wins, which were appended last, so we
-	// iterate backwards). Routes to the same destination in different tables are distinct entries
-	// (policy routing) and are all kept.
-	merged.Routes = deduplicateRoutes(merged.Routes)
-	merged.Rules = deduplicateRules(merged.Rules)
-	merged.Neighbors = deduplicateNeighbors(merged.Neighbors)
 
 	// Drop the meaningless IPVLAN config if the resolved type is not ipvlan.
 	if merged.Interface.Type != InterfaceTypeIPVLAN {
@@ -62,6 +55,108 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 	}
 
 	return merged
+}
+
+func mergeInterfaceConfig(user, cloud *InterfaceConfig) InterfaceConfig {
+	return InterfaceConfig{
+		Name:                firstNonEmpty(user.Name, cloud.Name),
+		Type:                firstNonEmpty(user.Type, cloud.Type),
+		Addressing:          firstNonEmpty(user.Addressing, cloud.Addressing),
+		Addresses:           deduplicateStrings(append(slices.Clone(cloud.Addresses), user.Addresses...)),
+		DHCP:                overridePtr(user.DHCP, cloud.DHCP),
+		MTU:                 overridePtr(user.MTU, cloud.MTU),
+		HardwareAddr:        overridePtr(user.HardwareAddr, cloud.HardwareAddr),
+		GSOMaxSize:          overridePtr(user.GSOMaxSize, cloud.GSOMaxSize),
+		GROMaxSize:          overridePtr(user.GROMaxSize, cloud.GROMaxSize),
+		GSOIPv4MaxSize:      overridePtr(user.GSOIPv4MaxSize, cloud.GSOIPv4MaxSize),
+		GROIPv4MaxSize:      overridePtr(user.GROIPv4MaxSize, cloud.GROIPv4MaxSize),
+		DisableEBPFPrograms: overridePtr(user.DisableEBPFPrograms, cloud.DisableEBPFPrograms),
+		Forwarding:          overridePtr(user.Forwarding, cloud.Forwarding),
+		ARPIgnore:           overridePtr(user.ARPIgnore, cloud.ARPIgnore),
+		ARPAnnounce:         overridePtr(user.ARPAnnounce, cloud.ARPAnnounce),
+		VRF:                 mergeVRF(user.VRF, cloud.VRF),
+		IPVlan:              mergeIPVlan(user.IPVlan, cloud.IPVlan),
+	}
+}
+
+func mergeVRF(user, cloud *VRFConfig) *VRFConfig {
+	if user == nil && cloud == nil {
+		return nil
+	}
+	if user == nil {
+		user = &VRFConfig{}
+	}
+	if cloud == nil {
+		cloud = &VRFConfig{}
+	}
+	return &VRFConfig{
+		Name:  firstNonEmpty(user.Name, cloud.Name),
+		Table: overridePtr(user.Table, cloud.Table),
+	}
+}
+
+func mergeIPVlan(user, cloud *IPVlanConfig) *IPVlanConfig {
+	if user == nil && cloud == nil {
+		return nil
+	}
+	if user == nil {
+		user = &IPVlanConfig{}
+	}
+	if cloud == nil {
+		cloud = &IPVlanConfig{}
+	}
+	return &IPVlanConfig{
+		Mode: firstNonEmpty(user.Mode, cloud.Mode),
+		Flag: firstNonEmpty(user.Flag, cloud.Flag),
+	}
+}
+
+func mergeEthtool(user, cloud *EthtoolConfig) *EthtoolConfig {
+	if user == nil && cloud == nil {
+		return nil
+	}
+	if user == nil {
+		user = &EthtoolConfig{}
+	}
+	if cloud == nil {
+		cloud = &EthtoolConfig{}
+	}
+	return &EthtoolConfig{
+		Features:     mergeBoolMaps(user.Features, cloud.Features),
+		PrivateFlags: mergeBoolMaps(user.PrivateFlags, cloud.PrivateFlags),
+	}
+}
+
+// mergeBoolMaps returns a new map with every provider entry and every user
+// entry, where a user entry replaces a provider entry with the same key.
+func mergeBoolMaps(user, cloud map[string]bool) map[string]bool {
+	if user == nil && cloud == nil {
+		return nil
+	}
+	merged := make(map[string]bool, len(user)+len(cloud))
+	maps.Copy(merged, cloud)
+	maps.Copy(merged, user)
+	return merged
+}
+
+// overridePtr returns a copy of the user value when set, even when it points
+// at a zero value such as false or 0, and otherwise a copy of the cloud value.
+func overridePtr[T any](user, cloud *T) *T {
+	if user != nil {
+		return ptr.To(*user)
+	}
+	if cloud != nil {
+		return ptr.To(*cloud)
+	}
+	return nil
+}
+
+// firstNonEmpty returns the user value when it is not empty, else the cloud value.
+func firstNonEmpty[T ~string](user, cloud T) T {
+	if user != "" {
+		return user
+	}
+	return cloud
 }
 
 // deduplicateStrings compacts a slice of strings keeping the last occurrence
