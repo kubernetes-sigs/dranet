@@ -90,6 +90,12 @@ type InterfaceConfig struct {
 	// Moving the interface resets it to the destination namespace default, so it
 	// must be requested explicitly.
 	ARPAnnounce *int32 `json:"arpAnnounce,omitempty"`
+
+	// AcceptRA controls IPv6 router advertisement acceptance through
+	// /proc/sys/net/ipv6/conf/<iface>/accept_ra. Valid values are 0-2.
+	// Moving the interface resets it to the destination namespace default, so it
+	// must be requested explicitly.
+	AcceptRA *int32 `json:"acceptRA,omitempty"`
 }
 ```
 
@@ -104,25 +110,34 @@ type InterfaceConfig struct {
 * **groIPv4MaxSize** (int32, optional): The maximum Generic Receive Offload size for IPv4.
 * **arpIgnore** (int32, optional): Which ARP requests the interface answers. Valid values are 0, 1, 2, 3, and 8. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_ignore`.
 * **arpAnnounce** (int32, optional): The source address the interface uses in ARP requests, from 0 to 2. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_announce`.
+* **acceptRA** (int32, optional): Whether the interface accepts IPv6 router advertisements. `0` rejects them, `1` accepts them when forwarding is off, and `2` accepts them also when forwarding is on. Sets `/proc/sys/net/ipv6/conf/<iface>/accept_ra`.
 
 The kernel resets both ARP settings to the network namespace default when an interface
 moves into a Pod, so a value configured on the host does not survive the move and has to
-be requested here. Setups that attach several interfaces sharing one IP subnet, such as
+be requested here. The kernel resets `accept_ra` the same way when the interface moves.
+The kernel creates IPv6 settings only for an interface with an MTU of 1280 or more.
+A claim with `acceptRA` is rejected when its `mtu` is below 1280, or when it sets no `mtu`
+and the interface would keep a smaller MTU from the host. The check runs before the interface
+is touched. When the interface has no `accept_ra` sysctl, for example on a node that boots
+with `ipv6.disable=1`, `acceptRA: 0` is already satisfied, and `1` or `2` fail with an error
+that says so.
+Setups that attach several interfaces sharing one IP subnet, such as
 multi-NIC RDMA nodes, typically need `arpIgnore: 1` and `arpAnnounce: 2`. Without them an
 interface can answer ARP for another interface's address, or send requests with a source
 address from the wrong subnet, which makes neighbor resolution pick the wrong link.
 
 Linux uses the maximum of the namespace-wide `conf/all` value and the per-interface value
-for both settings. A per-interface setting cannot reduce the effective value below
-`conf/all`. New IPv4 network namespaces normally inherit `conf/all` and `conf/default`
-from the initial network namespace, subject to `net.core.devconf_inherit_init_net`.
+for both ARP settings. A per-interface ARP setting cannot reduce the effective value below
+`conf/all`. New network namespaces normally inherit the IPv4 `conf/all` and `conf/default`
+values from the initial network namespace, subject to `net.core.devconf_inherit_init_net`.
+The IPv6 values start at the kernel defaults (`accept_ra` is 1) unless that sysctl is 1 or 3.
 DRANET only changes the per-interface value.
 
 ##### IPVLAN subinterfaces
 
 An `IPVLAN` subinterface is created inside the Pod network namespace on top of the
-host device. The `mtu`, GSO and GRO sizes, `arpIgnore`, and `arpAnnounce` settings apply
-to the child. They work the same way as on a passthrough interface. The child inherits
+host device. The `mtu`, GSO and GRO sizes, `arpIgnore`, `arpAnnounce`, and `acceptRA` settings
+apply to the child. They work the same way as on a passthrough interface. The child inherits
 the TSO maximum of its parent. The kernel rejects a GSO size above that maximum. It also
 rejects a GRO size above the global kernel maximum. A later change of the parent MTU
 resets the child MTU to the new parent value.

@@ -123,6 +123,12 @@ type InterfaceConfig struct {
 	// must be requested explicitly.
 	ARPAnnounce *int32 `json:"arpAnnounce,omitempty"`
 
+	// AcceptRA controls IPv6 router advertisement acceptance through
+	// /proc/sys/net/ipv6/conf/<iface>/accept_ra. Valid values are 0-2.
+	// Moving the interface resets it to the destination namespace default, so it
+	// must be requested explicitly.
+	AcceptRA *int32 `json:"acceptRA,omitempty"`
+
 	// VRF specifies the Virtual Routing and Forwarding domain this interface should belong to.
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.

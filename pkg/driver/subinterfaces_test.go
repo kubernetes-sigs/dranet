@@ -193,6 +193,7 @@ func testSubinterface_IPVlan_Namespaced(t *testing.T) {
 		GROIPv4MaxSize: ptr.To[int32](1027),
 		ARPIgnore:      ptr.To[int32](1),
 		ARPAnnounce:    ptr.To[int32](2),
+		AcceptRA:       ptr.To[int32](0),
 	}
 
 	deviceData, err := nsCreateSubinterface(env.parent, env.nsPath, config)
@@ -253,20 +254,22 @@ func testSubinterface_IPVlan_Namespaced(t *testing.T) {
 		// lo is the control: it shares the namespace but has no config, so it
 		// shows the namespace default the child would have kept.
 		for _, tc := range []struct {
+			family  string
 			setting string
 			want    int
 		}{
-			{"arp_ignore", int(*config.ARPIgnore)},
-			{"arp_announce", int(*config.ARPAnnounce)},
+			{"ipv4", "arp_ignore", int(*config.ARPIgnore)},
+			{"ipv4", "arp_announce", int(*config.ARPAnnounce)},
+			{"ipv6", "accept_ra", int(*config.AcceptRA)},
 		} {
-			got, err := sysctl.New().GetSysctl(fmt.Sprintf("net/ipv4/conf/%s/%s", config.Name, tc.setting))
+			got, err := sysctl.New().GetSysctl(fmt.Sprintf("net/%s/conf/%s/%s", tc.family, config.Name, tc.setting))
 			if err != nil {
 				t.Fatalf("failed to read %s in the pod namespace: %v", tc.setting, err)
 			}
 			if got != tc.want {
 				t.Errorf("%s = %d, want %d", tc.setting, got, tc.want)
 			}
-			baseline, err := sysctl.New().GetSysctl(fmt.Sprintf("net/ipv4/conf/lo/%s", tc.setting))
+			baseline, err := sysctl.New().GetSysctl(fmt.Sprintf("net/%s/conf/lo/%s", tc.family, tc.setting))
 			if err != nil {
 				t.Fatalf("failed to read baseline %s in the pod namespace: %v", tc.setting, err)
 			}
@@ -343,6 +346,42 @@ func testSubinterface_IPVlanRejectsMTUAboveParent_Namespaced(t *testing.T) {
 		t.Fatalf("nsCreateSubinterface() error = %v, want a parent MTU error", err)
 	}
 	assertOnlyLoopback(t, env)
+}
+
+func TestSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU(t *testing.T) {
+	userns.Run(t, testSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, apis.MinIPv6MTU-1)
+	config := apis.InterfaceConfig{
+		Name:      "dranet0",
+		Type:      apis.InterfaceTypeIPVLAN,
+		Addresses: []string{"192.0.2.3/32"},
+		AcceptRA:  ptr.To[int32](0),
+	}
+	// The helper brings the parent up. Set it down, so the rejection has to
+	// happen before the parent is touched for the flags to stay unchanged.
+	parent, err := nlwrap.LinkByName(env.parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.LinkSetDown(parent); err != nil {
+		t.Fatalf("failed to set the parent down: %v", err)
+	}
+
+	_, err = nsCreateSubinterface(env.parent, env.nsPath, config)
+	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
+		t.Fatalf("nsCreateSubinterface() error = %v, want an MTU error", err)
+	}
+	assertOnlyLoopback(t, env)
+	parent, err = nlwrap.LinkByName(env.parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parent.Attrs().Flags&net.FlagUp != 0 {
+		t.Error("the parent was brought up before the rejection")
+	}
 }
 
 func TestSubinterface_IPVlanRollsBackOnSysctlFailure(t *testing.T) {

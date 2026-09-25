@@ -171,7 +171,7 @@ wait_for_ready_pods() {
   assert_output --partial "169.254.169.13"
 }
 
-@test "validate per-interface ARP configuration on dummy interface" {
+@test "validate per-interface sysctl configuration on dummy interface" {
   docker exec "$CLUSTER_NAME"-worker bash -c "ip link add dummy0 type dummy"
   docker exec "$CLUSTER_NAME"-worker bash -c "ip link set up dev dummy0"
 
@@ -179,13 +179,28 @@ wait_for_ready_pods() {
   kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_arp.yaml
   kubectl wait --for=condition=ready pod/pod-arp-test --timeout=30s
 
+  # The kernel copies conf/default to a moved interface, so a default equal to
+  # the requested value would hide a missing write.
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv4/conf/default/arp_ignore
+  assert_success
+  refute_output "1"
   run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv4/conf/dranet-arp/arp_ignore
   assert_success
   assert_output "1"
 
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv4/conf/default/arp_announce
+  assert_success
+  refute_output "2"
   run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv4/conf/dranet-arp/arp_announce
   assert_success
   assert_output "2"
+
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/default/accept_ra
+  assert_success
+  refute_output "0"
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/accept_ra
+  assert_success
+  assert_output "0"
 }
 
 @test "dummy interface with IP addresses ResourceClaimTemplate" {
@@ -254,6 +269,12 @@ wait_for_ready_pods() {
   run kubectl exec pod-ipvlan -- cat /proc/sys/net/ipv4/conf/dummy0/arp_announce
   assert_success
   assert_output "2"
+  run kubectl exec pod-ipvlan -- cat /proc/sys/net/ipv6/conf/default/accept_ra
+  assert_success
+  refute_output "0"
+  run kubectl exec pod-ipvlan -- cat /proc/sys/net/ipv6/conf/dummy0/accept_ra
+  assert_success
+  assert_output "0"
 
   # The parent interface still exists on the host and keeps its own MTU.
   run docker exec "$CLUSTER_NAME"-worker ip link show dummy0

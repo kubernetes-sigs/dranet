@@ -167,6 +167,13 @@ func TestValidateConfig(t *testing.T) {
 			expectedCfg: &ipvlanARPRangeConf,
 			errContains: []string{"interface.arpIgnore: must be one of 0, 1, 2, 3, or 8, got 9"},
 		},
+		{
+			// The literal field name pins the JSON contract.
+			name:        "acceptRA parses under its JSON name",
+			raw:         &runtime.RawExtension{Raw: []byte(`{"interface":{"name":"eth0","acceptRA":2}}`)},
+			expectErr:   false,
+			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2)}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -405,6 +412,51 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
+			name:      "valid acceptRA",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "valid acceptRA at range bounds",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "invalid acceptRA (too large)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](3)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid acceptRA (negative)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](-1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "valid acceptRA (1)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "acceptRA with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "acceptRA with mtu at the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1280)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "multiple errors",
 			cfg:       &InterfaceConfig{Name: "eth/0", Addresses: []string{"badip"}, MTU: ptr.To[int32](0)},
 			fieldPath: "iface",
@@ -575,6 +627,12 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "acceptRA is accepted",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "addressing dhcp is rejected",
 			cfg:       &InterfaceConfig{Type: "IPVLAN", Addressing: AddressingModeDHCP},
 			fieldPath: "iface",
@@ -615,11 +673,62 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 	}
 }
 
-func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
+// Every InterfaceConfig field set on its own must be rejected for an RDMA-only
+// device, so a new field cannot slip past the check.
+func TestValidateRDMAOnlyConfigRejectsEveryInterfaceField(t *testing.T) {
+	sample := func(t *testing.T, field reflect.StructField) reflect.Value {
+		t.Helper()
+		typ := field.Type
+		switch typ.Kind() {
+		case reflect.String:
+			return reflect.ValueOf("x").Convert(typ)
+		case reflect.Slice:
+			return reflect.MakeSlice(typ, 1, 1)
+		case reflect.Ptr:
+			value := reflect.New(typ.Elem())
+			switch typ.Elem().Kind() {
+			case reflect.Bool:
+				value.Elem().SetBool(true)
+			case reflect.Int32:
+				value.Elem().SetInt(1)
+			case reflect.String:
+				value.Elem().SetString("x")
+			case reflect.Struct:
+				// A non-nil pointer is enough for the check.
+			default:
+				t.Fatalf("field %s: unsupported pointer element kind %s", field.Name, typ.Elem().Kind())
+			}
+			return value
+		}
+		t.Fatalf("field %s: unsupported kind %s", field.Name, typ.Kind())
+		return reflect.Value{}
+	}
+	ifaceType := reflect.TypeFor[InterfaceConfig]()
+	for i := 0; i < ifaceType.NumField(); i++ {
+		field := ifaceType.Field(i)
+		t.Run(field.Name, func(t *testing.T) {
+			config := NetworkConfig{}
+			reflect.ValueOf(&config.Interface).Elem().Field(i).Set(sample(t, field))
+			errs := ValidateRDMAOnlyConfig(newRawExtension(t, config))
+			found := false
+			for _, err := range errs {
+				if strings.Contains(err.Error(), "interface configuration is not supported") {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("ValidateRDMAOnlyConfig() errors = %v, want the interface rejection for field %s", errs, field.Name)
+			}
+		})
+	}
+}
+
+func TestValidateRDMAOnlyConfigRejectsInterfaceSettings(t *testing.T) {
 	tests := []struct {
 		name      string
 		raw       string
 		expectErr bool
+		wantErr   string
 	}{
 		{
 			name:      "arpIgnore is rejected",
@@ -632,6 +741,13 @@ func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			name:      "acceptRA is rejected",
+			raw:       `{"interface":{"acceptRA":2}}`,
+			expectErr: true,
+			// A strict-unmarshal error would also count as an error, so pin the reason.
+			wantErr: "interface configuration is not supported",
+		},
+		{
 			name:      "type is rejected",
 			raw:       `{"interface":{"type":"IPVLAN"}}`,
 			expectErr: true,
@@ -642,8 +758,25 @@ func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			name:      "forwarding is rejected",
+			raw:       `{"interface":{"forwarding":true}}`,
+			expectErr: true,
+			wantErr:   "interface configuration is not supported",
+		},
+		{
+			name:      "vrf is rejected",
+			raw:       `{"interface":{"vrf":{"name":"blue"}}}`,
+			expectErr: true,
+			wantErr:   "interface configuration is not supported",
+		},
+		{
 			name:      "empty config is accepted",
 			raw:       `{}`,
+			expectErr: false,
+		},
+		{
+			name:      "empty address list is accepted",
+			raw:       `{"interface":{"addresses":[]}}`,
 			expectErr: false,
 		},
 	}
@@ -652,6 +785,17 @@ func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
 			errs := ValidateRDMAOnlyConfig(&runtime.RawExtension{Raw: []byte(tt.raw)})
 			if (len(errs) > 0) != tt.expectErr {
 				t.Errorf("ValidateRDMAOnlyConfig() expectErr %v, got errors: %v", tt.expectErr, errs)
+			}
+			if tt.wantErr != "" {
+				found := false
+				for _, err := range errs {
+					if strings.Contains(err.Error(), tt.wantErr) {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("ValidateRDMAOnlyConfig() errors = %v, want one containing %q", errs, tt.wantErr)
+				}
 			}
 		})
 	}

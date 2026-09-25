@@ -118,9 +118,10 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 		return nil, err
 	}
 
-	// Apply before the link comes up so it never answers ARP with the wrong policy.
-	if err := applyInterfaceARPConfig(containerNs, ifName, config); err != nil {
-		return nil, fmt.Errorf("failed to apply ARP configuration to interface %s: %w", ifName, err)
+	// Apply before the link comes up so it never answers ARP or accepts router
+	// advertisements with the wrong policy.
+	if err := applyInterfaceSysctlConfig(containerNs, ifName, config); err != nil {
+		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s: %w", ifName, err)
 	}
 
 	networkData = &resourceapi.NetworkDeviceData{
@@ -191,6 +192,11 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis
 	// The kernel does not check a child MTU against its parent, so check it here.
 	if config.MTU != nil && int(*config.MTU) > parentLink.Attrs().MTU {
 		return nil, fmt.Errorf("requested MTU %d for %s subinterface %s exceeds parent interface %s MTU %d", *config.MTU, config.Type, config.Name, hostIfName, parentLink.Attrs().MTU)
+	}
+	// Without an mtu the child inherits the parent MTU. Below the IPv6 minimum
+	// the kernel creates no IPv6 settings, so accept_ra cannot be set.
+	if config.AcceptRA != nil && config.MTU == nil && parentLink.Attrs().MTU < apis.MinIPv6MTU {
+		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but parent interface %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, parentLink.Attrs().MTU)
 	}
 
 	// Make sure the parent link is up on the host, otherwise subinterfaces cannot transmit traffic.

@@ -1647,6 +1647,90 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 			},
 		},
 		{
+			// The claim is valid, so only the merged validation can catch the
+			// profile output, after the profile was allocated.
+			name: "profile output with an invalid acceptRA is rejected and the allocated profile is released",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-acceptra-range", Namespace: "default", Name: "claim-subif-acceptra-range"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-acceptra-range"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Profile: "cloud-managed", Interface: apis.InterfaceConfig{Type: "IPVLAN"}}, true
+				}
+				db.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addresses: []string{"10.24.3.5/32"}, AcceptRA: ptr.To[int32](3)}}, nil
+				}
+			},
+			wantErr: "acceptRA: must be between 0 and 2, got 3",
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.profileCalls.Load(); got != 1 {
+					t.Errorf("GetProfileConfig calls = %d, want 1", got)
+				}
+				if got := db.releaseProfileCalls.Load(); got != 1 {
+					t.Errorf("ReleaseProfileConfig calls = %d, want 1", got)
+				}
+			},
+		},
+		{
+			// The claim is valid, so only the merged validation can catch the
+			// profile output, after the profile was allocated.
+			name: "profile output with acceptRA below the IPv6 MTU is rejected and the allocated profile is released",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-acceptra-mtu", Namespace: "default", Name: "claim-subif-acceptra-mtu"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-acceptra-mtu"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Profile: "cloud-managed", Interface: apis.InterfaceConfig{Type: "IPVLAN"}}, true
+				}
+				db.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addresses: []string{"10.24.3.5/32"}, AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1279)}}, nil
+				}
+			},
+			wantErr: "acceptRA: requires an mtu of at least 1280, got 1279",
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.profileCalls.Load(); got != 1 {
+					t.Errorf("GetProfileConfig calls = %d, want 1", got)
+				}
+				if got := db.releaseProfileCalls.Load(); got != 1 {
+					t.Errorf("ReleaseProfileConfig calls = %d, want 1", got)
+				}
+			},
+		},
+		{
 			name: "profile-selected subinterface reports a failed profile release",
 			claim: &resourcev1.ResourceClaim{
 				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-hwaddr-relfail", Namespace: "default", Name: "claim-subif-hwaddr-relfail"},

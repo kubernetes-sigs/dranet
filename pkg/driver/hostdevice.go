@@ -39,6 +39,12 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		return nil, fmt.Errorf("failed to get link for interface %s: %w", hostIfName, err)
 	}
 
+	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be
+	// set. Reject it before the link is touched so the host device stays usable.
+	if interfaceConfig.AcceptRA != nil && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
+		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
+	}
+
 	// Devices can be renamed only when down
 	if err = netlink.LinkSetDown(hostDev); err != nil {
 		return nil, fmt.Errorf("failed to set %q down: %w", hostIfName, err)
@@ -137,10 +143,11 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		return nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
 	}
 
-	// Apply before the link comes up so it never answers ARP with the wrong policy.
-	if err := applyInterfaceARPConfig(containerNs, ifName, interfaceConfig); err != nil {
+	// Apply before the link comes up so it never answers ARP or accepts router
+	// advertisements with the wrong policy.
+	if err := applyInterfaceSysctlConfig(containerNs, ifName, interfaceConfig); err != nil {
 		rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName)
-		return nil, fmt.Errorf("failed to apply ARP configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
+		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
 	}
 
 	networkData := &resourceapi.NetworkDeviceData{

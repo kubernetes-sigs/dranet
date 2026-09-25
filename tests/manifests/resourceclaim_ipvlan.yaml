@@ -40,6 +40,7 @@ spec:
             groIPv4MaxSize: 32768
             arpIgnore: 1
             arpAnnounce: 2
+            acceptRA: 0
 ---
 apiVersion: v1
 kind: Pod

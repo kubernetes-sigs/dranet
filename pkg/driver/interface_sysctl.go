@@ -19,10 +19,12 @@ package driver
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 
 	"github.com/vishvananda/netns"
 	"k8s.io/component-helpers/node/util/sysctl"
+	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/dranet/pkg/apis"
 )
@@ -30,35 +32,50 @@ import (
 // sysctlProvider is overridden in tests to exercise sysctl failure paths.
 var sysctlProvider = sysctl.New
 
-// hasARPConfig reports whether the interface config asks for any ARP setting.
-func hasARPConfig(interfaceConfig apis.InterfaceConfig) bool {
-	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil
+// hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
+func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
+	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil
 }
 
-func applyInterfaceARPWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
+func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
 	var errorList []error
-	set := func(setting string, value int32) {
-		name := fmt.Sprintf("net/ipv4/conf/%s/%s", ifName, setting)
+	set := func(family, setting string, value int32) {
+		name := fmt.Sprintf("net/%s/conf/%s/%s", family, ifName, setting)
 		if err := sysctlInterface.SetSysctl(name, int(value)); err != nil {
 			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", name, err))
 		}
 	}
 
 	if interfaceConfig.ARPIgnore != nil {
-		set("arp_ignore", *interfaceConfig.ARPIgnore)
+		set("ipv4", "arp_ignore", *interfaceConfig.ARPIgnore)
 	}
 	if interfaceConfig.ARPAnnounce != nil {
-		set("arp_announce", *interfaceConfig.ARPAnnounce)
+		set("ipv4", "arp_announce", *interfaceConfig.ARPAnnounce)
+	}
+	if interfaceConfig.AcceptRA != nil {
+		name := fmt.Sprintf("net/ipv6/conf/%s/accept_ra", ifName)
+		err := sysctlInterface.SetSysctl(name, int(*interfaceConfig.AcceptRA))
+		switch {
+		case err == nil:
+		case errors.Is(err, os.ErrNotExist) && *interfaceConfig.AcceptRA == 0:
+			// The interface has no IPv6 sysctls, so it accepts no router
+			// advertisements and zero is already satisfied.
+			klog.V(4).Infof("%s not found; IPv6 is not enabled on %s and acceptRA: 0 is already satisfied", name, ifName)
+		case errors.Is(err, os.ErrNotExist):
+			errorList = append(errorList, fmt.Errorf("failed to set %s: IPv6 is not enabled on the interface: %w", name, err))
+		default:
+			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", name, err))
+		}
 	}
 	return errors.Join(errorList...)
 }
 
-// applyInterfaceARPConfig sets the requested per-interface ARP sysctls inside the
+// applyInterfaceSysctlConfig sets the requested per-interface sysctls inside the
 // Pod network namespace. These live under /proc/sys, so unlike the rest of the
 // interface configuration they cannot be set through a netlink handle and
 // require joining the namespace.
-func applyInterfaceARPConfig(containerNs netns.NsHandle, ifName string, interfaceConfig apis.InterfaceConfig) error {
-	if !hasARPConfig(interfaceConfig) {
+func applyInterfaceSysctlConfig(containerNs netns.NsHandle, ifName string, interfaceConfig apis.InterfaceConfig) error {
+	if !hasInterfaceSysctlConfig(interfaceConfig) {
 		return nil
 	}
 
@@ -84,7 +101,7 @@ func applyInterfaceARPConfig(containerNs netns.NsHandle, ifName string, interfac
 			return
 		}
 
-		applyErr := applyInterfaceARPWithSysctl(sysctlProvider(), ifName, interfaceConfig)
+		applyErr := applyInterfaceSysctlsWithSysctl(sysctlProvider(), ifName, interfaceConfig)
 		if err := netns.Set(originalNs); err != nil {
 			// Keep this thread locked so the runtime destroys it instead of
 			// reusing it in the wrong network namespace.

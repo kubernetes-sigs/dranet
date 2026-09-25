@@ -32,6 +32,8 @@ import (
 const (
 	// MinMTU is the minimum practical MTU (e.g., for IPv4).
 	MinMTU = 68
+	// MinIPv6MTU is the smallest MTU for which the kernel creates IPv6 settings.
+	MinIPv6MTU = 1280
 	// MaxInterfaceNameLen is typically IFNAMSIZ-1 (usually 15 on Linux).
 	MaxInterfaceNameLen = 15
 )
@@ -227,6 +229,15 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, fmt.Errorf("%s.arpAnnounce: must be between 0 and 2, got %d", fieldPath, *cfg.ARPAnnounce))
 	}
 
+	if cfg.AcceptRA != nil && (*cfg.AcceptRA < 0 || *cfg.AcceptRA > 2) {
+		allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: must be between 0 and 2, got %d", fieldPath, *cfg.AcceptRA))
+	}
+
+	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be set.
+	if cfg.AcceptRA != nil && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
+		allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: requires an mtu of at least %d, got %d", fieldPath, MinIPv6MTU, *cfg.MTU))
+	}
+
 	if cfg.VRF != nil {
 		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
 	}
@@ -401,8 +412,9 @@ func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
 		config.Interface.DHCP != nil || config.Interface.GSOMaxSize != nil ||
 		config.Interface.GROMaxSize != nil || config.Interface.GSOIPv4MaxSize != nil ||
 		config.Interface.GROIPv4MaxSize != nil || config.Interface.DisableEBPFPrograms != nil ||
-		config.Interface.ARPIgnore != nil || config.Interface.ARPAnnounce != nil ||
-		config.Interface.IPVlan != nil {
+		config.Interface.Forwarding != nil || config.Interface.ARPIgnore != nil ||
+		config.Interface.ARPAnnounce != nil || config.Interface.AcceptRA != nil ||
+		config.Interface.VRF != nil || config.Interface.IPVlan != nil {
 		allErrors = append(allErrors, fmt.Errorf("interface configuration is not supported for RDMA-only devices (no network interface present)"))
 	}
 	if len(config.Routes) > 0 {
