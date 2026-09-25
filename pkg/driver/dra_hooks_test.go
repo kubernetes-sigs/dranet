@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -1877,6 +1878,81 @@ func TestClearStaleRouteSources(t *testing.T) {
 				if tc.routes[i].Source != want {
 					t.Errorf("route %d source = %q, want %q", i, tc.routes[i].Source, want)
 				}
+			}
+		})
+	}
+}
+
+func TestClaimDeviceConfig(t *testing.T) {
+	opaque := func(source resourcev1.AllocationConfigSource, params string) resourcev1.DeviceAllocationConfiguration {
+		return resourcev1.DeviceAllocationConfiguration{
+			Source:   source,
+			Requests: []string{"req-1"},
+			DeviceConfiguration: resourcev1.DeviceConfiguration{
+				Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver:     "test.driver",
+					Parameters: runtime.RawExtension{Raw: []byte(params)},
+				},
+			},
+		}
+	}
+	class := opaque(resourcev1.AllocationConfigSourceClass, `{"interface":{"mtu":1500,"forwarding":true}}`)
+	claimCfg := opaque(resourcev1.AllocationConfigSourceClaim, `{"interface":{"mtu":9000,"addresses":["10.0.0.5/24"]}}`)
+
+	testCases := []struct {
+		name          string
+		configs       []resourcev1.DeviceAllocationConfiguration
+		wantMTU       *int32
+		wantAddresses []string
+		wantForward   *bool
+	}{
+		{
+			name:        "class only",
+			configs:     []resourcev1.DeviceAllocationConfiguration{class},
+			wantMTU:     ptr.To(int32(1500)),
+			wantForward: ptr.To(true),
+		},
+		{
+			name:          "claim only",
+			configs:       []resourcev1.DeviceAllocationConfiguration{claimCfg},
+			wantMTU:       ptr.To(int32(9000)),
+			wantAddresses: []string{"10.0.0.5/24"},
+		},
+		{
+			name:          "claim overrides class and keeps its defaults",
+			configs:       []resourcev1.DeviceAllocationConfiguration{class, claimCfg},
+			wantMTU:       ptr.To(int32(9000)),
+			wantAddresses: []string{"10.0.0.5/24"},
+			wantForward:   ptr.To(true),
+		},
+		{
+			name: "later claim config wins",
+			configs: []resourcev1.DeviceAllocationConfiguration{
+				claimCfg,
+				opaque(resourcev1.AllocationConfigSourceClaim, `{"interface":{"mtu":4000}}`),
+			},
+			wantMTU:       ptr.To(int32(4000)),
+			wantAddresses: []string{"10.0.0.5/24"},
+		},
+	}
+	np := &NetworkDriver{driverName: "test.driver"}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			claim := &resourcev1.ResourceClaim{Status: resourcev1.ResourceClaimStatus{
+				Allocation: &resourcev1.AllocationResult{Devices: resourcev1.DeviceAllocationResult{Config: tc.configs}},
+			}}
+			got, errs := np.claimDeviceConfig(claim, "req-1")
+			if len(errs) > 0 {
+				t.Fatalf("unexpected errors: %v", errs)
+			}
+			if !reflect.DeepEqual(got.Interface.MTU, tc.wantMTU) {
+				t.Errorf("MTU = %v, want %v", ptr.Deref(got.Interface.MTU, 0), ptr.Deref(tc.wantMTU, 0))
+			}
+			if !reflect.DeepEqual(got.Interface.Addresses, tc.wantAddresses) {
+				t.Errorf("Addresses = %v, want %v", got.Interface.Addresses, tc.wantAddresses)
+			}
+			if !reflect.DeepEqual(got.Interface.Forwarding, tc.wantForward) {
+				t.Errorf("Forwarding = %v, want %v", ptr.Deref(got.Interface.Forwarding, false), ptr.Deref(tc.wantForward, false))
 			}
 		})
 	}
