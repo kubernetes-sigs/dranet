@@ -197,12 +197,12 @@ func arpValue(value, defaultValue string) string {
 var testRDMA0Config = &apis.NetworkConfig{
 	Interface: apis.InterfaceConfig{
 		Type:        apis.InterfaceTypeIPVLAN,
-		Addresses:   []string{"10.222.13.19/15"},
+		Addresses:   []string{"10.208.13.19/12"},
 		ARPIgnore:   ptr.To[int32](1),
 		ARPAnnounce: ptr.To[int32](2),
 	},
-	Routes: []apis.RouteConfig{{Destination: "10.222.0.0/15", Source: "10.222.13.19", Scope: unix.RT_SCOPE_LINK, Table: 100}},
-	Rules:  []apis.RuleConfig{{Priority: apis.SourceRoutingRulePriority, Source: "10.222.13.19/32", Table: 100}},
+	Routes: []apis.RouteConfig{{Destination: "10.208.0.0/12", Source: "10.208.13.19", Scope: unix.RT_SCOPE_LINK, Table: 100}},
+	Rules:  []apis.RuleConfig{{Priority: apis.SourceRoutingRulePriority, Source: "10.208.13.19/32", Table: 100}},
 }
 
 func TestGetDeviceAttributes(t *testing.T) {
@@ -590,12 +590,12 @@ func TestGetProfileConfig(t *testing.T) {
 	rdma15Config := &apis.NetworkConfig{
 		Interface: apis.InterfaceConfig{
 			Type:        apis.InterfaceTypeIPVLAN,
-			Addresses:   []string{"10.223.237.19/15"},
+			Addresses:   []string{"10.209.237.19/12"},
 			ARPIgnore:   ptr.To[int32](1),
 			ARPAnnounce: ptr.To[int32](2),
 		},
-		Routes: []apis.RouteConfig{{Destination: "10.222.0.0/15", Source: "10.223.237.19", Scope: unix.RT_SCOPE_LINK, Table: 115}},
-		Rules:  []apis.RuleConfig{{Priority: apis.SourceRoutingRulePriority, Source: "10.223.237.19/32", Table: 115}},
+		Routes: []apis.RouteConfig{{Destination: "10.208.0.0/12", Source: "10.209.237.19", Scope: unix.RT_SCOPE_LINK, Table: 115}},
+		Rules:  []apis.RuleConfig{{Priority: apis.SourceRoutingRulePriority, Source: "10.209.237.19/32", Table: 115}},
 	}
 
 	tests := []struct {
@@ -676,7 +676,7 @@ func TestGetProfileConfig(t *testing.T) {
 			want: &apis.NetworkConfig{
 				Interface: apis.InterfaceConfig{
 					Type:        apis.InterfaceTypeIPVLAN,
-					Addresses:   []string{"10.222.13.19/15"},
+					Addresses:   []string{"10.208.13.19/12"},
 					ARPIgnore:   ptr.To[int32](2),
 					ARPAnnounce: ptr.To[int32](1),
 				},
@@ -735,7 +735,7 @@ func TestGetProfileConfig(t *testing.T) {
 		},
 		{
 			name:     "user addresses are rejected",
-			config:   profileConfig(apis.InterfaceConfig{Addresses: []string{"10.222.13.19/15"}}),
+			config:   profileConfig(apis.InterfaceConfig{Addresses: []string{"10.208.13.19/12"}}),
 			metadata: ipv4Fabric(),
 			ifName:   "rdma0",
 			wantErr:  "assigns the child address",
@@ -750,7 +750,7 @@ func TestGetProfileConfig(t *testing.T) {
 		},
 		{
 			name:      "user rules suppress the provider routing",
-			config:    &apis.NetworkConfig{Profile: okeRDMAProfile, Rules: []apis.RuleConfig{{Priority: 100, Source: "10.222.13.19/32", Table: 200}}},
+			config:    &apis.NetworkConfig{Profile: okeRDMAProfile, Rules: []apis.RuleConfig{{Priority: 100, Source: "10.208.13.19/32", Table: 200}}},
 			metadata:  ipv4Fabric(),
 			ifName:    "rdma0",
 			addresses: []string{"10.224.13.19/12"},
@@ -896,12 +896,12 @@ func TestGetProfileConfig(t *testing.T) {
 			wantErr:  "could not read addresses for rdma0",
 		},
 		{
-			name:      "RDMA NIC outside the child range",
+			name:      "RDMA NIC index above the largest shape",
 			config:    profileConfig(apis.InterfaceConfig{}),
 			metadata:  ipv4Fabric(),
 			ifName:    "rdma16",
 			addresses: []string{"10.226.13.19/12"},
-			wantErr:   "outside the child range 10.222.0.0/15",
+			wantErr:   "could not derive the OKE child address for rdma16: RDMA NIC index 16 is above the largest supported index 15",
 		},
 		{
 			name:      "missing arp_ignore",
@@ -2465,20 +2465,26 @@ func TestDeriveRDMAIPv4(t *testing.T) {
 		wantChild   string
 		wantErr     string
 	}{
-		{name: "RDMA NIC index 0 on a /19 subnet", vnic: testVNIC(), nicIndex: 0, parentRange: defaultRange, wantParent: "10.224.13.19", wantChild: "10.222.13.19"},
-		{name: "RDMA NIC index 1 on a /19 subnet", vnic: testVNIC(), nicIndex: 1, parentRange: defaultRange, wantParent: "10.224.45.19", wantChild: "10.222.45.19"},
-		{name: "RDMA NIC index 8 on a /19 subnet", vnic: testVNIC(), nicIndex: 8, parentRange: defaultRange, wantParent: "10.225.13.19", wantChild: "10.223.13.19"},
-		{name: "RDMA NIC index 15 on a /19 subnet", vnic: testVNIC(), nicIndex: 15, parentRange: defaultRange, wantParent: "10.225.237.19", wantChild: "10.223.237.19"},
-		{name: "RDMA NIC index 16 on a /19 subnet", vnic: testVNIC(), nicIndex: 16, parentRange: defaultRange, wantErr: "RDMA NIC index 16 with a /19 primary VNIC subnet is outside the child range 10.222.0.0/15"},
-		{name: "RDMA NIC index 1 on a /20 subnet", vnic: vnicIn("10.140.64.0/20"), nicIndex: 1, parentRange: defaultRange, wantParent: "10.224.29.19", wantChild: "10.222.29.19"},
-		{name: "RDMA NIC index 7 on a /18 subnet", vnic: vnicIn("10.140.64.0/18"), nicIndex: 7, parentRange: defaultRange, wantParent: "10.225.205.19", wantChild: "10.223.205.19"},
-		{name: "RDMA NIC index 8 on a /18 subnet", vnic: vnicIn("10.140.64.0/18"), nicIndex: 8, parentRange: defaultRange, wantErr: "RDMA NIC index 8 with a /18 primary VNIC subnet is outside the child range 10.222.0.0/15"},
-		{name: "RDMA NIC index 0 in a /16 OCA network", vnic: testVNIC(), nicIndex: 0, parentRange: netip.MustParsePrefix("192.168.0.0/16"), wantParent: "192.168.13.19", wantChild: "10.222.13.19"},
+		{name: "RDMA NIC index 0 on a /19 subnet", vnic: testVNIC(), nicIndex: 0, parentRange: defaultRange, wantParent: "10.224.13.19", wantChild: "10.208.13.19"},
+		{name: "RDMA NIC index 1 on a /19 subnet", vnic: testVNIC(), nicIndex: 1, parentRange: defaultRange, wantParent: "10.224.45.19", wantChild: "10.208.45.19"},
+		{name: "RDMA NIC index 8 on a /19 subnet", vnic: testVNIC(), nicIndex: 8, parentRange: defaultRange, wantParent: "10.225.13.19", wantChild: "10.209.13.19"},
+		{name: "RDMA NIC index 15 on a /19 subnet", vnic: testVNIC(), nicIndex: 15, parentRange: defaultRange, wantParent: "10.225.237.19", wantChild: "10.209.237.19"},
+		{name: "RDMA NIC index 16 on a /19 subnet", vnic: testVNIC(), nicIndex: 16, parentRange: defaultRange, wantErr: "RDMA NIC index 16 is above the largest supported index 15"},
+		{name: "RDMA NIC index 15 on a /24 subnet", vnic: vnicIn("10.140.77.0/24"), nicIndex: 15, parentRange: defaultRange, wantParent: "10.224.15.19", wantChild: "10.208.15.19"},
+		{name: "RDMA NIC index 16 fits the child range on a /24 subnet", vnic: vnicIn("10.140.77.0/24"), nicIndex: 16, parentRange: defaultRange, wantErr: "RDMA NIC index 16 is above the largest supported index 15"},
+		{name: "RDMA NIC index 154 would give table 254", vnic: vnicIn("10.140.77.0/24"), nicIndex: 154, parentRange: defaultRange, wantErr: "RDMA NIC index 154 is above the largest supported index 15"},
+		{name: "RDMA NIC index 128 is outside the OCA network too", vnic: testVNIC(), nicIndex: 128, parentRange: defaultRange, wantErr: "RDMA NIC index 128 is above the largest supported index 15"},
+		{name: "RDMA NIC index 1 on a /20 subnet", vnic: vnicIn("10.140.64.0/20"), nicIndex: 1, parentRange: defaultRange, wantParent: "10.224.29.19", wantChild: "10.208.29.19"},
+		{name: "RDMA NIC index 7 on a /18 subnet", vnic: vnicIn("10.140.64.0/18"), nicIndex: 7, parentRange: defaultRange, wantParent: "10.225.205.19", wantChild: "10.209.205.19"},
+		{name: "RDMA NIC index 8 on a /18 subnet", vnic: vnicIn("10.140.64.0/18"), nicIndex: 8, parentRange: defaultRange, wantParent: "10.226.13.19", wantChild: "10.210.13.19"},
+		{name: "RDMA NIC index 15 on a /16 subnet", vnic: vnicIn("10.140.0.0/16"), nicIndex: 15, parentRange: defaultRange, wantParent: "10.239.77.19", wantChild: "10.223.77.19"},
+		{name: "RDMA NIC index 8 on a /15 subnet", vnic: vnicIn("10.140.0.0/15"), nicIndex: 8, parentRange: netip.MustParsePrefix("172.0.0.0/8"), wantErr: "RDMA NIC index 8 with a /15 primary VNIC subnet is outside the child range 10.208.0.0/12"},
+		{name: "RDMA NIC index 0 in a /16 OCA network", vnic: testVNIC(), nicIndex: 0, parentRange: netip.MustParsePrefix("192.168.0.0/16"), wantParent: "192.168.13.19", wantChild: "10.208.13.19"},
 		{name: "RDMA NIC index 8 in a /16 OCA network", vnic: testVNIC(), nicIndex: 8, parentRange: netip.MustParsePrefix("192.168.0.0/16"), wantErr: "RDMA NIC index 8 with a /19 primary VNIC subnet is outside the OCA RDMA network 192.168.0.0/16"},
-		{name: "OCA network overlaps the child range", vnic: testVNIC(), parentRange: netip.MustParsePrefix("10.222.0.0/16"), wantErr: "overlaps the Dranet child range"},
+		{name: "OCA network overlaps the child range", vnic: testVNIC(), parentRange: netip.MustParsePrefix("10.208.0.0/16"), wantErr: "overlaps the Dranet child range"},
 		{name: "unmasked OCA network", vnic: testVNIC(), parentRange: netip.MustParsePrefix("10.224.1.0/12"), wantErr: "is not a masked IPv4 prefix"},
 		{name: "VNIC subnet inside the OCA network", vnic: &primaryVNIC{IPv4: netip.MustParseAddr("10.224.5.5"), Subnet: netip.MustParsePrefix("10.224.0.0/19")}, parentRange: defaultRange, wantErr: "overlaps the OCA RDMA network"},
-		{name: "VNIC subnet inside the child range", vnic: &primaryVNIC{IPv4: netip.MustParseAddr("10.222.5.5"), Subnet: netip.MustParsePrefix("10.222.0.0/19")}, parentRange: defaultRange, wantErr: "overlaps the Dranet child range"},
+		{name: "VNIC subnet inside the child range", vnic: &primaryVNIC{IPv4: netip.MustParseAddr("10.208.5.5"), Subnet: netip.MustParsePrefix("10.208.0.0/19")}, parentRange: defaultRange, wantErr: "overlaps the Dranet child range"},
 		{name: "VNIC outside its subnet", vnic: &primaryVNIC{IPv4: netip.MustParseAddr("10.140.200.19"), Subnet: netip.MustParsePrefix("10.140.64.0/19")}, parentRange: defaultRange, wantErr: "is outside its subnet"},
 		{name: "missing VNIC", parentRange: defaultRange, wantErr: "not available"},
 	}

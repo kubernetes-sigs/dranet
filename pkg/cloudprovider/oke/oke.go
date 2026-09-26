@@ -80,12 +80,20 @@ const (
 	// TableIDForName hashes into 1000 to 1999 and can collide between two
 	// RDMA NICs of one pod; the RDMA NIC index cannot.
 	okeRDMASBRTableBase = 100
+	// okeMaxIPv4RDMANics is the largest RDMA NIC count of an OKE shape on an
+	// IPv4 RDMA fabric. It bounds the RDMA NIC index, and with it the routing
+	// tables 100 to 115.
+	okeMaxIPv4RDMANics = 16
 	// okeRDMAParentIPv4CIDR is the OCA RDMA network when rdma_network.json
 	// is not mounted.
 	okeRDMAParentIPv4CIDR = "10.224.0.0/12"
-	// okeRDMAChildIPv4CIDR holds one child per parent at the parent's offset.
-	// It avoids the parent /12 and the OKE pod CIDR 10.240.0.0/12.
-	okeRDMAChildIPv4CIDR = "10.222.0.0/15"
+	// okeRDMAChildIPv4CIDR holds one child block per parent at the parent's offset.
+	// A /12 holds all 16 RDMA NICs of a /16 subnet, the largest OCI subnet. It
+	// avoids the parent 10.224.0.0/12 and the OKE pod CIDR 10.240.0.0/12.
+	okeRDMAChildIPv4CIDR = "10.208.0.0/12"
+	// okeChildrenPerNIC is the size of the block of child addresses that each
+	// RDMA NIC owns. The child is the first address of the block.
+	okeChildrenPerNIC = 1
 
 	// Oracle Cloud Agent files that describe the RDMA address assignment.
 	ocaRDMANetworkFileName     = "rdma_network.json"
@@ -1055,6 +1063,11 @@ func deriveOCAParentIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Pref
 // deriveRDMAIPv4 computes the OCA parent and the Dranet child address of one
 // RDMA NIC. The child keeps the parent offset inside the child range.
 func deriveRDMAIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Prefix) (netip.Addr, netip.Addr, error) {
+	// An index above the largest shape would leave tables 100 to 115 and could
+	// reach a reserved table. It runs first, so every such index gets this error.
+	if nicIndex >= okeMaxIPv4RDMANics {
+		return netip.Addr{}, netip.Addr{}, fmt.Errorf("RDMA NIC index %d is above the largest supported index %d", nicIndex, okeMaxIPv4RDMANics-1)
+	}
 	parent, offset, err := deriveOCAParentIPv4(vnic, nicIndex, parentRange)
 	if err != nil {
 		return netip.Addr{}, netip.Addr{}, err
@@ -1067,10 +1080,11 @@ func deriveRDMAIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Prefix) (
 	if vnic.Subnet.Overlaps(childRange) {
 		return netip.Addr{}, netip.Addr{}, fmt.Errorf("primary VNIC subnet %s overlaps the Dranet child range %s", vnic.Subnet, childRange)
 	}
-	if offset >= uint64(1)<<(32-childRange.Bits()) {
+	start := offset * okeChildrenPerNIC
+	if start+okeChildrenPerNIC > uint64(1)<<(32-childRange.Bits()) {
 		return netip.Addr{}, netip.Addr{}, fmt.Errorf("RDMA NIC index %d with a /%d primary VNIC subnet is outside the child range %s", nicIndex, vnic.Subnet.Bits(), childRange)
 	}
-	child := uint32ToIPv4(ipv4ToUint32(childRange.Addr()) + uint32(offset))
+	child := uint32ToIPv4(ipv4ToUint32(childRange.Addr()) + uint32(start))
 	return parent, child, nil
 }
 

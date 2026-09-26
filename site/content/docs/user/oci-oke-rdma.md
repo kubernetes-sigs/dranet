@@ -13,7 +13,7 @@ The provider reads the OCI Instance Metadata Service (IMDS) at startup and refre
 
 ## The oke-rdma profile
 
-The provider advertises the `oke-rdma` profile for each Ethernet RDMA NIC. A claim for an RDMA NIC gets an IPvlan child of the RDMA NIC with its own address in `10.222.0.0/15`, a route table with a source rule, and the ARP settings of the RDMA NIC. The RDMA NIC itself stays on the host with its address and settings. One pod uses an RDMA NIC at a time. The child keeps the parent name inside the pod.
+The provider advertises the `oke-rdma` profile for each Ethernet RDMA NIC. A claim for an RDMA NIC gets an IPvlan child of the RDMA NIC with its own address in `10.208.0.0/12`, a route table with a source rule, and the ARP settings of the RDMA NIC. The RDMA NIC itself stays on the host with its address and settings. One pod uses an RDMA NIC at a time. The child keeps the parent name inside the pod.
 
 The child address has its own GID index on the RDMA NIC, different from the index of the parent address. Do not set `NCCL_IB_GID_INDEX` for a job that uses the children. NCCL selects the GID index itself.
 
@@ -22,8 +22,8 @@ The profile needs these conditions:
 - Each RDMA NIC has the `rdmaN` name or an address in the OCA RDMA network. Some shapes, for example BM.Optimized3.36, keep the operating system name of the RDMA NIC. On such a shape the provider identifies the RDMA NIC by that address. A claim that is prepared before OCA assigns the address moves the RDMA NIC into the pod.
 - The RDMA subsystem runs in shared network namespace mode (`netns_mode=1` for `ib_core`). In exclusive mode the claim fails with the message `use shared RDMA mode`.
 - All nodes that share one RDMA network use one primary VNIC subnet.
-- The child range holds 2^(prefix length - 15) RDMA NICs per node for the primary VNIC subnet prefix length: 16 RDMA NICs need a /19 or smaller subnet. A claim for an RDMA NIC outside the range fails with an error that names the RDMA NIC and the subnet.
-- No VCN subnet, pod CIDR, or service CIDR uses `10.222.0.0/15`.
+- The child range holds 2^(prefix length - 12) RDMA NICs per node for the primary VNIC subnet prefix length, so all 16 RDMA NICs fit for a /16 or smaller subnet. A claim fails when the RDMA NIC index is above 15.
+- No VCN subnet, pod CIDR, or service CIDR uses `10.208.0.0/12`.
 
 The profile rejects `interface.type: Passthrough`, DHCP, unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 
@@ -42,7 +42,9 @@ A pod gets only the character devices of the claimed RDMA device. No interface m
 
 With another setting, the provider fails the claim with an error that names the setting. This check needs `--profile-provider=cloud`, like the profile. With `none`, the claim moves the RDMA NIC or the RDMA device into the pod.
 
-## Oracle Cloud Agent configuration
+## Oracle Cloud Agent (OCA) configuration
+
+The provider needs OCA to configure the RDMA NICs. On a node where OCA does not configure them, an RDMA NIC without the `rdmaN` name gets no profile, and a claim moves it into the pod. An `rdmaN` NIC whose address does not follow the OCA layout fails every claim. On such nodes, use `--profile-provider=webhook` or `--profile-provider=none`, and assign the child addresses in the webhook or in the claim.
 
 The provider assumes the OCA defaults. Mount the OCA configuration directory on an image that uses another RDMA network. With the Helm chart:
 
@@ -92,9 +94,9 @@ spec:
 Inside a pod that references the claim:
 
 ```text
-rdma15  10.223.237.19/15
-table 115: 10.222.0.0/15 dev rdma15 scope link src 10.223.237.19
-rule: from 10.223.237.19 lookup 115
+rdma15  10.209.237.19/12
+table 115: 10.208.0.0/12 dev rdma15 scope link src 10.209.237.19
+rule: from 10.209.237.19 lookup 115
 ```
 
 For a training job, request every RDMA NIC of the node in one claim, one request per RDMA NIC.
