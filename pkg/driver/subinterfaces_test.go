@@ -133,23 +133,41 @@ func (e *ipvlanTestEnv) inNS(t *testing.T, fn func()) {
 	fn()
 }
 
-// linkNames returns the interface names present in the test namespace.
-func (e *ipvlanTestEnv) linkNames(t *testing.T) []string {
+// assertLinksExactly ignores the kernel's built-in tunnel links, which can be
+// present in a fresh network namespace independently of these tests.
+func assertLinksExactly(t *testing.T, env *ipvlanTestEnv, want ...string) {
 	t.Helper()
-	nhNs, err := nlwrap.NewHandleAt(e.testNS)
+	links, err := nlwrap.NewHandleAt(env.testNS)
 	if err != nil {
 		t.Fatalf("fail to open netlink handle: %v", err)
 	}
-	defer nhNs.Close()
-	links, err := nhNs.LinkList()
+	defer links.Close()
+
+	allLinks, err := links.LinkList()
 	if err != nil {
 		t.Fatalf("failed to list links in the test namespace: %v", err)
 	}
-	names := make([]string, 0, len(links))
-	for _, l := range links {
-		names = append(names, l.Attrs().Name)
+	got := make([]string, 0, len(allLinks))
+	for _, link := range allLinks {
+		if isKernelTunnelDevice(link.Attrs().Name) {
+			continue
+		}
+		got = append(got, link.Attrs().Name)
 	}
-	return names
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("links after rollback = %v, want exactly %v (excluding kernel tunnel links)", got, want)
+	}
+}
+
+func isKernelTunnelDevice(name string) bool {
+	switch name {
+	case "tunl0", "sit0", "gre0", "gretap0", "ip6tnl0", "ip6gre0", "ip6gretap0", "erspan0", "ip6erspan0", "ip_vti0", "ip6_vti0":
+		return true
+	default:
+		return false
+	}
 }
 
 // linkAttrs reads the attributes of a link in the test namespace through netlink.
@@ -165,14 +183,6 @@ func (e *ipvlanTestEnv) linkAttrs(t *testing.T, name string) *netlink.LinkAttrs 
 		t.Fatalf("failed to find %s in the test namespace: %v", name, err)
 	}
 	return link.Attrs()
-}
-
-func assertOnlyLoopback(t *testing.T, env *ipvlanTestEnv) {
-	t.Helper()
-	names := env.linkNames(t)
-	if len(names) != 1 || names[0] != "lo" {
-		t.Errorf("expected only lo in the test namespace after the failure, got %v", names)
-	}
 }
 
 func TestSubinterface_IPVlan(t *testing.T) {
@@ -293,7 +303,7 @@ func testSubinterface_IPVlan_Namespaced(t *testing.T) {
 	if err := nsDeleteSubinterface(env.nsPath, config.Name); err != nil {
 		t.Fatalf("fail to delete subinterface: %v", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinksExactly(t, env, "lo")
 }
 
 func TestSubinterface_IPVlanMTU(t *testing.T) {
@@ -345,7 +355,7 @@ func testSubinterface_IPVlanRejectsMTUAboveParent_Namespaced(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exceeds parent interface") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want a parent MTU error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinksExactly(t, env, "lo")
 }
 
 func TestSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU(t *testing.T) {
@@ -374,7 +384,7 @@ func testSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want an MTU error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinksExactly(t, env, "lo")
 	parent, err = nlwrap.LinkByName(env.parent)
 	if err != nil {
 		t.Fatal(err)
@@ -410,7 +420,7 @@ func testSubinterface_IPVlanRollsBackOnSysctlFailure_Namespaced(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "arp_ignore") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want an arp_ignore apply error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinksExactly(t, env, "lo")
 }
 
 func TestSubinterface_IPVlanRollsBackOnNameCollision(t *testing.T) {
@@ -441,12 +451,8 @@ func testSubinterface_IPVlanRollsBackOnNameCollision_Namespaced(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "failed to rename interface") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want a rename error", err)
 	}
-	// Only lo and the pre-existing dummy remain, and the dummy is untouched.
-	names := env.linkNames(t)
-	slices.Sort(names)
-	if want := []string{config.Name, "lo"}; !slices.Equal(names, want) {
-		t.Errorf("links after the rename failure = %v, want %v", names, want)
-	}
+	// The pre-existing collision and loopback remain; kernel tunnel links are ignored.
+	assertLinksExactly(t, env, config.Name, "lo")
 	existing, err := nhNs.LinkByName(config.Name)
 	if err != nil {
 		t.Fatalf("pre-existing link %s is gone after the rename failure: %v", config.Name, err)
@@ -483,8 +489,43 @@ func testCreateSubinterfaceInNS_RollsBackOnConfigureFailure_Namespaced(t *testin
 	if err == nil || !strings.Contains(err.Error(), "error configuring device net-dev-0 routes") {
 		t.Fatalf("createSubinterfaceInNS() error = %v, want a routes configuration error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinksExactly(t, env, "lo")
 	// A failed configuration must not report the device.
+	if len(status.Conditions) != 0 || status.NetworkData != nil {
+		t.Errorf("status after a configuration failure has %d conditions and network data %v, want none", len(status.Conditions), status.NetworkData)
+	}
+}
+
+func TestAttachNetdevToNS_RollsBackOnConfigureFailure(t *testing.T) {
+	userns.Run(t, testAttachNetdevToNS_RollsBackOnConfigureFailure_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testAttachNetdevToNS_RollsBackOnConfigureFailure_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, 1400)
+	deviceCfg := DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: env.parent},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Name:      "dranet0",
+				Addresses: []string{"192.0.2.10/24"},
+			},
+			// The gateway is not on link, so the route cannot be applied.
+			Routes: []apis.RouteConfig{{Destination: "198.51.100.0/24", Gateway: "203.0.113.1"}},
+		},
+	}
+
+	status := resourceapply.AllocatedDeviceStatus()
+	err := attachNetdevToNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
+	if err == nil || !strings.Contains(err.Error(), "error configuring device net-dev-0 routes") {
+		t.Fatalf("attachNetdevToNS() error = %v, want a routes configuration error", err)
+	}
+	assertLinksExactly(t, env, "lo")
+	if _, err := nlwrap.LinkByName(env.parent); err != nil {
+		t.Errorf("expected interface %s to be returned to the host namespace: %v", env.parent, err)
+	}
 	if len(status.Conditions) != 0 || status.NetworkData != nil {
 		t.Errorf("status after a configuration failure has %d conditions and network data %v, want none", len(status.Conditions), status.NetworkData)
 	}
