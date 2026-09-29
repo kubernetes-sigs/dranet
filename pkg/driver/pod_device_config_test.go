@@ -551,17 +551,15 @@ func TestPodConfigStore_GetInUseSubinterfaceIPs(t *testing.T) {
 }
 
 // TestPodConfigStore_SetDeviceReady verifies Ready can be flipped independently
-// of the rest of the device config, no-ops for a pod/device that was never
-// allocated, and does not disturb other fields.
+// of the rest of the device config, errors for a pod/device that was never
+// allocated without creating an entry, and does not disturb other fields.
 func TestPodConfigStore_SetDeviceReady(t *testing.T) {
 	store := mustNewPodConfigStore()
 	podUID := types.UID("test-pod-uid-1")
 	deviceName := "eth0"
 
-	// Setting Ready before the device is allocated is a no-op, not an error:
-	// a device cannot be ready before PrepareResourceClaim has stored it.
-	if err := store.SetDeviceReady(podUID, deviceName, true); err != nil {
-		t.Fatalf("SetDeviceReady() on unallocated device returned error: %v", err)
+	if err := store.SetDeviceReady(podUID, deviceName, true); err == nil {
+		t.Fatalf("SetDeviceReady() on unallocated device returned nil error, want an error")
 	}
 	if _, found := store.GetDeviceConfig(podUID, deviceName); found {
 		t.Errorf("SetDeviceReady() on unallocated device created a config entry")
@@ -598,9 +596,7 @@ func TestPodConfigStore_SetDeviceReady(t *testing.T) {
 
 // TestPodConfigStore_CountDevices verifies the allocated/ready counts reflect
 // the current state across multiple pods and devices, including the partial
-// state where one device of a multi-device pod is ready and another isn't —
-// the case that matters for staying accurate if RunPodSandbox's device loop
-// blocks partway through (see the NRI RunPodSandbox timeout issue, #310).
+// state where one device of a multi-device pod is ready and another isn't.
 func TestPodConfigStore_CountDevices(t *testing.T) {
 	store := mustNewPodConfigStore()
 
@@ -623,9 +619,7 @@ func TestPodConfigStore_CountDevices(t *testing.T) {
 		t.Fatalf("CountDevices() after allocating 3 devices = (%d, %d), want (3, 0)", allocated, ready)
 	}
 
-	// Only one of pod A's two devices completes attachment — the partial
-	// case that matters most: a hang on dev1 must not hide that dev0 is
-	// genuinely ready.
+	// Only one of pod A two devices completes attachment
 	if err := store.SetDeviceReady(podA, "dev0", true); err != nil {
 		t.Fatalf("SetDeviceReady(podA, dev0, true) failed: %v", err)
 	}
