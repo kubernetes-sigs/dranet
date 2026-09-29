@@ -47,6 +47,8 @@ func registerMetrics() {
 		prometheus.MustRegister(nriPluginRequestsLatencySeconds)
 		prometheus.MustRegister(publishedDevicesTotal)
 		prometheus.MustRegister(lastPublishedTime)
+		prometheus.MustRegister(nriPluginDisconnectsTotal)
+		prometheus.MustRegister(reconnectAttempt)
 	})
 }
 
@@ -87,4 +89,28 @@ var (
 		Name:      "last_published_time_seconds",
 		Help:      "The timestamp of the last successful resource publication.",
 	})
+	// nriPluginDisconnectsTotal counts every time containerd closes its ttrpc
+	// connection to this plugin (stub.WithOnClose), e.g. after an NRI request
+	// exceeds containerd's plugin_request_timeout. Distinct from
+	// nri_plugin_requests_total{status="failed"}: a disconnect can happen after
+	// the local handler already returned success, since containerd gives up and
+	// tears down the connection independently of whether/how the handler finishes.
+	nriPluginDisconnectsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "nri_plugin_disconnects_total",
+		Help:      "Total number of times containerd closed its NRI plugin connection to dranet (e.g. on plugin_request_timeout).",
+	})
+	// reconnectAttempt tracks the current attempt number in the restart loop for
+	// a dranet subsystem (the NRI plugin connection, or the host network device
+	// database). Both loops are capped at maxAttempts before the process exits
+	// via klog.Fatalf, so this value approaching maxAttempts is an early warning
+	// ahead of that exit, whereas the container restart itself only becomes
+	// visible afterwards, via kube_pod_container_status_restarts_total.
+	reconnectAttempt = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "reconnect_attempt",
+		Help:      "Current attempt number (0-indexed) in the restart loop for a dranet subsystem. Resets to 0 on process restart; approaches maxAttempts before the process exits.",
+	}, []string{"component"})
 )
