@@ -110,7 +110,7 @@ var (
 	reconnectAttempt = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",
-		Name:      "reconnect_attempt",
+		Name:      "nri_plugin_reconnect_attempt",
 		Help:      "Current attempt number (0-indexed) in the restart loop for a dranet subsystem. Resets to 0 on process restart; approaches maxAttempts before the process exits.",
 	}, []string{"component"})
 )
