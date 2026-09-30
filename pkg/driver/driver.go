@@ -211,7 +211,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				reconnectAttempt.WithLabelValues("nri_plugin").Set(float64(i))
+				nriPluginReconnectAttempt.Set(float64(i))
 				klog.Infof("Restarting NRI plugin %d out of %d", i, maxAttempts)
 			}
 		}
@@ -232,7 +232,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				reconnectAttempt.WithLabelValues("netdb").Set(float64(i))
+				netdbReconnectAttempt.Set(float64(i))
 				klog.Infof("Restarting Network Device DB %d out of %d", i, maxAttempts)
 			}
 		}

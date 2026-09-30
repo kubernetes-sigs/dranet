@@ -34,26 +34,32 @@ func TestNRIPluginDisconnectsTotal(t *testing.T) {
 	}
 }
 
-func TestReconnectAttemptGauge(t *testing.T) {
-	reconnectAttempt.Reset()
+func TestReconnectAttemptGauges(t *testing.T) {
+	nriPluginReconnectAttempt.Set(3)
+	netdbReconnectAttempt.Set(1)
 
-	reconnectAttempt.WithLabelValues("nri_plugin").Set(3)
-	reconnectAttempt.WithLabelValues("netdb").Set(1)
-
-	if got := testutil.ToFloat64(reconnectAttempt.WithLabelValues("nri_plugin")); got != 3 {
+	if got := testutil.ToFloat64(nriPluginReconnectAttempt); got != 3 {
 		t.Errorf("expected nri_plugin reconnect attempt to be 3, got %v", got)
 	}
-	if got := testutil.ToFloat64(reconnectAttempt.WithLabelValues("netdb")); got != 1 {
+	if got := testutil.ToFloat64(netdbReconnectAttempt); got != 1 {
 		t.Errorf("expected netdb reconnect attempt to be 1, got %v", got)
 	}
 
-	expected := `
-		# HELP dranet_driver_reconnect_attempt Current attempt number (0-indexed) in the restart loop for a dranet subsystem. Resets to 0 on process restart; approaches maxAttempts before the process exits.
-		# TYPE dranet_driver_reconnect_attempt gauge
-		dranet_driver_reconnect_attempt{component="netdb"} 1
-		dranet_driver_reconnect_attempt{component="nri_plugin"} 3
+	expectedNRI := `
+		# HELP dranet_driver_nri_plugin_reconnect_attempt Current attempt number (0-indexed) in the restart loop for the NRI plugin connection. Resets to 0 on process restart; approaches maxAttempts before the process exits.
+		# TYPE dranet_driver_nri_plugin_reconnect_attempt gauge
+		dranet_driver_nri_plugin_reconnect_attempt 3
 		`
-	if err := testutil.CollectAndCompare(reconnectAttempt, strings.NewReader(expected), "dranet_driver_reconnect_attempt"); err != nil {
-		t.Fatalf("CollectAndCompare failed: %v", err)
+	if err := testutil.CollectAndCompare(nriPluginReconnectAttempt, strings.NewReader(expectedNRI), "dranet_driver_nri_plugin_reconnect_attempt"); err != nil {
+		t.Fatalf("CollectAndCompare failed for nriPluginReconnectAttempt: %v", err)
+	}
+
+	expectedNetdb := `
+		# HELP dranet_driver_netdb_reconnect_attempt Current attempt number (0-indexed) in the restart loop for the host network device database. Resets to 0 on process restart; approaches maxAttempts before the process exits.
+		# TYPE dranet_driver_netdb_reconnect_attempt gauge
+		dranet_driver_netdb_reconnect_attempt 1
+		`
+	if err := testutil.CollectAndCompare(netdbReconnectAttempt, strings.NewReader(expectedNetdb), "dranet_driver_netdb_reconnect_attempt"); err != nil {
+		t.Fatalf("CollectAndCompare failed for netdbReconnectAttempt: %v", err)
 	}
 }
