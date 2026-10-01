@@ -68,8 +68,9 @@ var (
 )
 
 type DB struct {
-	instance cloudprovider.CloudInstance
-	profProv cloudprovider.ProfileProvider
+	instance         cloudprovider.CloudInstance
+	profProv         cloudprovider.ProfileProvider
+	hostNetValidator cloudprovider.HostNetworkConfigValidator
 	// TODO: it is not common but may happen in edge cases that the default
 	// gateway changes revisit once we have more evidence this can be a
 	// potential problem or break some use cases.
@@ -145,6 +146,12 @@ func WithCloudInstance(instance cloudprovider.CloudInstance) Option {
 func WithProfileProvider(profProv cloudprovider.ProfileProvider) Option {
 	return func(db *DB) {
 		db.profProv = profProv
+	}
+}
+
+func WithHostNetworkConfigValidator(v cloudprovider.HostNetworkConfigValidator) Option {
+	return func(db *DB) {
+		db.hostNetValidator = v
 	}
 }
 
@@ -655,6 +662,26 @@ func (db *DB) ReleaseProfileConfig(deviceName string, claimUID types.UID, config
 	}
 
 	return p.ReleaseProfileConfig(id, claimUID, config)
+}
+
+// ValidateHostNetworkConfig asks the optional provider validator to check the
+// host-derived network configuration about to be persisted. A nil validator is
+// a no-op (providers that do not opt in keep current behavior).
+func (db *DB) ValidateHostNetworkConfig(deviceName string, config *apis.NetworkConfig) error {
+	v := db.hostNetValidator
+	if v == nil {
+		return nil
+	}
+
+	db.mu.RLock()
+	device, exists := db.deviceStore[deviceName]
+	db.mu.RUnlock()
+
+	id := cloudprovider.DeviceIdentifiers{}
+	if exists {
+		id = getDeviceIdentifiers(&device)
+	}
+	return v.ValidateHostNetworkConfig(id, config)
 }
 
 // GetDeviceConfig returns the network configuration associated with the device, if any.
