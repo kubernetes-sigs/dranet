@@ -47,6 +47,10 @@ spec:
         - name: dranet
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metricsPort | default 9177 }}
+              protocol: TCP
           args:
             - /dranet
             - --v={{ .Values.logVerbosity }}
@@ -108,13 +112,13 @@ spec:
           startupProbe:
             httpGet:
               path: {{ .Values.metricsPath }}
-              port: {{ .Values.metricsPort | default 9177 }}
+              port: metrics
             failureThreshold: 12
             periodSeconds: 5
           readinessProbe:
             httpGet:
               path: {{ .Values.metricsPath }}
-              port: {{ .Values.metricsPort | default 9177 }}
+              port: metrics
           volumeMounts:
             - name: device-plugin
               mountPath: {{ .Values.kubeletRootDir }}/plugins

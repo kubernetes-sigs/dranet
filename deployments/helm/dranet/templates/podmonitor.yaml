@@ -1,0 +1,23 @@
+{{- if and (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor") .Values.prometheus.monitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "dranet.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dranet.labels" . | nindent 4 }}
+    {{- with .Values.prometheus.monitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "dranet.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.prometheus.monitor.interval | quote }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+{{- end }}

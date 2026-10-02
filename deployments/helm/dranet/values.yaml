@@ -19,6 +19,12 @@ logVerbosity: 4
 metricsPort: ~
 metricsPath: /healthz
 
+prometheus:
+  monitor:
+    enabled: false
+    labels: {}
+    interval: 30s
+
 # DRANET daemon arguments. Omit a field to use the binary's built-in default.
 args: {}
 #  filter: '!("dra.net/type" in attributes) || attributes["dra.net/type"].StringValue  != "veth"'

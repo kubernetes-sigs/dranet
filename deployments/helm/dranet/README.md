@@ -26,6 +26,9 @@ The following table lists the configurable parameters and their default values:
 | `logVerbosity` | Log verbosity level | `4` |
 | `metricsPort` | Port for the metrics/healthz server and readiness probe | binary default: `9177` |
 | `metricsPath` | HTTP path for the startup and readiness probes | `/healthz` |
+| `prometheus.monitor.enabled` | Create a PodMonitor for Prometheus Operator to scrape `/metrics` on `metricsPort` | `false` |
+| `prometheus.monitor.labels` | Extra labels on the PodMonitor object, e.g. to match a Prometheus instance's `podMonitorSelector` | `{}` |
+| `prometheus.monitor.interval` | Prometheus scrape interval | `30s` |
 | `kubeletRootDir` | Kubelet data directory (its `--root-dir`), used for both the hostPath and mountPath of the plugin/registration sockets | `/var/lib/kubelet` |
 | `nodeSelector` | Node selector for the DaemonSet pods | `{}` |
 | `affinity` | Affinity rules for the DaemonSet pods | `{}` |
@@ -62,6 +65,22 @@ After the upgrade, restart those workloads.
 
 When `args.profileProvider` or `args.cloudProviderHint` is `webhook`, set
 `args.webhookURL` to the webhook endpoint.
+
+`prometheus.monitor.enabled` creates a PodMonitor for Prometheus Operator
+to scrape. The template checks for the `monitoring.coreos.com/v1/PodMonitor`
+CRD via `.Capabilities.APIVersions` before rendering, so setting it to `true`
+on a cluster without that CRD installed is a silent no-op rather than a
+failed `helm install`. `helm install`/`helm upgrade` populate this check from
+the live cluster automatically; a plain offline `helm template` does not --
+pass `--api-versions monitoring.coreos.com/v1/PodMonitor` to simulate it there.
+
+Metrics remain scrapable without the CRD via annotation-based discovery
+instead: set `podAnnotations` to `prometheus.io/scrape: "true"` and
+`prometheus.io/port: "9177"`. This only works if your Prometheus is actually
+configured with a scrape config that reads `prometheus.io/*` annotations --
+unlike the PodMonitor path, nothing here wires that up automatically. Keep
+`prometheus.io/port` in sync with `metricsPort` if you change it from the
+default.
 
 `extraVolumes` and `extraVolumeMounts` add entries after the built-in volumes
 and container mounts. The chart does not change the entries. Do not reuse the
