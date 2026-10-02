@@ -549,3 +549,86 @@ func TestPodConfigStore_GetInUseSubinterfaceIPs(t *testing.T) {
 		})
 	}
 }
+
+// TestPodConfigStore_SetDeviceReady verifies Ready can be flipped independently
+// of the rest of the device config, errors for a pod/device that was never
+// allocated without creating an entry, and does not disturb other fields.
+func TestPodConfigStore_SetDeviceReady(t *testing.T) {
+	store := mustNewPodConfigStore()
+	podUID := types.UID("test-pod-uid-1")
+	deviceName := "eth0"
+
+	if err := store.SetDeviceReady(podUID, deviceName, true); err == nil {
+		t.Fatalf("SetDeviceReady() on unallocated device returned nil error, want an error")
+	}
+	if _, found := store.GetDeviceConfig(podUID, deviceName); found {
+		t.Errorf("SetDeviceReady() on unallocated device created a config entry")
+	}
+
+	config := DeviceConfig{RDMADevice: RDMAConfig{LinkDev: "mlx5_0"}}
+	if err := store.SetDeviceConfig(podUID, deviceName, config); err != nil {
+		t.Fatalf("SetDeviceConfig() failed: %v", err)
+	}
+	got, _ := store.GetDeviceConfig(podUID, deviceName)
+	if got.Ready {
+		t.Errorf("newly allocated device is Ready=true, want false")
+	}
+
+	if err := store.SetDeviceReady(podUID, deviceName, true); err != nil {
+		t.Fatalf("SetDeviceReady(true) failed: %v", err)
+	}
+	got, _ = store.GetDeviceConfig(podUID, deviceName)
+	if !got.Ready {
+		t.Errorf("SetDeviceReady(true): Ready = false, want true")
+	}
+	if got.RDMADevice.LinkDev != "mlx5_0" {
+		t.Errorf("SetDeviceReady() disturbed unrelated field RDMADevice.LinkDev = %q, want mlx5_0", got.RDMADevice.LinkDev)
+	}
+
+	if err := store.SetDeviceReady(podUID, deviceName, false); err != nil {
+		t.Fatalf("SetDeviceReady(false) failed: %v", err)
+	}
+	got, _ = store.GetDeviceConfig(podUID, deviceName)
+	if got.Ready {
+		t.Errorf("SetDeviceReady(false): Ready = true, want false")
+	}
+}
+
+// TestPodConfigStore_CountDevices verifies the allocated/ready counts reflect
+// the current state across multiple pods and devices, including the partial
+// state where one device of a multi-device pod is ready and another isn't.
+func TestPodConfigStore_CountDevices(t *testing.T) {
+	store := mustNewPodConfigStore()
+
+	if allocated, ready := store.CountDevices(); allocated != 0 || ready != 0 {
+		t.Fatalf("CountDevices() on empty store = (%d, %d), want (0, 0)", allocated, ready)
+	}
+
+	podA, podB := types.UID("pod-a"), types.UID("pod-b")
+	for _, d := range []struct {
+		pod    types.UID
+		device string
+	}{
+		{podA, "dev0"}, {podA, "dev1"}, {podB, "dev0"},
+	} {
+		if err := store.SetDeviceConfig(d.pod, d.device, DeviceConfig{}); err != nil {
+			t.Fatalf("SetDeviceConfig(%s, %s) failed: %v", d.pod, d.device, err)
+		}
+	}
+	if allocated, ready := store.CountDevices(); allocated != 3 || ready != 0 {
+		t.Fatalf("CountDevices() after allocating 3 devices = (%d, %d), want (3, 0)", allocated, ready)
+	}
+
+	// Only one of pod A two devices completes attachment
+	if err := store.SetDeviceReady(podA, "dev0", true); err != nil {
+		t.Fatalf("SetDeviceReady(podA, dev0, true) failed: %v", err)
+	}
+	if allocated, ready := store.CountDevices(); allocated != 3 || ready != 1 {
+		t.Fatalf("CountDevices() with one ready device = (%d, %d), want (3, 1)", allocated, ready)
+	}
+
+	store.DeletePod(podB)
+	if allocated, ready := store.CountDevices(); allocated != 2 || ready != 1 {
+		t.Fatalf("CountDevices() after DeletePod(podB) = (%d, %d), want (2, 1)", allocated, ready)
+	}
+}
