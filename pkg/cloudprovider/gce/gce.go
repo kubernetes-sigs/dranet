@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -35,6 +36,7 @@ import (
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/dranet/internal/nlwrap"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/ipam"
@@ -206,22 +208,22 @@ func (g *GCEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim
 		if err := g.localIPAM.Reserve(config.Interface.Addresses); err != nil {
 			return nil, fmt.Errorf("reserving static subinterface addresses for device %q: %w", id.MAC, err)
 		}
-		return sourceRoutingConfig(interfaceForMac, config, nil), nil
+		return sourceRoutingConfig(id.Name, interfaceForMac, config, nil), nil
 	}
 
-	// Otherwise allocate node-local IPs from the interface's cloud ranges.
-	ranges, err := g.subinterfaceRanges(interfaceForMac)
+	// Otherwise allocate node-local IPs from the interface's ranges.
+	ranges, err := g.subinterfaceRanges(id.Name, interfaceForMac)
 	if err != nil {
 		return nil, err
 	}
 	if len(ranges) == 0 {
-		return nil, fmt.Errorf("no subinterface IP ranges found in cloud metadata for device %q", id.MAC)
+		return nil, fmt.Errorf("no subinterface IP ranges found for device %q (mac %q)", id.Name, id.MAC)
 	}
 	addrs, err := g.localIPAM.Allocate(ranges)
 	if err != nil {
 		return nil, fmt.Errorf("allocating subinterface addresses for device %q: %w", id.MAC, err)
 	}
-	return sourceRoutingConfig(interfaceForMac, config, addrs), nil
+	return sourceRoutingConfig(id.Name, interfaceForMac, config, addrs), nil
 }
 
 // sourceRoutingConfig builds the profile config for a subinterface: the newly
@@ -230,7 +232,7 @@ func (g *GCEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim
 // holding an on-link gateway route and a default route, and one source rule per
 // address. When the merged config already carries routes, rules or a VRF, the
 // user/provider owns routing and nothing is synthesized.
-func sourceRoutingConfig(iface gceNetworkInterface, config *apis.NetworkConfig, allocated []string) *apis.NetworkConfig {
+func sourceRoutingConfig(ifName string, iface gceNetworkInterface, config *apis.NetworkConfig, allocated []string) *apis.NetworkConfig {
 	profile := &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addresses: allocated}}
 
 	addrs := allocated
@@ -249,7 +251,9 @@ func sourceRoutingConfig(iface gceNetworkInterface, config *apis.NetworkConfig, 
 	if gw, err := netip.ParseAddr(iface.Gateway); err == nil && gw.Is4() {
 		gateways[false] = gw
 	}
-	if gw, err := netip.ParseAddr(iface.GatewayIPv6); err == nil && gw.Is6() {
+	if gw := getIPv6GatewayFromNeighbors(ifName); gw.IsValid() {
+		gateways[true] = gw
+	} else if gw, err := netip.ParseAddr(iface.GatewayIPv6); err == nil && gw.Is6() {
 		gateways[true] = gw
 	}
 
@@ -372,13 +376,17 @@ func WithReservedAddresses(addrs []string) Option {
 }
 
 // subinterfaceRanges derives the node-local IP allocation ranges for the given GCE network interface.
-func (g *GCEInstance) subinterfaceRanges(iface gceNetworkInterface) ([]ipam.IPRange, error) {
+func (g *GCEInstance) subinterfaceRanges(ifName string, iface gceNetworkInterface) ([]ipam.IPRange, error) {
 	var ranges []ipam.IPRange
-	// IPv6: derive the subinterface range from the base IPv6 address.
-	if len(iface.IPv6) > 0 {
-		cidr, err := getIPv6Range(iface.IPv6[0])
+	// IPv6: derive the subinterface range from the host interface's global IPv6 prefix.
+	prefix, err := getNICIPv6Prefix(ifName)
+	if err != nil {
+		return nil, fmt.Errorf("determining IPv6 prefix for device %q: %w", ifName, err)
+	}
+	if prefix != nil {
+		cidr, err := getIPv6Range(prefix.String())
 		if err != nil {
-			return nil, fmt.Errorf("calculating IPv6 range for base IP %q: %w", iface.IPv6[0], err)
+			return nil, fmt.Errorf("calculating IPv6 range for base IP %q: %w", prefix.String(), err)
 		}
 		start, end, err := cloudprovider.IPRangeFromCIDR(cidr, 0, 0)
 		if err != nil {
@@ -396,6 +404,63 @@ func (g *GCEInstance) subinterfaceRanges(iface gceNetworkInterface) ([]ipam.IPRa
 		ranges = append(ranges, ipam.IPRange{Start: start, End: end})
 	}
 	return ranges, nil
+}
+
+// getNICIPv6Prefix queries the host interface ifName via netlink and returns
+// the global IPv6 prefix of ifName.
+func getNICIPv6Prefix(ifName string) (*net.IPNet, error) {
+	if ifName == "" {
+		return nil, nil
+	}
+	link, err := nlwrap.LinkByName(ifName)
+	if err != nil {
+		return nil, fmt.Errorf("could not find interface %s: %w", ifName, err)
+	}
+	addrs, err := nlwrap.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return nil, fmt.Errorf("could not list IPv6 addresses for %s: %w", ifName, err)
+	}
+	for _, addr := range addrs {
+		if !addr.IP.IsGlobalUnicast() {
+			continue
+		}
+		if ones, bits := addr.Mask.Size(); bits != 128 || ones/8 >= 14 {
+			continue
+		}
+		return &net.IPNet{IP: addr.IP.Mask(addr.Mask), Mask: addr.Mask}, nil
+	}
+	return nil, nil
+}
+
+// getIPv6GatewayFromNeighbors inspects ifName for a permanent, link-local IPv6
+// neighbor entry (e.g. "fe80::1 lladdr 02:32:00:00:00:00 PERMANENT" on A5X
+// dcnN_lbvf) and returns its IP as the IPv6 gateway.
+func getIPv6GatewayFromNeighbors(ifName string) netip.Addr {
+	if ifName == "" {
+		return netip.Addr{}
+	}
+	link, err := nlwrap.LinkByName(ifName)
+	if err != nil {
+		return netip.Addr{}
+	}
+	neighs, err := nlwrap.NeighList(link.Attrs().Index, netlink.FAMILY_V6)
+	if err != nil {
+		return netip.Addr{}
+	}
+	for _, neigh := range neighs {
+		if neigh.State&netlink.NUD_PERMANENT == 0 || neigh.IP == nil || len(neigh.HardwareAddr) == 0 {
+			continue
+		}
+		if !neigh.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		gw, err := netip.ParseAddr(neigh.IP.String())
+		if err != nil || !gw.Is6() {
+			continue
+		}
+		return gw
+	}
+	return netip.Addr{}
 }
 
 // getIPv6Range calculates the subinterface IPv6 range by appending 0xC0DE marker to the base range.

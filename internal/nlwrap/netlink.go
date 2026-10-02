@@ -393,3 +393,25 @@ func (h *Handle) RdmaSystemGetNetnsMode() (string, error) {
 	})
 	return mode, discardErrDumpInterrupted(err)
 }
+
+// NeighList calls netlink.NeighList, retrying if necessary.
+func NeighList(linkIndex, family int) ([]netlink.Neigh, error) {
+	var neighs []netlink.Neigh
+	var err error
+	retryOnIntr(func() error {
+		neighs, err = netlink.NeighList(linkIndex, family) //nolint:forbidigo
+		return err
+	})
+	return neighs, discardErrDumpInterrupted(err)
+}
+
+// NeighList calls h.Handle.NeighList, retrying if necessary.
+func (h Handle) NeighList(linkIndex, family int) ([]netlink.Neigh, error) {
+	var neighs []netlink.Neigh
+	var err error
+	retryOnIntr(func() error {
+		neighs, err = h.Handle.NeighList(linkIndex, family) //nolint:forbidigo
+		return err
+	})
+	return neighs, discardErrDumpInterrupted(err)
+}

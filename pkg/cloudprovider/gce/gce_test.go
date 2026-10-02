@@ -17,8 +17,12 @@ limitations under the License.
 package gce
 
 import (
+	"net"
+	"syscall"
 	"testing"
 
+	"github.com/vishvananda/netlink"
+	userns "sigs.k8s.io/dranet/internal/testutils"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/ipam"
@@ -28,6 +32,27 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/utils/ptr"
 )
+
+func addDummyInterface(t *testing.T, ifName string, cidrs ...string) {
+	t.Helper()
+	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: ifName}}
+	if err := netlink.LinkAdd(dummy); err != nil {
+		t.Fatalf("failed to add dummy %s: %v", ifName, err)
+	}
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		t.Fatalf("failed to look up %s: %v", ifName, err)
+	}
+	for _, cidr := range cidrs {
+		addr, err := netlink.ParseAddr(cidr)
+		if err != nil {
+			t.Fatalf("failed to parse address %s: %v", cidr, err)
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			t.Fatalf("failed to add address %s to %s: %v", cidr, ifName, err)
+		}
+	}
+}
 
 func TestGetDeviceAttributes(t *testing.T) {
 	tests := []struct {
@@ -158,21 +183,29 @@ func TestGetDeviceAttributes(t *testing.T) {
 }
 
 func TestGetProfileConfig(t *testing.T) {
-	const mac = "00:11:22:33:44:55"
-	dualStackIface := gceNetworkInterface{
-		Mac:       mac,
-		IPAliases: []string{"10.24.3.0/24"},
-		IPv6:      []string{"2001:db8:1234:5678::/64"},
+	userns.Run(t, testGetProfileConfig_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testGetProfileConfig_Namespaced(t *testing.T) {
+	const (
+		dualStackMAC = "00:11:22:33:44:55"
+		bareMAC      = "00:11:22:33:44:66"
+	)
+
+	addDummyInterface(t, "eth-dualstack", "2001:db8:1234:5678::1/64")
+	addDummyInterface(t, "eth-bare")
+
+	interfaces := []gceNetworkInterface{
+		{Mac: dualStackMAC, IPAliases: []string{"10.24.3.0/24"}},
+		{Mac: bareMAC},
 	}
-	bareIface := gceNetworkInterface{Mac: mac}
 	ipvlanConfig := func() *apis.NetworkConfig {
 		return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN}}
 	}
 
 	tests := []struct {
 		name      string
-		mac       string
-		iface     gceNetworkInterface
+		id        cloudprovider.DeviceIdentifiers
 		config    *apis.NetworkConfig
 		wantAddrs int
 		wantErr   bool
@@ -180,68 +213,60 @@ func TestGetProfileConfig(t *testing.T) {
 	}{
 		{
 			name:      "dual-stack subinterface allocates one address per family",
-			mac:       mac,
-			iface:     dualStackIface,
+			id:        cloudprovider.DeviceIdentifiers{MAC: dualStackMAC, Name: "eth-dualstack"},
 			config:    ipvlanConfig(),
 			wantAddrs: 2,
 		},
 		{
 			name:   "empty MAC returns nil",
-			mac:    "",
-			iface:  dualStackIface,
+			id:     cloudprovider.DeviceIdentifiers{MAC: "", Name: "eth-dualstack"},
 			config: ipvlanConfig(),
 		},
 		{
 			name:   "MAC not found returns nil",
-			mac:    "aa:bb:cc:dd:ee:ff",
-			iface:  dualStackIface,
+			id:     cloudprovider.DeviceIdentifiers{MAC: "aa:bb:cc:dd:ee:ff", Name: "eth-dualstack"},
 			config: ipvlanConfig(),
 		},
 		{
 			name:   "non-subinterface config returns nil",
-			mac:    mac,
-			iface:  dualStackIface,
+			id:     cloudprovider.DeviceIdentifiers{MAC: dualStackMAC, Name: "eth-dualstack"},
 			config: &apis.NetworkConfig{},
 		},
 		{
-			name:    "subinterface without cloud ranges returns error",
-			mac:     mac,
-			iface:   bareIface,
+			name:    "subinterface without ranges returns error",
+			id:      cloudprovider.DeviceIdentifiers{MAC: bareMAC, Name: "eth-bare"},
 			config:  ipvlanConfig(),
 			wantErr: true,
 		},
 		{
 			name:    "subinterface without IPAM returns error",
-			mac:     mac,
-			iface:   dualStackIface,
+			id:      cloudprovider.DeviceIdentifiers{MAC: dualStackMAC, Name: "eth-dualstack"},
 			config:  ipvlanConfig(),
 			nilIPAM: true,
 			wantErr: true,
 		},
 		{
 			name:      "static addresses are reserved not allocated",
-			mac:       mac,
-			iface:     dualStackIface,
+			id:        cloudprovider.DeviceIdentifiers{MAC: dualStackMAC, Name: "eth-dualstack"},
 			config:    &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN, Addresses: []string{"10.24.3.5/32"}}},
 			wantAddrs: 0,
 		},
 		{
-			name:    "invalid IPv6 metadata returns error",
-			mac:     mac,
-			iface:   gceNetworkInterface{Mac: mac, IPv6: []string{"not-an-ip"}},
+			name:    "non-existent interface name returns error",
+			id:      cloudprovider.DeviceIdentifiers{MAC: dualStackMAC, Name: "missing-nic"},
 			config:  ipvlanConfig(),
 			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
+		instance := &GCEInstance{Interfaces: interfaces}
 		t.Run(tt.name, func(t *testing.T) {
-			instance := &GCEInstance{Interfaces: []gceNetworkInterface{tt.iface}}
 			if !tt.nilIPAM {
 				instance.localIPAM = ipam.NewLocalIPAM(nil)
 			}
 
-			got, err := instance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: tt.mac}, nil, tt.config)
+			got, err := instance.GetProfileConfig(tt.id, nil, tt.config)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("GetProfileConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -266,18 +291,23 @@ func TestGetProfileConfig(t *testing.T) {
 // (per-device table routes plus per-address source rules) through the existing
 // Routes/Rules API, so the driver applies it with no special casing.
 func TestGetProfileConfigSourceRouting(t *testing.T) {
+	userns.Run(t, testGetProfileConfigSourceRouting_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testGetProfileConfigSourceRouting_Namespaced(t *testing.T) {
+	addDummyInterface(t, "eth0", "2001:db8:1234:5678::1/64")
+
 	const mac = "00:11:22:33:44:55"
 	iface := gceNetworkInterface{
 		Mac:         mac,
 		IPAliases:   []string{"10.24.3.0/24"},
-		IPv6:        []string{"2001:db8:1234:5678::/64"},
 		Gateway:     "10.24.3.1",
 		GatewayIPv6: "fe80::1",
 	}
 	instance := &GCEInstance{Interfaces: []gceNetworkInterface{iface}, localIPAM: ipam.NewLocalIPAM(nil)}
 	ipvlanConfig := &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN}}
 
-	got, err := instance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: mac}, nil, ipvlanConfig)
+	got, err := instance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: mac, Name: "eth0"}, nil, ipvlanConfig)
 	if err != nil {
 		t.Fatalf("GetProfileConfig() error = %v", err)
 	}
@@ -306,13 +336,61 @@ func TestGetProfileConfigSourceRouting(t *testing.T) {
 		}
 	}
 
+	// When the parent interface (e.g. A5X lbvf) has a permanent link-local
+	// IPv6 neighbor, its IP takes precedence over MDS gatewayIpv6.
+	addDummyInterface(t, "lbvf", "fd36:0:4:2047:c00::/72")
+	lbvfLink, err := netlink.LinkByName("lbvf")
+	if err != nil {
+		t.Fatalf("failed to look up lbvf: %v", err)
+	}
+	if err := netlink.LinkSetUp(lbvfLink); err != nil {
+		t.Fatalf("failed to set up lbvf: %v", err)
+	}
+	nonLinkLocalMAC, _ := net.ParseMAC("02:32:00:00:00:99")
+	if err := netlink.NeighAdd(&netlink.Neigh{
+		LinkIndex:    lbvfLink.Attrs().Index,
+		Family:       netlink.FAMILY_V6,
+		State:        netlink.NUD_PERMANENT,
+		IP:           net.ParseIP("fd36:0:4:2047:c00::2"),
+		HardwareAddr: nonLinkLocalMAC,
+	}); err != nil {
+		t.Fatalf("failed to add global neighbor on lbvf: %v", err)
+	}
+	gwMAC, _ := net.ParseMAC("02:32:00:00:00:00")
+	if err := netlink.NeighAdd(&netlink.Neigh{
+		LinkIndex:    lbvfLink.Attrs().Index,
+		Family:       netlink.FAMILY_V6,
+		State:        netlink.NUD_PERMANENT,
+		IP:           net.ParseIP("fe80::1"),
+		HardwareAddr: gwMAC,
+	}); err != nil {
+		t.Fatalf("failed to add permanent link-local neighbor on lbvf: %v", err)
+	}
+
+	lbvfIface := gceNetworkInterface{
+		Mac:         mac,
+		GatewayIPv6: "fe80::2",
+	}
+	lbvfInstance := &GCEInstance{Interfaces: []gceNetworkInterface{lbvfIface}, localIPAM: ipam.NewLocalIPAM(nil)}
+	lbvfGot, err := lbvfInstance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: mac, Name: "lbvf"}, nil, ipvlanConfig)
+	if err != nil {
+		t.Fatalf("GetProfileConfig(lbvf) error = %v", err)
+	}
+	wantLbvfRoutes := []apis.RouteConfig{
+		{Destination: "fe80::1/128", Scope: 253, Table: table},
+		{Destination: "::/0", Gateway: "fe80::1", Table: table},
+	}
+	if diff := cmp.Diff(wantLbvfRoutes, lbvfGot.Routes); diff != "" {
+		t.Errorf("lbvf Routes mismatch (-want +got):\n%s", diff)
+	}
+
 	// A config that already carries routes or rules owns its routing:
 	// the profile must only return the allocated addresses.
 	userOwned := &apis.NetworkConfig{
 		Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN},
 		Routes:    []apis.RouteConfig{{Destination: "0.0.0.0/0", Gateway: "10.24.3.1"}},
 	}
-	got, err = instance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: mac}, nil, userOwned)
+	got, err = instance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: mac, Name: "eth0"}, nil, userOwned)
 	if err != nil {
 		t.Fatalf("GetProfileConfig() error = %v", err)
 	}
@@ -373,42 +451,62 @@ func TestGetIPv6Range(t *testing.T) {
 }
 
 func TestSubinterfaceRanges(t *testing.T) {
+	userns.Run(t, testSubinterfaceRanges_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testSubinterfaceRanges_Namespaced(t *testing.T) {
+	addDummyInterface(t, "eth-v6", "fd36:0:4:2047:c00::/72")
+	addDummyInterface(t, "eth-v4")
+
 	tests := []struct {
 		name    string
+		ifName  string
 		iface   gceNetworkInterface
 		want    [][2]string // {start, end} per range, in order.
 		wantErr bool
 	}{
 		{
-			name:  "IPv4 alias only",
-			iface: gceNetworkInterface{IPAliases: []string{"10.24.3.0/24"}},
-			want:  [][2]string{{"10.24.3.1", "10.24.3.254"}},
+			name:   "IPv4 alias only",
+			ifName: "eth-v4",
+			iface:  gceNetworkInterface{IPAliases: []string{"10.24.3.0/24"}},
+			want:   [][2]string{{"10.24.3.1", "10.24.3.254"}},
 		},
 		{
-			name:  "IPv6 only",
-			iface: gceNetworkInterface{IPv6: []string{"2001:db8:1234:5678::/64"}},
-			want:  [][2]string{{"2001:db8:1234:5678:c0de::1", "2001:db8:1234:5678:c0de:ffff:ffff:fffe"}},
+			name:   "IPv6 from host interface",
+			ifName: "eth-v6",
+			iface:  gceNetworkInterface{},
+			want:   [][2]string{{"fd36:0:4:2047:cc0:de00:0:1", "fd36:0:4:2047:cc0:deff:ffff:fffe"}},
 		},
 		{
-			name:  "dual stack orders IPv6 before IPv4",
-			iface: gceNetworkInterface{IPAliases: []string{"10.24.3.0/24"}, IPv6: []string{"2001:db8:1234:5678::/64"}},
+			name:   "host interface IPv6 overrides mismatched metadata IPv6",
+			ifName: "eth-v6",
+			iface:  gceNetworkInterface{IPv6: []string{"fd36:0:4:2047:1000::/72"}},
+			want:   [][2]string{{"fd36:0:4:2047:cc0:de00:0:1", "fd36:0:4:2047:cc0:deff:ffff:fffe"}},
+		},
+		{
+			name:   "dual stack orders IPv6 before IPv4",
+			ifName: "eth-v6",
+			iface:  gceNetworkInterface{IPAliases: []string{"10.24.3.0/24"}},
 			want: [][2]string{
-				{"2001:db8:1234:5678:c0de::1", "2001:db8:1234:5678:c0de:ffff:ffff:fffe"},
+				{"fd36:0:4:2047:cc0:de00:0:1", "fd36:0:4:2047:cc0:deff:ffff:fffe"},
 				{"10.24.3.1", "10.24.3.254"},
 			},
 		},
 		{
-			name:  "no IPv6 or aliases yields no ranges",
-			iface: gceNetworkInterface{Mac: "00:11:22:33:44:55"},
-			want:  nil,
+			name:   "no IPv6 or aliases yields no ranges",
+			ifName: "eth-v4",
+			iface:  gceNetworkInterface{Mac: "00:11:22:33:44:55"},
+			want:   nil,
 		},
 		{
-			name:    "invalid IPv6 base returns error",
-			iface:   gceNetworkInterface{IPv6: []string{"not-an-ip"}},
+			name:    "non-existent interface returns error",
+			ifName:  "missing-nic",
+			iface:   gceNetworkInterface{},
 			wantErr: true,
 		},
 		{
 			name:    "invalid IPv4 alias returns error",
+			ifName:  "eth-v4",
 			iface:   gceNetworkInterface{IPAliases: []string{"bad-cidr"}},
 			wantErr: true,
 		},
@@ -417,7 +515,7 @@ func TestSubinterfaceRanges(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := &GCEInstance{}
-			got, err := g.subinterfaceRanges(tt.iface)
+			got, err := g.subinterfaceRanges(tt.ifName, tt.iface)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("subinterfaceRanges() error = %v, wantErr %v", err, tt.wantErr)
 			}
