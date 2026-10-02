@@ -981,3 +981,106 @@ func TestAddRDMAAttributesStandalone(t *testing.T) {
 		}
 	})
 }
+
+func TestIsIBOnlyDevice(t *testing.T) {
+	// A synthetic sysfs holding one RoCE VF (network class, Ethernet link
+	// layer), one IB HCA (network class, InfiniBand link layer), one VPI
+	// adapter (network class, InfiniBand on port 1 and Ethernet on port 2) and
+	// one eRDMA device (not a network class).
+	root := t.TempDir()
+	ibRoot := filepath.Join(root, "class/infiniband")
+	pciRoot := filepath.Join(root, "bus/pci/devices")
+	writeTestSysfsFile(t, root, "class/infiniband/rocep231s0/ports/1/link_layer", "Ethernet\n")
+	writeTestSysfsFile(t, root, "bus/pci/devices/0000:e7:00.0/class", "0x020000\n")
+	writeTestSysfsFile(t, root, "class/infiniband/mlx5_0/ports/1/link_layer", "InfiniBand\n")
+	writeTestSysfsFile(t, root, "bus/pci/devices/0000:1a:00.0/class", "0x020700\n")
+	writeTestSysfsFile(t, root, "class/infiniband/mlx4_0/ports/1/link_layer", "InfiniBand\n")
+	writeTestSysfsFile(t, root, "class/infiniband/mlx4_0/ports/2/link_layer", "Ethernet\n")
+	writeTestSysfsFile(t, root, "bus/pci/devices/0000:1c:00.0/class", "0x028000\n")
+	writeTestSysfsFile(t, root, "class/infiniband/erdma_0/ports/1/link_layer", "Ethernet\n")
+	writeTestSysfsFile(t, root, "bus/pci/devices/0000:1b:00.0/class", "0x00ff00\n")
+
+	device := func(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute) *DB {
+		return &DB{
+			deviceStore:    map[string]resourceapi.Device{"dev": {Name: "dev", Attributes: attrs}},
+			infinibandPath: ibRoot,
+			pciDevicePath:  pciRoot,
+		}
+	}
+
+	testCases := []struct {
+		name  string
+		attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
+		want  bool
+	}{
+		{
+			name: "RoCE VF whose netdev is in a pod namespace is not IB-only",
+			attrs: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrRDMADevice: {StringValue: ptr.To("rocep231s0")},
+				apis.AttrPCIAddress: {StringValue: ptr.To("0000:e7:00.0")},
+			},
+			want: false,
+		},
+		{
+			name: "RoCE VF with its netdev on the host is not IB-only",
+			attrs: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrRDMADevice:    {StringValue: ptr.To("rocep231s0")},
+				apis.AttrPCIAddress:    {StringValue: ptr.To("0000:e7:00.0")},
+				apis.AttrInterfaceName: {StringValue: ptr.To("enp231s0")},
+			},
+			want: false,
+		},
+		{
+			name: "IB HCA with no netdev is IB-only",
+			attrs: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrRDMADevice: {StringValue: ptr.To("mlx5_0")},
+				apis.AttrPCIAddress: {StringValue: ptr.To("0000:1a:00.0")},
+			},
+			want: true,
+		},
+		{
+			name: "VPI adapter with an Ethernet second port in a pod namespace is not IB-only",
+			attrs: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrRDMADevice: {StringValue: ptr.To("mlx4_0")},
+				apis.AttrPCIAddress: {StringValue: ptr.To("0000:1c:00.0")},
+			},
+			want: false,
+		},
+		{
+			name: "eRDMA device is IB-only although its link layer is Ethernet",
+			attrs: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrRDMADevice: {StringValue: ptr.To("erdma_0")},
+				apis.AttrPCIAddress: {StringValue: ptr.To("0000:1b:00.0")},
+			},
+			want: true,
+		},
+		{
+			name: "RDMA device with no PCI address is IB-only",
+			attrs: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrRDMADevice: {StringValue: ptr.To("erdma_0")},
+			},
+			want: true,
+		},
+		{
+			name: "device without RDMA capability is not IB-only",
+			attrs: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrPCIAddress: {StringValue: ptr.To("0000:e7:00.0")},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := device(tc.attrs).IsIBOnlyDevice("dev"); got != tc.want {
+				t.Errorf("IsIBOnlyDevice() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("unknown device is not IB-only", func(t *testing.T) {
+		if (&DB{}).IsIBOnlyDevice("absent") {
+			t.Error("IsIBOnlyDevice() = true for a device that is not in the store")
+		}
+	})
+}

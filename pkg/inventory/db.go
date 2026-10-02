@@ -105,6 +105,11 @@ type DB struct {
 	// deviceAttributeMachineModifiers is used to redirect the upstream
 	// topology helpers to a synthetic sysfs in unit tests.
 	deviceAttributeMachineModifiers []deviceattribute.MachineModifier
+
+	// infinibandPath and pciDevicePath, when set, redirect the sysfs lookups
+	// IsIBOnlyDevice makes to a synthetic sysfs in unit tests.
+	infinibandPath string
+	pciDevicePath  string
 }
 
 type Option func(*DB)
@@ -696,18 +701,54 @@ func (db *DB) getNetInterfaceNameWithoutRescan(deviceName string) (string, error
 	return *device.Attributes[apis.AttrInterfaceName].StringValue, nil
 }
 
-// IsIBOnlyDevice returns true if the device has RDMA capability but no netdev
-// interface (i.e. an InfiniBand-only device). Derived from existing attributes:
-// a device with a non-empty rdmaDevice and no ifName is IB-only.
+// IsIBOnlyDevice returns true if the device has RDMA capability and no netdev
+// of its own (i.e. an InfiniBand-only device).
+//
+// An absent ifName is not that evidence on its own: a RoCE VF loses its
+// ifName for as long as its netdev sits in a pod's namespace, because
+// /sys/class/net is netns-tagged (same trap as isAllocatableNetworkDevice).
+// Two sysfs reads that still answer from the host settle it: the PCI class,
+// which is not netns-tagged, and the RDMA ports' link layers, which the
+// default shared RDMA netns mode shows in every namespace. A network-class
+// PCI device with an RDMA port that reports an Ethernet link layer has a
+// netdev somewhere, wherever it currently is.
 func (db *DB) IsIBOnlyDevice(deviceName string) bool {
 	device, exists := db.GetDevice(deviceName)
 	if !exists {
 		return false
 	}
 	rdmaAttr := device.Attributes[apis.AttrRDMADevice]
-	ifAttr := device.Attributes[apis.AttrInterfaceName]
-	return rdmaAttr.StringValue != nil && *rdmaAttr.StringValue != "" &&
-		(ifAttr.StringValue == nil || *ifAttr.StringValue == "")
+	if rdmaAttr.StringValue == nil || *rdmaAttr.StringValue == "" {
+		return false
+	}
+	if ifAttr := device.Attributes[apis.AttrInterfaceName]; ifAttr.StringValue != nil && *ifAttr.StringValue != "" {
+		return false
+	}
+	pciAttr := device.Attributes[apis.AttrPCIAddress]
+	if pciAttr.StringValue == nil {
+		return true
+	}
+	if pciBaseClass(db.pciDeviceRoot(), *pciAttr.StringValue) != pciBaseClassNetwork {
+		// eRDMA and friends: not a network controller, so no netdev exists.
+		return true
+	}
+	return !rdmaHasEthernetPort(db.infinibandRoot(), *rdmaAttr.StringValue)
+}
+
+// infinibandRoot and pciDeviceRoot return the sysfs trees IsIBOnlyDevice
+// reads, which unit tests redirect to a synthetic sysfs.
+func (db *DB) infinibandRoot() string {
+	if db.infinibandPath != "" {
+		return db.infinibandPath
+	}
+	return sysInfinibandPath
+}
+
+func (db *DB) pciDeviceRoot() string {
+	if db.pciDevicePath != "" {
+		return db.pciDevicePath
+	}
+	return sysBusPCIDevicesPath
 }
 
 // GetRDMADeviceName returns the RDMA link name (e.g. "mlx5_0") for an IB-only
@@ -769,9 +810,9 @@ func isAllocatableNetworkDevice(dev *ghw.PCIDevice) bool {
 // attributes like NUMA node, vendor, and product are populated uniformly by
 // enrichPCIDeviceAttributes in the enrichment phase.
 //
-// Unlike /sys/class/net, /sys/class/infiniband entries are not netns-tagged:
-// they remain visible from the host even after the device is allocated to a pod,
-// so this scan is stable across the full device lifecycle.
+// Like /sys/class/net, /sys/class/infiniband is netns-tagged, but in the
+// default shared RDMA netns mode an RDMA device stays bound to the host
+// namespace, so this scan is stable across the full device lifecycle.
 func (db *DB) discoverStandaloneRDMADevices(devices []resourceapi.Device) []resourceapi.Device {
 	knownPCIAddresses := sets.New[string]()
 	for _, device := range devices {

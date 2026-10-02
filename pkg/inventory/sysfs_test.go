@@ -462,3 +462,71 @@ func TestPCIAddressForRDMADevice(t *testing.T) {
 		}
 	})
 }
+
+func TestRDMAHasEthernetPort(t *testing.T) {
+	dir := t.TempDir()
+	for port, layer := range map[string]string{
+		"rocep231s0/ports/1": "Ethernet\n",
+		"mlx5_0/ports/1":     "InfiniBand\n",
+		// A VPI adapter whose first port is InfiniBand and second Ethernet.
+		"mlx4_0/ports/1": "InfiniBand\n",
+		"mlx4_0/ports/2": "Ethernet\n",
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, port), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, port, "link_layer"), []byte(layer), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "noports"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		device string
+		want   bool
+	}{
+		{device: "rocep231s0", want: true},
+		{device: "mlx5_0", want: false},
+		{device: "mlx4_0", want: true},
+		{device: "noports", want: false},
+		{device: "absent", want: false},
+	}
+	for _, tc := range testCases {
+		if got := rdmaHasEthernetPort(dir, tc.device); got != tc.want {
+			t.Errorf("rdmaHasEthernetPort(%q) = %v, want %v", tc.device, got, tc.want)
+		}
+	}
+}
+
+func TestPCIBaseClass(t *testing.T) {
+	dir := t.TempDir()
+	for addr, class := range map[string]string{
+		"0000:e7:00.0": "0x020000\n",
+		"0000:1b:00.0": "0x00ff00\n",
+		"0000:1c:00.0": "0\n",
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, addr), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, addr, "class"), []byte(class), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	testCases := []struct {
+		addr string
+		want string
+	}{
+		{addr: "0000:e7:00.0", want: "02"},
+		{addr: "0000:1b:00.0", want: "00"},
+		{addr: "0000:1c:00.0", want: ""},
+		{addr: "0000:ff:00.0", want: ""},
+	}
+	for _, tc := range testCases {
+		if got := pciBaseClass(dir, tc.addr); got != tc.want {
+			t.Errorf("pciBaseClass(%q) = %q, want %q", tc.addr, got, tc.want)
+		}
+	}
+}
