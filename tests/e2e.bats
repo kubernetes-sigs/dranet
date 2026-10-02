@@ -74,6 +74,8 @@ cleanup_veth_interfaces() {
       ip link delete pbr-test-pod-1 || true
       ip link delete pbr-test-pod-2 || true
       ip link delete ipvlan-pbr-a || true
+      ip link delete dhcp-cli || true
+      iptables -w -D INPUT -i dhcp-srv -p udp --dport 67 -m statistic --mode nth --every 100 --packet 0 -j DROP 2>/dev/null || true
     '
   done
 }
@@ -855,4 +857,35 @@ EOF
 
   kubectl patch daemonset dranet -n kube-system --type='json' -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/args\", \"value\": $ORIGINAL_ARGS}]"
   kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
+}
+
+@test "DHCP ResourceClaim obtains a lease when the server drops the first DISCOVER" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  # dhcp-cli goes to the Pod, dhcp-srv stays on the node with the DHCP server.
+  docker exec "$NODE_NAME" bash -c "ip link add dhcp-cli type veth peer name dhcp-srv"
+  docker exec "$NODE_NAME" bash -c "ip addr add 192.0.2.1/24 dev dhcp-srv"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev dhcp-srv"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev dhcp-cli"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/dhcp_server.yaml
+  wait_for_ready_pods app=dhcp-server 60s
+
+  # Drop the first DHCP packet the server receives, so only a retransmitted
+  # DISCOVER gets an OFFER.
+  docker exec "$NODE_NAME" bash -c "iptables -w -A INPUT -i dhcp-srv -p udp --dport 67 -m statistic --mode nth --every 100 --packet 0 -j DROP"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_dhcp.yaml
+  wait_for_ready_pods app=pod-dhcp 60s
+
+  run kubectl exec pod-dhcp -- ip -4 addr show eth99
+  assert_success
+  assert_output --partial "192.0.2.1"
+
+  # The first DISCOVER was dropped, so the lease came from a retransmit.
+  run docker exec "$NODE_NAME" bash -c "iptables -w -L INPUT -v -n -x | awk '/dhcp-srv/ && /statistic/ {print \$1}'"
+  assert_output "1"
+  run kubectl logs dhcp-server
+  assert_success
+  assert_output --partial "sending ACK"
 }

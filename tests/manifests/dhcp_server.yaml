@@ -1,0 +1,38 @@
+# Copyright The Kubernetes Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# DHCP server on the node side of the dhcp-cli/dhcp-srv veth pair.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dhcp-server
+  labels:
+    app: dhcp-server
+spec:
+  hostNetwork: true
+  nodeSelector:
+    kubernetes.io/hostname: dranet-test-cluster-worker
+  containers:
+  - name: udhcpd
+    image: docker.io/library/busybox:1.37
+    command:
+    - sh
+    - -c
+    - |
+      printf 'start 192.0.2.10\nend 192.0.2.20\ninterface dhcp-srv\nlease_file /tmp/udhcpd.leases\noption subnet 255.255.255.0\noption router 192.0.2.1\n' > /tmp/udhcpd.conf
+      touch /tmp/udhcpd.leases
+      exec udhcpd -f -v /tmp/udhcpd.conf
+    securityContext:
+      capabilities:
+        add: ["NET_ADMIN", "NET_RAW"]

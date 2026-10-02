@@ -46,7 +46,7 @@ func getDHCP(ctx context.Context, ifName string) (ip string, routes []apis.Route
 			return "", nil, nil, fmt.Errorf("failed to set interface %s up: %w", ifName, err)
 		}
 	}
-	dhclient, err := nclient4.New(ifName)
+	dhclient, err := nclient4.New(ifName, nclient4.WithTimeout(dhcpReadTimeout))
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("failed to create DHCP client on interface %s: %w", ifName, err)
 	}
@@ -91,6 +91,12 @@ func newDHCPLeaseRecord(ack *dhcpv4.DHCPv4) *DHCPLeaseRecord {
 		ServerID:  serverID.String(),
 	}
 }
+
+// dhcpReadTimeout is how long the client waits for a reply before it
+// retransmits. The nclient4 default of 5s equals the prepare timeout, so the
+// first retransmit never happened. With 1s and the doubling the client
+// applies between tries, DISCOVER goes out at 0s, 1s and 3s.
+const dhcpReadTimeout = 1 * time.Second
 
 // dhcpReleaseTimeout bounds the release attempt. RELEASE is not answered, so
 // this is how long the send is allowed to take, not a wait for a reply.
