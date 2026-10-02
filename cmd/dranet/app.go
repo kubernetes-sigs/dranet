@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -70,7 +71,8 @@ var (
 	featureGates         string
 	cloudProviderOptions stringList
 
-	kubeletRootDir string
+	kubeletRootDir   string
+	uplinkInterfaces string
 
 	ready atomic.Bool
 )
@@ -89,6 +91,7 @@ func init() {
 	flag.StringVar(&profileProvider, "profile-provider", "cloud", "Provides user intent (cloud, webhook, none). 'cloud' falls back to the cloud-provider's native implementation.")
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
+	flag.StringVar(&uplinkInterfaces, "uplink-interfaces", "", "Comma-separated names of the host's uplink interfaces, which are kept out of the inventory along with their children. Replaces the automatic detection from the default routes. Set this on fabrics where the RDMA NICs receive a default route of their own, for example from IPv6 Router Advertisements: detection cannot tell those apart from a management uplink and excludes the whole fabric. Names that do not exist on a node are ignored, so one list can name the uplink of every node shape in the cluster; if none of them exist on a node, detection runs there instead.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 	flag.Var(&cloudProviderOptions, "cloud-provider-options", "A <provider>.<option>=<value> pair for a cloud provider. Repeat the flag for each option. Values can contain commas. The options of a provider apply only when that provider runs. Values must not contain secrets; flags are logged.")
 
@@ -231,6 +234,15 @@ func main() {
 		inventory.WithRateLimiter(rate.NewLimiter(rate.Every(minPollInterval), pollBurst)),
 		inventory.WithMaxPollInterval(maxPollInterval),
 		inventory.WithMoveIBInterfaces(moveIBInterfaces),
+	}
+	if uplinkInterfaces != "" {
+		names := []string{}
+		for _, name := range strings.Split(uplinkInterfaces, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				names = append(names, name)
+			}
+		}
+		optsDb = append(optsDb, inventory.WithUplinkInterfaces(names))
 	}
 	if features.DefaultFeatureGate.Enabled(features.DRAListTypeAttributes) {
 		optsDb = append(optsDb, inventory.WithListNUMAAttributes())

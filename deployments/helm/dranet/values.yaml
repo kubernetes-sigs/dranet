@@ -33,6 +33,7 @@ args: {}
 #      rdma-child-ipv4-cidr: "10.192.0.0/14"
 #  profileProvider: "cloud"
 #  webhookURL: ""
+#  uplinkInterfaces: ""
 #  featureGates: ""
 
 # kubeletRootDir is the kubelet data directory (its --root-dir). The driver's

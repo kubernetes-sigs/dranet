@@ -87,6 +87,9 @@ spec:
             {{- if (hasKey .Values.args "webhookURL") }}
             - {{ printf "--webhook-url=%s" .Values.args.webhookURL | quote }}
             {{- end }}
+            {{- if .Values.args.uplinkInterfaces }}
+            - {{ printf "--uplink-interfaces=%s" .Values.args.uplinkInterfaces | quote }}
+            {{- end }}
             {{- if (hasKey .Values.args "featureGates") }}
             - {{ printf "--feature-gates=%s" .Values.args.featureGates | quote }}
             {{- end }}
