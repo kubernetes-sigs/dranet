@@ -238,6 +238,11 @@ func main() {
 
 	if cloudInst != nil {
 		optsDb = append(optsDb, inventory.WithCloudInstance(cloudInst))
+		// Opt-in: providers that implement HostNetworkConfigValidator are wired
+		// automatically; others keep current prepare behavior (no-op).
+		if v, ok := cloudInst.(cloudprovider.HostNetworkConfigValidator); ok {
+			optsDb = append(optsDb, inventory.WithHostNetworkConfigValidator(v))
+		}
 	}
 	if profProv != nil {
 		optsDb = append(optsDb, inventory.WithProfileProvider(profProv))
