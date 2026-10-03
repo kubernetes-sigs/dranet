@@ -24,12 +24,7 @@ import (
 
 // DeviceIdentifiers contains locally discovered hardware identifiers
 // that a cloud provider can use to match against its metadata.
-type DeviceIdentifiers struct {
-	MAC        string `json:"mac_address,omitempty"`
-	PCIAddress string `json:"pci_address,omitempty"`
-	// Name is the local network interface name, or empty if unavailable.
-	Name string `json:"name"`
-}
+type DeviceIdentifiers = apis.DeviceIdentifiers
 
 // CloudInstance defines the generic interface for all cloud providers.
 type CloudInstance interface {

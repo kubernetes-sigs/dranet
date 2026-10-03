@@ -538,20 +538,7 @@ func (db *DB) addCloudAttributes(devices []resourceapi.Device) []resourceapi.Dev
 
 // getDeviceIdentifiers extracts provider identifiers from device attributes.
 func getDeviceIdentifiers(device *resourceapi.Device) cloudprovider.DeviceIdentifiers {
-	id := cloudprovider.DeviceIdentifiers{}
-	if device == nil {
-		return id
-	}
-	if ifaceNameAttr, ok := device.Attributes[apis.AttrInterfaceName]; ok && ifaceNameAttr.StringValue != nil {
-		id.Name = *ifaceNameAttr.StringValue
-	}
-	if macAttr, ok := device.Attributes[apis.AttrMac]; ok && macAttr.StringValue != nil {
-		id.MAC = *macAttr.StringValue
-	}
-	if pciAttr, ok := device.Attributes[apis.AttrPCIAddress]; ok && pciAttr.StringValue != nil {
-		id.PCIAddress = *pciAttr.StringValue
-	}
-	return id
+	return apis.DeviceIdentifiersFromDevice(device)
 }
 
 func (db *DB) getProviderAttributes(device *resourceapi.Device, instance cloudprovider.CloudInstance) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
