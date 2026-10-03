@@ -33,6 +33,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// attachNetdev is nsAttachNetdev behind a variable, so tests and the
+// end-to-end build can wrap it.
+var attachNetdev = nsAttachNetdev
+
 func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
 	hostDev, err := nlwrap.LinkByName(hostIfName)
 	if err != nil {

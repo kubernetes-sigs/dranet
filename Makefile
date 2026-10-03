@@ -32,6 +32,8 @@ clean:
 
 test:
 	CGO_ENABLED=1 go test -v -race -count 1 ./...
+	# The end-to-end image compiles test hooks the release does not have.
+	go vet -tags e2e ./pkg/driver/
 
 e2e-test:
 	bats --verbose-run tests/

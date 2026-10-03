@@ -18,7 +18,8 @@ ARG BASE_IMAGE=gcr.io/distroless/base-debian12
 
 FROM --platform=$BUILDPLATFORM $GOLANG_IMAGE AS builder
 ARG TARGETARCH
-ARG GOARCH=${TARGETARCH} CGO_ENABLED=0
+# GOFLAGS=-tags=e2e builds the image the end-to-end tests run.
+ARG GOARCH=${TARGETARCH} CGO_ENABLED=0 GOFLAGS=""
 
 # cache go modules
 WORKDIR /go/src/app
@@ -27,9 +28,11 @@ RUN go mod download
 
 # build
 COPY . .
-RUN go build -o /go/bin/dranet ./cmd/dranet
+RUN go build -o /go/bin/dranet ./cmd/dranet && \
+    go build -o /go/bin/dranet-hook ./cmd/dranet-hook
 
 # copy binary onto base image
 FROM $BASE_IMAGE
 COPY --from=builder --chown=root:root /go/bin/dranet /dranet
+COPY --from=builder --chown=root:root /go/bin/dranet-hook /dranet-hook
 CMD ["/dranet"]

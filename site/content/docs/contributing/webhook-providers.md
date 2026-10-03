@@ -19,6 +19,18 @@ To enable the webhook provider, update the `dranet` daemonset arguments:
 
 You can mix and match providers. For example, you can use the native GCP cloud provider for hardware discovery, but use a webhook for custom IPAM.
 
+### Extension phases
+
+DRANET makes a decision in three phases of a Pod's life, and each phase has one extension point that receives the complete decision in DRANET's models:
+
+| Phase | When | Extension point | Receives | Returns |
+|---|---|---|---|---|
+| Discovery | inventory scan, `ResourceSlice` publication | Cloud provider: `GetDeviceAttributes`, `GetDeviceConfig` | `DeviceIdentifiers` | attributes; baseline `NetworkConfig` |
+| Configuration | `NodePrepareResources`, `NodeUnprepareResources` | Profile provider: `GetProfileConfig`, `ReleaseProfileConfig`, `GetRuntimeHook` | `DeviceIdentifiers`, the `ResourceClaim`, the merged `NetworkConfig` | resolved `NetworkConfig`, or a denial; optionally a runtime hook |
+| Runtime | container start, with the devices attached and configured | the profile provider's runtime hook, a binary on the node | the Pod, its network namespace, every device with its final `NetworkConfig` and the provider's data, in the environment | exit `0`, or non-zero to fail the container start |
+
+The runtime phase cannot change what DRANET did; it applies post-configuration with the result in hand, or refuses the container. The provider decides at configuration time whether a Pod gets a runtime hook, and DRANET records that decision with the device, so nothing is looked up while the containers are created and started. See [Device Attach Timing](../concepts/device-attach-timing.md) for how the hook runs.
+
 ### Architecture Pipeline
 
 The following diagram illustrates how DRANET communicates with the webhook providers during device discovery and profile resolution:
@@ -71,11 +83,12 @@ When DRANET connects to the webhook, it performs an HTTP `GET /health` and expec
 ```json
 {
   "cloudProvider": false,
-  "profileProvider": true
+  "profileProvider": true,
+  "runtimeHook": true
 }
 ```
 
-If you start DRANET with `--cloud-provider-hint=webhook` but the webhook returns `"cloudProvider": false`, DRANET will log a fatal error during initialization to prevent misconfiguration.
+If you start DRANET with `--cloud-provider-hint=webhook` but the webhook returns `"cloudProvider": false`, DRANET will log a fatal error during initialization to prevent misconfiguration. `runtimeHook` is optional and requires `profileProvider`.
 
 ### API Contracts
 
@@ -110,6 +123,27 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
 
 * `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). It receives the ResourceClaim UID and the full `NetworkConfig`. `NodeUnprepareResources` does not provide the complete ResourceClaim. The endpoint should return `200 OK` on success or if the resource was already released (idempotency).
   * **Best-effort teardown**: A failed `ReleaseProfileConfig` is logged but not retried by DRANET (teardown must not block pod deletion). The provider therefore owns leak reclamation and must be able to garbage-collect orphaned allocations on its own, otherwise resources leak permanently.
+
+#### Runtime Hook API (`runtimeHook: true`)
+
+* `POST /GetRuntimeHook`: Called after `GetProfileConfig`, with the same request (`device`, `claim`, and the resolved `config`). Returns the binary DRANET runs on the node once per Pod, when the Pod's first container starts, after the Pod's devices are attached and configured and before the container's process runs, or `null` when the profile needs none:
+
+  ```json
+  {
+    "path": "/opt/acme/bin/acme-hook",
+    "args": ["--post"],
+    "timeoutSeconds": 10,
+    "data": {"fabric": "a", "rail": 1}
+  }
+  ```
+
+  * `path` must be absolute and resolve on the node: the container runtime executes it, not DRANET. The provider's DaemonSet installs it, for example in the directory DRANET uses for its own hook (`hookBinDir` in the Helm chart).
+  * `timeoutSeconds` defaults to 10 and may not exceed 30; the sum of the timeouts of a container's hooks, DRANET's own included, may not exceed 90, so one provider hook always fits next to DRANET's. The runtime kills a hook at its timeout and the container start fails.
+  * `data` is passed to the hook as is, in the device's entry of `DRANET_DEVICES`. DRANET does not interpret it; it is the provider's channel for data that has no place in `NetworkConfig`.
+
+  The hook runs with the environment described in [Device Attach Timing](../concepts/device-attach-timing.md#hook-contract). It is scoped to the Pod's network namespace, like DRANET: it may change network state in the namespace at `DRANET_NETNS` and nothing else, it receives the Pod and its devices but no container, and it must not use the OCI container state the runtime writes on its stdin. It must be idempotent: it runs again when the kubelet replaces a container that failed to start. It must not move, rename or re-address the interfaces DRANET attached. A non-zero exit fails the container start with the hook's stderr in the Pod's events.
+
+  DRANET validates the hook at `NodePrepareResources`; an invalid one fails the preparation like a denied profile. The decision is recorded with the device and survives a DRANET restart.
 
 ### Reference Implementation
 

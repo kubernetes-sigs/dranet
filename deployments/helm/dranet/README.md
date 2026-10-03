@@ -27,6 +27,7 @@ The following table lists the configurable parameters and their default values:
 | `metricsPort` | Port for the metrics/healthz server and readiness probe | binary default: `9177` |
 | `metricsPath` | HTTP path for the startup and readiness probes | `/healthz` |
 | `kubeletRootDir` | Kubelet data directory (its `--root-dir`), used for both the hostPath and mountPath of the plugin/registration sockets | `/var/lib/kubelet` |
+| `hookBinDir` | Host directory where the `dranet-hook` OCI hook binary is installed by an init container; must be writable and on a filesystem that allows executables (not mounted `noexec`) | `/opt/dranet/bin` |
 | `nodeSelector` | Node selector for the DaemonSet pods | `{}` |
 | `affinity` | Affinity rules for the DaemonSet pods | `{}` |
 | `tolerations` | Pod tolerations | `[{operator: Exists, effect: NoSchedule}]` |
@@ -43,6 +44,7 @@ The following table lists the configurable parameters and their default values:
 | `args.inventoryMaxPollInterval` | Maximum interval between two consecutive inventory polls | binary default: `1m` |
 | `args.inventoryPollBurst` | Number of inventory polls that can be run in a burst | binary default: `5` |
 | `args.moveIBInterfaces` | If true, InfiniBand (IPoIB) interfaces are moved into the pod network namespace | binary default: `true` |
+| `args.deviceAttachTimeout` | Time allowed to attach a Pod's devices when they do not fit in the container runtime NRI request timeout (`plugin_request_timeout`); the attach continues in the background and the Pod's containers wait for it through an OCI hook. `0s` fails the sandbox instead | binary default: `30s` |
 | `args.cloudProviderHint` | Hint for the cloud provider plugin (`GCE`, `AZURE`, `OKE`, `AWS`, `ALIBABA`, `CKS`, `webhook`, `NONE`); auto-detected if unset | binary default: `""` |
 | `args.cloudProviderOptions` | Options per provider, as a map of maps; see [Cloud provider options](#cloud-provider-options) | binary default: no options |
 | `args.profileProvider` | Provider for user profile configuration (`cloud`, `webhook`, `none`) | binary default: `cloud` |

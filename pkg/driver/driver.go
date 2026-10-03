@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/cel-go/cel"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/dranet/pkg/apis"
+	hookapi "sigs.k8s.io/dranet/pkg/apis/hook"
 	"sigs.k8s.io/dranet/pkg/inventory"
 
 	"github.com/containerd/nri/pkg/stub"
@@ -69,6 +71,7 @@ type inventoryDB interface {
 	RequestRescan()
 	GetProfileConfig(deviceName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
 	ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
+	GetRuntimeHook(deviceName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error)
 }
 
 // WithFilter
@@ -95,6 +98,27 @@ func WithKubeletRootDir(dir string) Option {
 	}
 }
 
+// WithDeviceAttachTimeout bounds how long attaching a Pod's devices may take
+// once RunPodSandbox runs out of NRI request time: the attach continues in the
+// background and the Pod's containers wait for it, up to d after the sandbox
+// was created. 0 makes RunPodSandbox fail the sandbox instead of deferring.
+func WithDeviceAttachTimeout(d time.Duration) Option {
+	return func(o *NetworkDriver) {
+		o.deviceAttachTimeout = d
+	}
+}
+
+// WithHook sets the host path of the binary the driver adds as an OCI
+// createRuntime hook to containers whose Pod still has devices being
+// attached; see apis.HookEnv* for what the hook receives. An empty path
+// disables the hook: such containers fail to create until the attach is done
+// and the kubelet retries them.
+func WithHook(path string) Option {
+	return func(o *NetworkDriver) {
+		o.hookPath = path
+	}
+}
+
 type NetworkDriver struct {
 	draPlugin     pluginHelper
 	driverName    string
@@ -110,6 +134,15 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+
+	// deviceAttachTimeout bounds a Pod's device attach; see WithDeviceAttachTimeout.
+	deviceAttachTimeout time.Duration
+	// hookPath configures the OCI hook barrier; see WithHook.
+	hookPath string
+	// attachJobs holds the running or last finished attach job per Pod UID;
+	// attachJobsMu guards it and is never held while waiting on a job.
+	attachJobs   map[types.UID]*attachJob
+	attachJobsMu sync.Mutex
 
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.
@@ -148,6 +181,12 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 
 	for _, o := range opts {
 		o(plugin)
+	}
+
+	if plugin.hookPath != "" {
+		if err := plugin.serveHookSocket(ctx, hookapi.SocketPath); err != nil {
+			return nil, fmt.Errorf("serve hook socket %s: %w", hookapi.SocketPath, err)
+		}
 	}
 
 	driverPluginPath := filepath.Join(plugin.kubeletRootDir, "plugins", driverName)

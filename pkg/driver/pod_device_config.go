@@ -72,6 +72,22 @@ type DeviceConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+
+	// Attached records that the device (netdev and RDMA link) was moved into
+	// the Pod's network namespace and its configuration applied. Cleared by
+	// RunPodSandbox, since a new sandbox has a new network namespace.
+	// Checkpointed so a daemon restart mid-attach resumes from the right device.
+	Attached bool `json:"attached,omitempty"`
+
+	// RuntimeHook is the profile provider's hook for this device, decided at
+	// prepare time and run once per Pod before its first container.
+	RuntimeHook *apis.RuntimeHook `json:"runtimeHook,omitempty"`
+
+	// RuntimeHookDone records that the Pod's runtime hooks ran: a container
+	// carrying them reached its start. Set on every device of the Pod; cleared
+	// by RunPodSandbox with Attached. Checkpointed so a daemon restart does not
+	// run the hooks again for a later container of the Pod.
+	RuntimeHookDone bool `json:"runtimeHookDone,omitempty"`
 }
 
 // NetworkInterfaceState is the driver-recorded runtime counterpart of an
@@ -273,6 +289,97 @@ func (s *PodConfigStore) GetDeviceConfig(podUID types.UID, deviceName string) (D
 		return config, found
 	}
 	return DeviceConfig{}, false
+}
+
+// SetDeviceAttached records whether the device is attached to the Pod's network
+// namespace. Like SetDeviceConfig, the checkpoint is written before memory.
+func (s *PodConfigStore) SetDeviceAttached(podUID types.UID, deviceName string, attached bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setDeviceAttachedLocked(podUID, deviceName, attached)
+}
+
+func (s *PodConfigStore) setDeviceAttachedLocked(podUID types.UID, deviceName string, attached bool) error {
+	podConfig, ok := s.configs[podUID]
+	if !ok {
+		return fmt.Errorf("pod %s not found", podUID)
+	}
+	config, ok := podConfig.DeviceConfigs[deviceName]
+	if !ok {
+		return fmt.Errorf("device %s not found for pod %s", deviceName, podUID)
+	}
+	if config.Attached == attached {
+		return nil
+	}
+	config.Attached = attached
+	if s.checkpointer != nil {
+		if err := s.checkpointer.Store(podUID, deviceName, config); err != nil {
+			return fmt.Errorf("checkpoint attached state for pod %s device %s: %w", podUID, deviceName, err)
+		}
+	}
+	podConfig.DeviceConfigs[deviceName] = config
+	return nil
+}
+
+// ResetAttachProgress marks every device of the Pod as not attached and the
+// runtime hooks as not run, and returns the Pod's configuration.
+// RunPodSandbox calls it because a new sandbox starts with an empty network
+// namespace.
+func (s *PodConfigStore) ResetAttachProgress(podUID types.UID) (PodConfig, error) {
+	s.mu.Lock()
+	podConfig, ok := s.configs[podUID]
+	if !ok {
+		s.mu.Unlock()
+		return PodConfig{}, fmt.Errorf("pod %s not found", podUID)
+	}
+	for deviceName := range podConfig.DeviceConfigs {
+		if err := s.setDeviceAttachedLocked(podUID, deviceName, false); err != nil {
+			s.mu.Unlock()
+			return PodConfig{}, err
+		}
+		if err := s.setRuntimeHookDoneLocked(podUID, deviceName, false); err != nil {
+			s.mu.Unlock()
+			return PodConfig{}, err
+		}
+	}
+	s.mu.Unlock()
+	podConfig, _ = s.GetPodConfig(podUID)
+	return podConfig, nil
+}
+
+// SetRuntimeHooksDone records that the Pod's runtime hooks ran.
+func (s *PodConfigStore) SetRuntimeHooksDone(podUID types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	podConfig, ok := s.configs[podUID]
+	if !ok {
+		return fmt.Errorf("pod %s not found", podUID)
+	}
+	for deviceName := range podConfig.DeviceConfigs {
+		if err := s.setRuntimeHookDoneLocked(podUID, deviceName, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *PodConfigStore) setRuntimeHookDoneLocked(podUID types.UID, deviceName string, done bool) error {
+	podConfig := s.configs[podUID]
+	config, ok := podConfig.DeviceConfigs[deviceName]
+	if !ok {
+		return fmt.Errorf("device %s not found for pod %s", deviceName, podUID)
+	}
+	if config.RuntimeHookDone == done {
+		return nil
+	}
+	config.RuntimeHookDone = done
+	if s.checkpointer != nil {
+		if err := s.checkpointer.Store(podUID, deviceName, config); err != nil {
+			return fmt.Errorf("checkpoint runtime hook state for pod %s device %s: %w", podUID, deviceName, err)
+		}
+	}
+	podConfig.DeviceConfigs[deviceName] = config
+	return nil
 }
 
 // DeletePod removes all configurations associated with a given Pod UID.

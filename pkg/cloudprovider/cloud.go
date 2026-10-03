@@ -24,12 +24,7 @@ import (
 
 // DeviceIdentifiers contains locally discovered hardware identifiers
 // that a cloud provider can use to match against its metadata.
-type DeviceIdentifiers struct {
-	MAC        string `json:"mac_address,omitempty"`
-	PCIAddress string `json:"pci_address,omitempty"`
-	// Name is the local network interface name, or empty if unavailable.
-	Name string `json:"name"`
-}
+type DeviceIdentifiers = apis.DeviceIdentifiers
 
 // CloudInstance defines the generic interface for all cloud providers.
 type CloudInstance interface {
@@ -53,4 +48,14 @@ type ProfileProvider interface {
 	// ReleaseProfileConfig frees any stateful resources (like IP leases) that were
 	// previously allocated for the given claim and profile.
 	ReleaseProfileConfig(id DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error
+}
+
+// RuntimeHookProvider is an optional interface implemented by profile providers
+// that need to run a binary on the node when the Pod's containers are created,
+// after DRANET attached and configured the devices. It is called at prepare
+// time, after GetProfileConfig, with the resolved configuration.
+type RuntimeHookProvider interface {
+	// GetRuntimeHook returns the hook for the device, or nil when the profile
+	// needs none.
+	GetRuntimeHook(id DeviceIdentifiers, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error)
 }

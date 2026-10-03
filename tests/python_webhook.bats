@@ -8,6 +8,11 @@ setup_file() {
 
   # Create ConfigMap with the python webhook script
   kubectl --context kind-dranet-test-cluster create configmap python-webhook-script -n kube-system --from-file=webhook.py="$BATS_TEST_DIRNAME"/webhook.py
+
+  # The webhook's runtime hook must be on the node, where the container
+  # runtime executes it; its directory is the one dranet installs its own hook in.
+  docker cp "$BATS_TEST_DIRNAME"/python_post_hook.sh dranet-test-cluster-worker:/opt/dranet/bin/python-post-hook.sh
+  docker exec dranet-test-cluster-worker chmod 0755 /opt/dranet/bin/python-post-hook.sh
   
   # Deploy the python webhook daemonset
   kubectl --context kind-dranet-test-cluster apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/python_webhook_daemonset.yaml
@@ -42,6 +47,7 @@ teardown_file() {
   
   kubectl --context kind-dranet-test-cluster delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/python_webhook_daemonset.yaml || true
   kubectl --context kind-dranet-test-cluster delete configmap python-webhook-script -n kube-system || true
+  docker exec dranet-test-cluster-worker rm -f /opt/dranet/bin/python-post-hook.sh || true
 }
 
 @test "validate python webhook configuration integration" {
@@ -85,9 +91,34 @@ teardown_file() {
 
   run kubectl --context kind-dranet-test-cluster exec pod-python-webhook -- ip link show dummy1
   assert_output --partial "mtu 1450"
-  
-  kubectl --context kind-dranet-test-cluster delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/python_webhook_pod.yaml
-  kubectl --context kind-dranet-test-cluster delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
-  
-  docker exec "$NODE_NAME" bash -c "ip link delete dev dummy1 || true"
+
+  # The webhook's runtime hook ran on the node once for the pod, before its
+  # first container, after dranet attached the device, with the pod and the
+  # device in its environment; it only changed network state in the pod's
+  # namespace (the interface alias). The pod has two containers.
+  run kubectl --context kind-dranet-test-cluster exec pod-python-webhook -c app -- ip -j link show dev dummy1
+  assert_success
+  alias=$(jq -r '.[0].ifalias' <<<"$output")
+  assert_equal "$alias" 'post-hook runs=1 pod=default/pod-python-webhook devices=dummy1, data={"vendor":"python","rail":1} addresses=["10.200.200.200/24"]'
+  # The hook is in the OCI spec of the first container, after dranet's own
+  # hooks if any, and not in the second container's.
+  first_id=$(kubectl --context kind-dranet-test-cluster get pod pod-python-webhook -o jsonpath='{.status.containerStatuses[?(@.name=="app")].containerID}' | sed 's#containerd://##')
+  run docker exec "$NODE_NAME" crictl inspect "$first_id"
+  assert_success
+  run jq -r '.info.runtimeSpec.hooks.createRuntime[-1].path' <<<"$output"
+  assert_output "/opt/dranet/bin/python-post-hook.sh"
+  second_id=$(kubectl --context kind-dranet-test-cluster get pod pod-python-webhook -o jsonpath='{.status.containerStatuses[?(@.name=="second")].containerID}' | sed 's#containerd://##')
+  run docker exec "$NODE_NAME" crictl inspect "$second_id"
+  assert_success
+  run jq -r '.info.runtimeSpec.hooks.createRuntime // [] | length' <<<"$output"
+  assert_output "0"
+}
+
+teardown() {
+  # Clean up even when an assertion failed, so a leftover pod or claim does
+  # not break the test files that run after this one.
+  kubectl --context kind-dranet-test-cluster delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/python_webhook_pod.yaml --ignore-not-found --wait=true || true
+  kubectl --context kind-dranet-test-cluster delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml --ignore-not-found || true
+
+  docker exec dranet-test-cluster-worker bash -c "ip link delete dev dummy1 || true"
 }

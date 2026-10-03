@@ -18,8 +18,13 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -31,6 +36,8 @@ import (
 	resourceapply "k8s.io/client-go/applyconfigurations/resource/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/set"
+	"sigs.k8s.io/dranet/pkg/apis"
+	hookapi "sigs.k8s.io/dranet/pkg/apis/hook"
 )
 
 // NRI hooks into the container runtime, the lifecycle of the Pod seen here is local to the runtime
@@ -38,25 +45,31 @@ import (
 // is retried locally multiple times, so the hooks need to be idempotent to all operations on the Pod.
 // The NRI hooks are time sensitive, any slow operation needs to be added on the DRA hooks and only
 // the information necessary should passed to the NRI hooks via the np.podConfigStore so it can be executed
-// quickly.
+// quickly. Attaching devices is the exception; see attach_job.go.
+
+// errNRIBudgetExceeded is returned when attaching the Pod's devices does not fit
+// in the request and deferring is disabled. The runtime treats a plugin error
+// returned before its deadline as a failure of the operation; a reply after the
+// deadline disconnects the plugin and the operation proceeds without the devices.
+var errNRIBudgetExceeded = errors.New("not enough time left in the NRI request to attach all the network devices; increase the container runtime NRI plugin_request_timeout")
 
 func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
 	logger := klog.FromContext(ctx)
 	logger.Info("Synchronized state with the runtime", "pods", len(pods), "containers", len(containers))
 
-	// livePodNetNs map tracks live pods by UID and their network namespace paths.
-	livePodNetNs := make(map[types.UID]string)
+	// livePods tracks live pods by UID.
+	livePods := make(map[types.UID]*api.PodSandbox)
 	for _, pod := range pods {
 		podLogger := klog.LoggerWithValues(logger, "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid)
 		podLogger.Info("Synchronize Pod")
 		podLogger.V(2).Info("Pod network details", "netns", getNetworkNamespace(pod), "ips", pod.GetIps())
-		livePodNetNs[types.UID(pod.Uid)] = getNetworkNamespace(pod)
+		livePods[types.UID(pod.Uid)] = pod
 	}
 
 	// Process stored pods: update NetNS for live pods.
 	for _, storedUID := range np.podConfigStore.ListPods() {
-		if ns, isLive := livePodNetNs[storedUID]; isLive {
-			np.podConfigStore.SetPodNetNs(storedUID, ns)
+		if pod, isLive := livePods[storedUID]; isLive {
+			np.podConfigStore.SetPodNetNs(storedUID, getNetworkNamespace(pod))
 		}
 	}
 
@@ -94,10 +107,49 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 	return adjust, update, err
 }
 
-func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+func (np *NetworkDriver) createContainer(ctx context.Context, pod *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	logger := klog.FromContext(ctx)
+	adjust := &api.ContainerAdjustment{}
+
+	// The container must not start until every device of the Pod is attached.
+	var hooks []*api.Hook
+	if pending, _ := np.pendingDevices(podConfig); pending > 0 {
+		barrier, err := np.gateContainerOnAttach(ctx, pod)
+		if err != nil {
+			return nil, nil, err
+		}
+		if barrier != nil {
+			hooks = append(hooks, barrier)
+			containerHooksTotal.WithLabelValues(hookTypeBarrier).Inc()
+		}
+		// The attach may have progressed while waiting.
+		podConfig, _ = np.podConfigStore.GetPodConfig(types.UID(pod.GetUid()))
+	}
+	// The profile providers' hooks run after the barrier, with the devices
+	// attached and configured, once per Pod: they are added to the containers
+	// created until one of them starts (StartContainer).
+	providerHooks := runtimeHooks(podConfig)
+	containerHooksTotal.WithLabelValues(hookTypeProvider).Add(float64(len(providerHooks)))
+	hooks = append(hooks, providerHooks...)
+	if len(hooks) > 0 {
+		env, err := np.hookEnv(pod, podConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		chainTimeout := 0
+		for _, hook := range hooks {
+			hook.Env = env
+			chainTimeout += int(hook.Timeout.GetValue())
+		}
+		if chainTimeout > apis.RuntimeHookChainMaxTimeoutSeconds {
+			return nil, nil, fmt.Errorf("the hooks of pod %s/%s may take up to %ds, over the maximum of %ds for one container", pod.GetNamespace(), pod.GetName(), chainTimeout, apis.RuntimeHookChainMaxTimeoutSeconds)
+		}
+		adjust.AddHooks(&api.Hooks{CreateRuntime: hooks})
+		logger.V(2).Info("Added createRuntime hooks to the container", "hooks", len(hooks), "chainTimeout", chainTimeout)
+	}
+
 	// Containers only care about the RDMA char devices.
 	devPaths := set.Set[string]{}
-	adjust := &api.ContainerAdjustment{}
 
 	for _, config := range podConfig.DeviceConfigs {
 		for _, dev := range config.RDMADevice.DevChars {
@@ -117,6 +169,228 @@ func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _
 	}
 
 	return adjust, nil, nil
+}
+
+// gateContainerOnAttach makes sure the container does not start before all
+// the Pod's devices are attached. It waits for the attach job within the
+// request budget; if the job is still running it returns the barrier hook to
+// add to the container, which blocks on the hook socket until the job ends.
+// A failed job is retried until the Pod's attach deadline.
+func (np *NetworkDriver) gateContainerOnAttach(ctx context.Context, pod *api.PodSandbox) (*api.Hook, error) {
+	logger := klog.FromContext(ctx)
+	job, err := np.attachJobForContainer(ctx, pod)
+	if err != nil || job == nil {
+		return nil, err
+	}
+
+	// Often the job ends within this request's budget and no hook is needed.
+	waitCtx, cancel := requestBudget(ctx)
+	defer cancel()
+	if job.wait(waitCtx) {
+		return nil, job.err
+	}
+
+	podConfig, _ := np.podConfigStore.GetPodConfig(types.UID(pod.GetUid()))
+	pending, total := np.pendingDevices(podConfig)
+	if np.hookPath == "" {
+		return nil, fmt.Errorf("network devices of pod %s/%s: %d/%d attached, the kubelet will retry: %w", pod.GetNamespace(), pod.GetName(), total-pending, total, errNRIBudgetExceeded)
+	}
+	// The runtime kills the hook at its timeout and fails the container, so
+	// the hook gets the Pod's remaining attach time, rounded up.
+	hookTimeout := max(int(math.Ceil(time.Until(job.deadline).Seconds())), 1)
+	logger.V(2).Info("Injected the device attach hook into the container", "pending", pending, "total", total, "hookTimeout", hookTimeout)
+	return &api.Hook{
+		Path:    np.hookPath,
+		Args:    []string{filepath.Base(np.hookPath), "wait"},
+		Timeout: api.Int(hookTimeout),
+	}, nil
+}
+
+// runtimeHooks returns the profile providers' hooks for the Pod, one per
+// distinct path and arguments, in a stable order, or nothing once a container
+// carrying them was started. Devices sharing a hook each carry their own data
+// in the hook environment.
+func runtimeHooks(podConfig PodConfig) []*api.Hook {
+	seen := map[string]bool{}
+	var hooks []*api.Hook
+	for _, config := range podConfig.DeviceConfigs {
+		h := config.RuntimeHook
+		if h == nil || config.RuntimeHookDone {
+			continue
+		}
+		key := h.Path + "\x00" + strings.Join(h.Args, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		timeout := h.TimeoutSeconds
+		if timeout == 0 {
+			timeout = apis.RuntimeHookDefaultTimeoutSeconds
+		}
+		hooks = append(hooks, &api.Hook{
+			Path:    h.Path,
+			Args:    append([]string{filepath.Base(h.Path)}, h.Args...),
+			Timeout: api.Int(timeout),
+		})
+	}
+	sort.Slice(hooks, func(i, j int) bool {
+		return hooks[i].Path+strings.Join(hooks[i].Args, " ") < hooks[j].Path+strings.Join(hooks[j].Args, " ")
+	})
+	return hooks
+}
+
+// hookEnv is the environment of every createRuntime hook of the Pod's
+// containers: what DRANET decided for the Pod (package apis/hook), so a hook
+// does not look the Pod or its devices up elsewhere while they change. It
+// names the Pod and its devices, never the container: hooks are scoped to the
+// network namespace.
+func (np *NetworkDriver) hookEnv(pod *api.PodSandbox, podConfig PodConfig) ([]string, error) {
+	devices := make([]apis.HookDevice, 0, len(podConfig.DeviceConfigs))
+	for name, config := range podConfig.DeviceConfigs {
+		device := apis.HookDevice{
+			Name:        name,
+			Claim:       apis.HookClaimRef{Namespace: config.Claim.Namespace, Name: config.Claim.Name},
+			Host:        apis.DeviceIdentifiersFromDevice(config.DeviceSnapshot),
+			Interface:   config.NetworkInterfaceConfigInPod.Interface.Name,
+			RDMALinkDev: config.RDMADevice.LinkDev,
+		}
+		if device.Host.Name == "" {
+			device.Host.Name = config.NetworkInterfaceConfigInHost.Interface.Name
+		}
+		if np.needsAttach(config) {
+			conf := config.NetworkInterfaceConfigInPod
+			device.Config = &conf
+		}
+		if config.RuntimeHook != nil {
+			device.Data = config.RuntimeHook.Data
+		}
+		devices = append(devices, device)
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
+	devicesJSON, err := json.Marshal(devices)
+	if err != nil {
+		return nil, fmt.Errorf("encode the hook devices: %w", err)
+	}
+	ns := getNetworkNamespace(pod)
+	if ns == "" {
+		ns = podConfig.NetNS
+	}
+	return []string{
+		hookapi.EnvPodUID + "=" + pod.GetUid(),
+		hookapi.EnvPodNamespace + "=" + pod.GetNamespace(),
+		hookapi.EnvPodName + "=" + pod.GetName(),
+		hookapi.EnvNetNS + "=" + ns,
+		hookapi.EnvSocket + "=" + hookapi.SocketPath,
+		hookapi.EnvDevices + "=" + string(devicesJSON),
+	}, nil
+}
+
+// StartContainer records that the Pod's runtime hooks ran. The runtime calls it
+// after it created the container's task, which is the OCI create that runs
+// the createRuntime hooks, and before it starts the process; reaching it means
+// every hook of the container exited 0. Later containers of the Pod are
+// created without the provider hooks.
+func (np *NetworkDriver) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid, "container", ctr.Name)
+	start := time.Now()
+	status := statusNoop
+	defer func() {
+		nriPluginRequestsTotal.WithLabelValues(methodStartContainer, status).Inc()
+		nriPluginRequestsLatencySeconds.WithLabelValues(methodStartContainer, status).Observe(time.Since(start).Seconds())
+	}()
+	podUID := types.UID(pod.GetUid())
+	podConfig, ok := np.podConfigStore.GetPodConfig(podUID)
+	if !ok || len(runtimeHooks(podConfig)) == 0 {
+		return nil
+	}
+	if err := np.podConfigStore.SetRuntimeHooksDone(podUID); err != nil {
+		status = statusFailed
+		logger.Error(err, "Failed to record that the runtime hooks ran")
+		return nil
+	}
+	status = statusSuccess
+	runtimeHooksCompletedTotal.Inc()
+	logger.V(2).Info("Runtime hooks ran for the pod")
+	return nil
+}
+
+// attachJobForContainer returns the job a container must wait on, or nil when
+// the Pod's devices are all attached. It starts a job when the previous one
+// failed, or when none exists because the driver restarted since
+// RunPodSandbox, and fails once the Pod's attach deadline has passed.
+func (np *NetworkDriver) attachJobForContainer(ctx context.Context, pod *api.PodSandbox) (*attachJob, error) {
+	logger := klog.FromContext(ctx)
+	podUID := types.UID(pod.GetUid())
+	np.attachJobsMu.Lock()
+	defer np.attachJobsMu.Unlock()
+
+	podConfig, ok := np.podConfigStore.GetPodConfig(podUID)
+	if !ok {
+		return nil, nil
+	}
+	pending, total := np.pendingDevices(podConfig)
+	if pending == 0 {
+		return nil, nil
+	}
+	job := np.attachJobs[podUID]
+	if job != nil && !job.finished() {
+		return job, nil
+	}
+
+	now := time.Now()
+	var deadline time.Time
+	if job != nil {
+		deadline = job.deadline
+	}
+	if deadline.IsZero() {
+		if np.deviceAttachTimeout == 0 {
+			return nil, fmt.Errorf("pod %s/%s has %d/%d network devices pending and deferred attach is disabled (--device-attach-timeout=0)", pod.GetNamespace(), pod.GetName(), pending, total)
+		}
+		// No job: the driver restarted since RunPodSandbox.
+		deadline = now.Add(np.deviceAttachTimeout)
+	}
+	if !now.Before(deadline) {
+		attachDeadlineExceededTotal.Inc()
+		err := fmt.Errorf("gave up attaching network devices to pod %s/%s after %s: %d/%d attached. The sandbox stays and the kubelet keeps retrying this error; delete the pod to start over, and increase the container runtime NRI plugin_request_timeout", pod.GetNamespace(), pod.GetName(), np.deviceAttachTimeout, total-pending, total)
+		logger.Error(err, "CreateContainer giving up on pending devices")
+		np.eventRecorder.Event(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed", err.Error())
+		return nil, err
+	}
+
+	ns := getNetworkNamespace(pod)
+	if ns == "" {
+		ns = podConfig.NetNS
+	}
+	if ns == "" {
+		return nil, fmt.Errorf("network namespace of pod %s/%s is unknown, can not attach its %d/%d pending network devices", pod.GetNamespace(), pod.GetName(), pending, total)
+	}
+	if job != nil {
+		logger.Info("Retrying the network device attach", "err", job.err, "attached", total-pending, "total", total)
+	}
+	return np.startAttachJob(pod, podConfig, ns, deadline), nil
+}
+
+// needsAttach reports whether the device has something to move into the Pod's
+// network namespace: a netdev, or an RDMA link in exclusive RDMA netns mode.
+// Devices that only inject RDMA char devices are handled by createContainer.
+func (np *NetworkDriver) needsAttach(config DeviceConfig) bool {
+	return config.NetworkInterfaceConfigInHost.Interface.Name != "" ||
+		(!np.rdmaSharedMode && config.RDMADevice.LinkDev != "")
+}
+
+// pendingDevices returns how many devices of the Pod still need to be attached
+// and how many need attaching at all.
+func (np *NetworkDriver) pendingDevices(podConfig PodConfig) (pending, total int) {
+	for _, config := range podConfig.DeviceConfigs {
+		if !np.needsAttach(config) {
+			continue
+		}
+		total++
+		if !config.Attached {
+			pending++
+		}
+	}
+	return pending, total
 }
 
 func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
@@ -146,27 +420,94 @@ func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox)
 }
 func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
 	logger := klog.FromContext(ctx)
+	podUID := types.UID(pod.GetUid())
+	if deadline, ok := ctx.Deadline(); ok {
+		nriRequestTimeoutSeconds.Set(time.Until(deadline).Round(100 * time.Millisecond).Seconds())
+	}
 	// get the pod network namespace
 	ns := getNetworkNamespace(pod)
 	// host network pods can not allocate network devices because it impact the host
 	if ns == "" {
 		return fmt.Errorf("RunPodSandbox pod %s/%s using host network can not claim host devices", pod.Namespace, pod.Name)
 	}
-	// store the Pod network namespace in the pod config store
-	np.podConfigStore.SetPodNetNs(types.UID(pod.GetUid()), ns)
-
-	// Track all the status updates needed for the resource claims of the pod.
-	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
-	// Process the configurations of the ResourceClaim
-	for deviceName, config := range podConfig.DeviceConfigs {
-		logger.V(4).Info("RunPodSandbox processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
-		resourceClaim := types.NamespacedName{Name: config.Claim.Name, Namespace: config.Claim.Namespace}
-		resourceClaimStatus := statusUpdates[resourceClaim]
-		if statusUpdates[resourceClaim] == nil {
-			resourceClaimStatus = resourceapply.ResourceClaimStatus()
-			statusUpdates[resourceClaim] = resourceClaimStatus
+	job, err := np.startSandboxAttach(ctx, pod, ns)
+	if err != nil || job == nil {
+		return err
+	}
+	waitCtx, cancel := requestBudget(ctx)
+	defer cancel()
+	if job.wait(waitCtx) {
+		// An attach error fails the sandbox: the runtime destroys the network
+		// namespace and the kernel returns the devices to the host.
+		if job.err != nil {
+			sandboxAttachTotal.WithLabelValues(attachResultFailed).Inc()
+		} else {
+			sandboxAttachTotal.WithLabelValues(attachResultAttached).Inc()
 		}
-		// resourceClaim status for this specific device
+		return job.err
+	}
+
+	current, _ := np.podConfigStore.GetPodConfig(podUID)
+	pending, total := np.pendingDevices(current)
+	if np.deviceAttachTimeout == 0 {
+		job.cancel()
+		sandboxAttachTotal.WithLabelValues(attachResultRejected).Inc()
+		np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachTimeout",
+			"attached %d/%d network devices to pod %s/%s within the container runtime NRI request timeout; failing the sandbox so the pod does not start with missing devices. Increase the container runtime NRI plugin_request_timeout", total-pending, total, pod.GetNamespace(), pod.GetName())
+		return fmt.Errorf("attached %d/%d network devices: %w", total-pending, total, errNRIBudgetExceeded)
+	}
+	sandboxAttachTotal.WithLabelValues(attachResultDeferred).Inc()
+	np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachDeferred",
+		"attached %d/%d network devices to pod %s/%s within the container runtime NRI request timeout; the attach continues and the pod's containers wait for it, up to %s. Increase the container runtime NRI plugin_request_timeout to attach all devices at sandbox creation", total-pending, total, pod.GetNamespace(), pod.GetName(), np.deviceAttachTimeout)
+	logger.Info("RunPodSandbox returning with the network device attach in progress", "attached", total-pending, "total", total, "deadline", job.deadline)
+	return nil
+}
+
+// startSandboxAttach records the new sandbox's network namespace, forgets the
+// attach progress of any previous sandbox of the Pod, and starts the attach
+// job; nil when the Pod has no device to attach.
+func (np *NetworkDriver) startSandboxAttach(ctx context.Context, pod *api.PodSandbox, ns string) (*attachJob, error) {
+	podUID := types.UID(pod.GetUid())
+	np.podConfigStore.SetPodNetNs(podUID, ns)
+	// A job of a previous sandbox of the Pod must not touch the new namespace.
+	np.stopAttachJob(ctx, podUID)
+	podConfig, err := np.podConfigStore.ResetAttachProgress(podUID)
+	if err != nil {
+		return nil, err
+	}
+	if _, total := np.pendingDevices(podConfig); total == 0 {
+		return nil, nil
+	}
+	var deadline time.Time
+	if np.deviceAttachTimeout > 0 {
+		deadline = time.Now().Add(np.deviceAttachTimeout)
+	}
+	np.attachJobsMu.Lock()
+	defer np.attachJobsMu.Unlock()
+	return np.startAttachJob(pod, podConfig, ns, deadline), nil
+}
+
+// attachDevices attaches the Pod's pending devices to its network namespace ns,
+// one at a time, until ctx is done. It returns how many devices are still
+// pending and the total. A device that fails to attach returns an error; the
+// devices attached before it stay attached and recorded.
+func (np *NetworkDriver) attachDevices(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig, ns string) (pending, total int, err error) {
+	logger := klog.FromContext(ctx)
+	podUID := types.UID(pod.GetUid())
+	_, total = np.pendingDevices(podConfig)
+
+	for deviceName, config := range podConfig.DeviceConfigs {
+		if !np.needsAttach(config) || config.Attached {
+			continue
+		}
+		if ctx.Err() != nil {
+			pending++
+			continue
+		}
+		logger.V(4).Info("Processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
+		deviceStart := time.Now()
+		resourceClaim := types.NamespacedName{Name: config.Claim.Name, Namespace: config.Claim.Namespace}
+		// resourceClaim status for this specific device, applied once it is attached
 		resourceClaimStatusDevice := resourceapply.
 			AllocatedDeviceStatus().
 			WithDevice(deviceName).
@@ -179,14 +520,16 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 		if ifName != "" {
 			if config.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
 				if err := createSubinterfaceInNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+					deviceAttachDurationSeconds.WithLabelValues(attachResultFailed).Observe(time.Since(deviceStart).Seconds())
 					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceCreateFailed",
 						"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
-					return err
+					return 0, total, err
 				}
 			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+				deviceAttachDurationSeconds.WithLabelValues(attachResultFailed).Observe(time.Since(deviceStart).Seconds())
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
 					"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
-				return err
+				return 0, total, err
 			}
 		}
 
@@ -195,9 +538,10 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 		// for RoCE (netdev + RDMA) it runs after the netdev block above.
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
 			if err := attachRdmaToNS(ctx, config.RDMADevice.LinkDev, ns, resourceClaimStatusDevice); err != nil {
+				deviceAttachDurationSeconds.WithLabelValues(attachResultFailed).Observe(time.Since(deviceStart).Seconds())
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "RDMADeviceAttachFailed",
 					"failed to attach RDMA device %s to pod %s/%s: %v", config.RDMADevice.LinkDev, pod.GetNamespace(), pod.GetName(), err)
-				return err
+				return 0, total, err
 			}
 		}
 
@@ -215,28 +559,39 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 			)
 		}
 
-		resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
+		np.applyDeviceStatus(ctx, resourceClaim, deviceName, resourceClaimStatusDevice)
+		deviceAttachDurationSeconds.WithLabelValues(attachResultAttached).Observe(time.Since(deviceStart).Seconds())
+		// The kernel state changed; record it even if the checkpoint fails so
+		// StopPodSandbox and the hooks see the device as attached.
+		if err := np.podConfigStore.SetDeviceAttached(podUID, deviceName, true); err != nil {
+			logger.Error(err, "Failed to record device as attached", "device", deviceName)
+		}
 	}
-	// do not block the handler to update the status
-	for claim, status := range statusUpdates {
-		resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).WithStatus(status)
-		claimLogger := klog.LoggerWithValues(logger, "claim", klog.KRef(claim.Namespace, claim.Name))
-		go func() {
-			ctxStatus, cancel := context.WithTimeout(klog.NewContext(context.Background(), claimLogger), 3*time.Second)
-			defer cancel()
-			_, err := np.kubeClient.ResourceV1().ResourceClaims(claim.Namespace).ApplyStatus(ctxStatus,
-				resourceClaimApply,
-				metav1.ApplyOptions{FieldManager: np.driverName, Force: true},
-			)
-			if err != nil {
-				claimLogger.Error(err, "Failed to update status for claim")
-			} else {
-				claimLogger.V(4).Info("Updated status for claim")
-			}
-		}()
-	}
+	return pending, total, nil
+}
 
-	return nil
+// applyDeviceStatus writes one device's status to its ResourceClaim in the
+// background, so the NRI handler is not blocked by the API server. Each device
+// is applied under its own field manager: status.devices is a keyed list and a
+// server-side apply removes the entries its manager owned but no longer sends,
+// so devices attached in different hook calls must not share a manager.
+func (np *NetworkDriver) applyDeviceStatus(ctx context.Context, claim types.NamespacedName, deviceName string, device *resourceapply.AllocatedDeviceStatusApplyConfiguration) {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "claim", klog.KRef(claim.Namespace, claim.Name), "device", deviceName)
+	resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).
+		WithStatus(resourceapply.ResourceClaimStatus().WithDevices(device))
+	go func() {
+		ctxStatus, cancel := context.WithTimeout(klog.NewContext(context.Background(), logger), 3*time.Second)
+		defer cancel()
+		_, err := np.kubeClient.ResourceV1().ResourceClaims(claim.Namespace).ApplyStatus(ctxStatus,
+			resourceClaimApply,
+			metav1.ApplyOptions{FieldManager: np.driverName + "/" + deviceName, Force: true},
+		)
+		if err != nil {
+			logger.Error(err, "Failed to update status for claim")
+		} else {
+			logger.V(4).Info("Updated status for claim")
+		}
+	}()
 }
 
 // attachRdmaToNS moves the RDMA link device into the pod network namespace and
@@ -267,7 +622,7 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 	logger.V(2).Info("RunPodSandbox processing Network device")
 	// TODO config options to rename the device and pass parameters
 	// use https://github.com/opencontainers/runtime-spec/pull/1271
-	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
+	networkData, err := attachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
@@ -424,6 +779,9 @@ func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox
 
 func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
 	logger := klog.FromContext(ctx)
+	podUID := types.UID(pod.GetUid())
+	// Nothing may move devices into the namespace while they are detached.
+	np.stopAttachJob(ctx, podUID)
 	// get the pod network namespace
 	ns := getNetworkNamespace(pod)
 	if ns == "" {
@@ -518,7 +876,10 @@ func (np *NetworkDriver) RemovePodSandbox(ctx context.Context, pod *api.PodSandb
 	return err
 }
 
-func (np *NetworkDriver) removePodSandbox(_ context.Context, pod *api.PodSandbox) error {
+func (np *NetworkDriver) removePodSandbox(ctx context.Context, pod *api.PodSandbox) error {
+	podUID := types.UID(pod.GetUid())
+	np.stopAttachJob(ctx, podUID)
+	np.deleteAttachJob(podUID)
 	return nil
 }
 

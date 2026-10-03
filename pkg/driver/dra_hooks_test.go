@@ -447,6 +447,60 @@ func TestDynamicProfiles(t *testing.T) {
 		}
 	})
 
+	t.Run("Runtime hook from the profile provider", func(t *testing.T) {
+		newDB := func(hook *apis.RuntimeHook) *fakeInventoryDB {
+			fakeDB := newFakeInventoryDB()
+			fakeDB.GetProfileConfigFunc = func(string, *resourcev1.ResourceClaim, *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				return &apis.NetworkConfig{}, nil
+			}
+			fakeDB.GetDeviceConfigFunc = func(string) (*apis.NetworkConfig, bool) {
+				return &apis.NetworkConfig{Profile: "my-profile"}, true
+			}
+			fakeDB.IsIBOnlyDeviceFunc = func(string) bool { return true }
+			fakeDB.GetRuntimeHookFunc = func(_ string, _ *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error) {
+				// The provider decides with the resolved configuration in hand.
+				if config == nil || config.Profile != "my-profile" {
+					return nil, fmt.Errorf("unexpected config %#v", config)
+				}
+				return hook, nil
+			}
+			return fakeDB
+		}
+		claims := []*resourcev1.ResourceClaim{{
+			ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-hook", Namespace: "default", Name: "claim-hook"},
+			Status: resourcev1.ResourceClaimStatus{
+				ReservedFor: []resourcev1.ResourceClaimConsumerReference{{Resource: "pods", Name: "test-pod", UID: "pod-uid-hook"}},
+				Allocation: &resourcev1.AllocationResult{Devices: resourcev1.DeviceAllocationResult{
+					Results: []resourcev1.DeviceRequestAllocationResult{{Driver: "test.driver", Device: "device-1", Request: "req-1"}},
+				}},
+			},
+		}}
+
+		// Stored with the device, with the default timeout applied.
+		hook := &apis.RuntimeHook{Path: "/opt/acme/bin/acme-hook", Data: json.RawMessage(`{"fabric":"a"}`)}
+		np := &NetworkDriver{netdb: newDB(hook), driverName: "test.driver", podConfigStore: mustNewPodConfigStore()}
+		res, err := np.PrepareResourceClaims(ctx, claims)
+		if err != nil || res["claim-uid-hook"].Err != nil {
+			t.Fatalf("PrepareResourceClaims: %v / %v", err, res["claim-uid-hook"].Err)
+		}
+		podCfg, _ := np.podConfigStore.GetPodConfig("pod-uid-hook")
+		got := podCfg.DeviceConfigs["device-1"].RuntimeHook
+		want := &apis.RuntimeHook{Path: "/opt/acme/bin/acme-hook", TimeoutSeconds: apis.RuntimeHookDefaultTimeoutSeconds, Data: json.RawMessage(`{"fabric":"a"}`)}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("stored hook mismatch (-want +got):\n%s", diff)
+		}
+
+		// An invalid hook fails the preparation and releases the profile.
+		np = &NetworkDriver{netdb: newDB(&apis.RuntimeHook{Path: "relative/hook"}), driverName: "test.driver", podConfigStore: mustNewPodConfigStore(), eventRecorder: record.NewFakeRecorder(10)}
+		res, _ = np.PrepareResourceClaims(ctx, claims)
+		if res["claim-uid-hook"].Err == nil || !strings.Contains(res["claim-uid-hook"].Err.Error(), "not absolute") {
+			t.Fatalf("expected the invalid hook to fail the claim, got %v", res["claim-uid-hook"].Err)
+		}
+		if got := np.netdb.(*fakeInventoryDB).releaseProfileCalls.Load(); got != 1 {
+			t.Fatalf("expected the profile to be released once, got %d", got)
+		}
+	})
+
 	t.Run("Unsupported Provider Case", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
 		fakeDB.GetProfileConfigFunc = func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {

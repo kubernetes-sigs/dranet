@@ -55,6 +55,7 @@ type fakeInventoryDB struct {
 	GetRDMADeviceNameFunc    func(deviceName string) (string, error)
 	GetProfileConfigFunc     func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
 	ReleaseProfileConfigFunc func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
+	GetRuntimeHookFunc       func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error)
 	profileCalls             atomic.Int32
 	releaseProfileCalls      atomic.Int32
 }
@@ -124,6 +125,13 @@ func (m *fakeInventoryDB) ReleaseProfileConfig(deviceName string, claimUID types
 		return m.ReleaseProfileConfigFunc(deviceName, claimUID, config)
 	}
 	return nil
+}
+
+func (m *fakeInventoryDB) GetRuntimeHook(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error) {
+	if m.GetRuntimeHookFunc != nil {
+		return m.GetRuntimeHookFunc(deviceName, claim, config)
+	}
+	return nil, nil
 }
 
 // fakeNriStub is a mock implementation of the stub.Stub interface for testing.

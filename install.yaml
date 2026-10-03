@@ -109,6 +109,16 @@ spec:
       - operator: Exists
         effect: NoSchedule
       serviceAccountName: dranet
+      # dranet-hook must be on the host filesystem: the container runtime runs
+      # it as an OCI hook before creating the containers of a Pod whose
+      # network devices are still being attached.
+      initContainers:
+      - name: install-hook
+        image: registry.k8s.io/networking/dranet:stable
+        command: ["/dranet-hook", "install", "/host/opt/dranet/bin"]
+        volumeMounts:
+        - name: hook-bin
+          mountPath: /host/opt/dranet/bin
       containers:
       - name: dranet
         args:
@@ -182,6 +192,10 @@ spec:
       - name: dranet-run
         hostPath:
           path: /var/run/dranet
+          type: DirectoryOrCreate
+      - name: hook-bin
+        hostPath:
+          path: /opt/dranet/bin
           type: DirectoryOrCreate
       # Additional host volumes go here. Example, a host configuration
       # directory (pair with the mount above):
