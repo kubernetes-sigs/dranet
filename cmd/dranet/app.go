@@ -18,8 +18,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -137,9 +139,13 @@ func main() {
 	})
 	// Add metrics handler
 	mux.Handle("/metrics", promhttp.Handler())
-	go func() {
-		_ = http.ListenAndServe(bindAddress, mux)
-	}()
+	// Bind before the driver starts, so a port still held by the previous pod
+	// stops this process before it accepts any claim; kubelet restarts it.
+	if _, err := startMetricsServer(bindAddress, mux, func(err error) {
+		klog.Fatalf("metrics/healthz server on %s stopped: %v", bindAddress, err)
+	}); err != nil {
+		klog.Fatalf("Failed to start the metrics/healthz server: %v", err)
+	}
 
 	if err := pcidb.Setup(); err != nil {
 		klog.Fatalf("Failed to setup PCI DB: %v", err)
@@ -352,4 +358,21 @@ func setupProviders(ctx context.Context, opts providerOptions) (cloudprovider.Cl
 	}
 
 	return cloudInst, profProv, nil
+}
+
+// startMetricsServer binds addr and serves handler on it in the background.
+// A bind failure is returned to the caller. Any error that stops the server,
+// other than http.ErrServerClosed from a Shutdown, is passed to onServeError.
+func startMetricsServer(addr string, handler http.Handler, onServeError func(error)) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			onServeError(err)
+		}
+	}()
+	return ln, nil
 }
