@@ -59,6 +59,10 @@
       "type": "string",
       "description": "Kubelet data directory (its --root-dir); the driver's plugin and registration sockets live under it"
     },
+    "hookBinDir": {
+      "type": "string",
+      "description": "Host directory where the dranet-hook OCI hook binary is installed; must be writable and on a filesystem that allows executables (not mounted noexec)"
+    },
     "args": {
       "type": "object",
       "additionalProperties": false,
@@ -97,6 +101,11 @@
         },
         "moveIBInterfaces": {
           "type": "boolean"
+        },
+        "deviceAttachTimeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(ns|us|ms|s|m|h)$",
+          "description": "Time allowed to attach a Pod's devices when they do not fit in the runtime NRI request timeout; the Pod's containers wait for it. '0s' fails the sandbox instead"
         },
         "cloudProviderHint": {
           "type": "string",

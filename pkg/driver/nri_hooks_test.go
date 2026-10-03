@@ -18,15 +18,24 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/dranet/pkg/apis"
+	hookapi "sigs.k8s.io/dranet/pkg/apis/hook"
 	"sigs.k8s.io/dranet/pkg/inventory"
 )
 
@@ -186,6 +195,373 @@ func TestRunPodSandboxUsesPersistedConfigAfterRestart(t *testing.T) {
 	err = np.RunPodSandbox(context.Background(), pod)
 	if err == nil {
 		t.Fatal("expected RunPodSandbox to error (config found, netdev ops fail), got nil (config missing?)")
+	}
+}
+
+func TestRequestBudget(t *testing.T) {
+	// No deadline: the budget context only ends with the parent.
+	ctx, cancel := requestBudget(context.Background())
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("expected no deadline without a request deadline")
+	}
+	cancel()
+
+	// With a deadline: ends nriDeadlineMargin earlier.
+	parent, cancelParent := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelParent()
+	ctx, cancel = requestBudget(parent)
+	defer cancel()
+	parentDeadline, _ := parent.Deadline()
+	budgetDeadline, ok := ctx.Deadline()
+	if !ok || !budgetDeadline.Equal(parentDeadline.Add(-nriDeadlineMargin)) {
+		t.Fatalf("expected the budget to end %s before the request deadline, got %v (request %v)", nriDeadlineMargin, budgetDeadline, parentDeadline)
+	}
+}
+
+// slowAttach makes every netdev attach take at least delay for the rest of the
+// test, the way slow hardware does.
+func slowAttach(t *testing.T, delay time.Duration) {
+	t.Helper()
+	attach := attachNetdev
+	attachNetdev = func(hostIfName string, containerNsPath string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
+		time.Sleep(delay)
+		return attach(hostIfName, containerNsPath, interfaceConfig)
+	}
+	t.Cleanup(func() { attachNetdev = attach })
+}
+
+// slowAttachDriver returns a driver whose device attach takes at least delay
+// per device. The device does not exist, so an attempt ends with a netlink
+// error after the delay.
+func slowAttachDriver(t *testing.T, podUID types.UID, delay, attachTimeout time.Duration, recorder *record.FakeRecorder) *NetworkDriver {
+	t.Helper()
+	if delay > 0 {
+		slowAttach(t, delay)
+	}
+	np := &NetworkDriver{
+		podConfigStore:      mustNewPodConfigStore(),
+		netdb:               inventory.New(),
+		eventRecorder:       recorder,
+		deviceAttachTimeout: attachTimeout,
+		hookPath:            "/opt/dranet/bin/dranet-hook",
+	}
+	if err := np.podConfigStore.SetDeviceConfig(podUID, "dev0", nonexistentDeviceConfig()); err != nil {
+		t.Fatalf("SetDeviceConfig() error: %v", err)
+	}
+	return np
+}
+
+// shortRequest returns a request context whose budget ends before a slow
+// device attach can complete.
+func shortRequest() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), nriDeadlineMargin+50*time.Millisecond)
+}
+
+func waitForJob(t *testing.T, np *NetworkDriver, podUID types.UID) *attachJob {
+	t.Helper()
+	job := np.getAttachJob(podUID)
+	if job == nil {
+		t.Fatal("expected an attach job")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !job.wait(ctx) {
+		t.Fatal("attach job did not finish")
+	}
+	return job
+}
+
+// TestRunPodSandboxFailsBeforeRuntimeDeadline verifies that with deferral
+// disabled, when the attach does not fit in the request budget, RunPodSandbox
+// returns an error before the runtime deadline, so the runtime fails the
+// sandbox instead of disconnecting the plugin.
+func TestRunPodSandboxFailsBeforeRuntimeDeadline(t *testing.T) {
+	podUID := types.UID("test-pod-deadline")
+	recorder := record.NewFakeRecorder(10)
+	np := slowAttachDriver(t, podUID, 500*time.Millisecond, 0, recorder)
+	pod := deadlineTestPod(podUID)
+
+	ctx, cancel := shortRequest()
+	defer cancel()
+	start := time.Now()
+	err := np.RunPodSandbox(ctx, pod)
+	if !errors.Is(err, errNRIBudgetExceeded) {
+		t.Fatalf("expected errNRIBudgetExceeded, got %v", err)
+	}
+	if deadline, _ := ctx.Deadline(); time.Now().After(deadline) {
+		t.Fatalf("RunPodSandbox returned after the request deadline (%s)", time.Since(start))
+	}
+	expectEvent(t, recorder, "NetworkDeviceAttachTimeout")
+	if got := testutil.ToFloat64(nriPluginRequestsTotal.WithLabelValues(methodRunPodSandbox, statusFailed)); got < 1 {
+		t.Errorf("expected RunPodSandbox to be counted as failed, got %f", got)
+	}
+	if got := testutil.ToFloat64(sandboxAttachTotal.WithLabelValues(attachResultRejected)); got < 1 {
+		t.Errorf("expected the sandbox attach to be counted as rejected, got %f", got)
+	}
+	// The job was cancelled; the device operation in flight ends on its own
+	// and nothing is recorded as attached.
+	job := waitForJob(t, np, podUID)
+	if job.err == nil {
+		t.Fatal("expected the cancelled job to end with an error")
+	}
+	if cfg, _ := np.podConfigStore.GetDeviceConfig(podUID, "dev0"); cfg.Attached {
+		t.Fatal("expected no device recorded as attached")
+	}
+}
+
+// TestRunPodSandboxDefersToHook covers the deferred path: RunPodSandbox
+// returns with the job running, CreateContainer injects the OCI hook while the
+// job runs, retries a failed job until the deadline, and fails terminally
+// after it; a new sandbox starts over.
+func TestRunPodSandboxDefersToHook(t *testing.T) {
+	podUID := types.UID("test-pod-defer")
+	recorder := record.NewFakeRecorder(10)
+	np := slowAttachDriver(t, podUID, 500*time.Millisecond, 10*time.Second, recorder)
+	pod := deadlineTestPod(podUID)
+	ctr := &api.Container{Name: "ctr"}
+
+	ctx, cancel := shortRequest()
+	defer cancel()
+	if err := np.RunPodSandbox(ctx, pod); err != nil {
+		t.Fatalf("expected RunPodSandbox to defer without error, got %v", err)
+	}
+	expectEvent(t, recorder, "NetworkDeviceAttachDeferred")
+	if job := np.getAttachJob(podUID); job == nil || job.deadline.IsZero() {
+		t.Fatal("expected a job with an attach deadline")
+	}
+	if got := testutil.ToFloat64(sandboxAttachTotal.WithLabelValues(attachResultDeferred)); got < 1 {
+		t.Errorf("expected the sandbox attach to be counted as deferred, got %f", got)
+	}
+	barrierHooks := testutil.ToFloat64(containerHooksTotal.WithLabelValues(hookTypeBarrier))
+
+	// While the job runs, the container gets the hook and no error. Several
+	// containers of the Pod created at once share the job and none waits for
+	// the lock of another: each returns within its own request budget.
+	ctx2, cancel2 := shortRequest()
+	defer cancel2()
+	adjust, _, err := np.CreateContainer(ctx2, pod, ctr)
+	if err != nil {
+		t.Fatalf("expected CreateContainer to inject the hook, got %v", err)
+	}
+	if adjust == nil || adjust.Hooks == nil || len(adjust.Hooks.CreateRuntime) != 1 {
+		t.Fatalf("expected one createRuntime hook, got %#v", adjust)
+	}
+	hook := adjust.Hooks.CreateRuntime[0]
+	if hook.Path != np.hookPath || hook.Timeout.GetValue() <= 0 {
+		t.Fatalf("unexpected hook %#v", hook)
+	}
+	if got := testutil.ToFloat64(containerHooksTotal.WithLabelValues(hookTypeBarrier)); got != barrierHooks+1 {
+		t.Errorf("expected one more barrier hook counted, got %f, had %f", got, barrierHooks)
+	}
+	// The environment carries what DRANET decided for the Pod, so the hook
+	// does not need another channel to learn it.
+	env := map[string]string{}
+	for _, kv := range hook.Env {
+		k, v, _ := strings.Cut(kv, "=")
+		env[k] = v
+	}
+	if env[hookapi.EnvPodUID] != string(podUID) || env[hookapi.EnvPodNamespace] != pod.Namespace || env[hookapi.EnvPodName] != pod.Name ||
+		env[hookapi.EnvContainerName] != ctr.Name || env[hookapi.EnvNetNS] != getNetworkNamespace(pod) || env[hookapi.EnvSocket] != hookapi.SocketPath {
+		t.Fatalf("unexpected hook environment %v", hook.Env)
+	}
+	var devices []apis.HookDevice
+	if err := json.Unmarshal([]byte(env[hookapi.EnvDevices]), &devices); err != nil {
+		t.Fatalf("decode %s: %v", hookapi.EnvDevices, err)
+	}
+	wantDevice := apis.HookDevice{
+		Name:      "dev0",
+		Claim:     apis.HookClaimRef{Namespace: "ns", Name: "claim1"},
+		Host:      apis.DeviceIdentifiers{Name: "nonexistent0"},
+		Interface: "eth0-pod",
+		Config:    &apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "eth0-pod"}},
+	}
+	if len(devices) != 1 || !reflect.DeepEqual(devices[0], wantDevice) {
+		t.Fatalf("unexpected hook devices %#v, want %#v", devices, wantDevice)
+	}
+	running := np.getAttachJob(podUID)
+	var wg sync.WaitGroup
+	results := make(chan error, 3)
+	for i := range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := shortRequest()
+			defer cancel()
+			adjust, _, err := np.CreateContainer(ctx, pod, &api.Container{Name: "ctr" + string(rune('a'+i))})
+			if deadline, _ := ctx.Deadline(); time.Now().After(deadline) {
+				results <- errors.New("CreateContainer returned after its request deadline")
+				return
+			}
+			if err == nil && (adjust == nil || adjust.Hooks == nil || len(adjust.Hooks.CreateRuntime) != 1) {
+				err = errors.New("expected the hook to be injected")
+			}
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("concurrent CreateContainer: %v", err)
+		}
+	}
+	if np.getAttachJob(podUID) != running {
+		t.Fatal("concurrent CreateContainer calls must share the running job")
+	}
+
+	// The job fails (the device does not exist); before the deadline the
+	// next container creation starts a new job.
+	first := waitForJob(t, np, podUID)
+	if first.err == nil || errors.Is(first.err, context.Canceled) {
+		t.Fatalf("expected the job to fail on the device, got %v", first.err)
+	}
+	ctx3, cancel3 := shortRequest()
+	defer cancel3()
+	if _, _, err := np.CreateContainer(ctx3, pod, ctr); err != nil {
+		t.Fatalf("expected CreateContainer to retry the attach, got %v", err)
+	}
+	if np.getAttachJob(podUID) == first {
+		t.Fatal("expected a new attach job")
+	}
+	waitForJob(t, np, podUID)
+
+	// Past the deadline: terminal error and event, no new job. The job is
+	// finished, so nothing else reads its deadline.
+	np.getAttachJob(podUID).deadline = time.Now().Add(-time.Second)
+	deadlineExceeded := testutil.ToFloat64(attachDeadlineExceededTotal)
+	_, _, err = np.CreateContainer(context.Background(), pod, ctr)
+	if err == nil || !strings.Contains(err.Error(), "gave up attaching") {
+		t.Fatalf("expected a terminal error after the deadline, got %v", err)
+	}
+	expectEvent(t, recorder, "NetworkDeviceAttachFailed")
+	if got := testutil.ToFloat64(attachDeadlineExceededTotal); got != deadlineExceeded+1 {
+		t.Errorf("expected the deadline to be counted as exceeded once, got %f, had %f", got, deadlineExceeded)
+	}
+
+	// A new sandbox starts over: progress and deadline are reset.
+	ctx4, cancel4 := shortRequest()
+	defer cancel4()
+	if err := np.RunPodSandbox(ctx4, pod); err != nil {
+		t.Fatalf("expected RunPodSandbox to defer again, got %v", err)
+	}
+	if job := np.getAttachJob(podUID); !time.Now().Before(job.deadline) {
+		t.Fatalf("expected a fresh deadline, got %v", job.deadline)
+	}
+	waitForJob(t, np, podUID)
+}
+
+// TestHookWaitHandler covers the endpoint the OCI hook blocks on.
+func TestHookWaitHandler(t *testing.T) {
+	podUID := types.UID("test-pod-hook")
+	np := slowAttachDriver(t, podUID, 0, 10*time.Second, record.NewFakeRecorder(10))
+	pod := deadlineTestPod(podUID)
+
+	get := func(pod string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		np.handleHookWait(rec, httptest.NewRequest(http.MethodGet, hookapi.WaitPath+"?pod="+pod, nil))
+		return rec
+	}
+
+	if rec := get(""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without a pod, got %d", rec.Code)
+	}
+	if rec := get("unknown"); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for an unknown pod, got %d", rec.Code)
+	}
+	// Pending devices and no job (the driver restarted): the hook does not
+	// start one, the container start fails and CreateContainer will.
+	if rec := get(string(podUID)); rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "no network device attach in progress") {
+		t.Fatalf("expected 500 without a job, got %d %q", rec.Code, rec.Body.String())
+	}
+
+	// A failing job: the hook gets the reason.
+	ctx, cancel := shortRequest()
+	defer cancel()
+	_ = np.RunPodSandbox(ctx, pod)
+	waitForJob(t, np, podUID)
+	failedWaits := testutil.ToFloat64(hookWaitsTotal.WithLabelValues(hookWaitFailed))
+	releasedWaits := testutil.ToFloat64(hookWaitsTotal.WithLabelValues(hookWaitReleased))
+	rec := get(string(podUID))
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "nonexistent0") {
+		t.Fatalf("expected 500 with the attach error, got %d %q", rec.Code, rec.Body.String())
+	}
+	if got := testutil.ToFloat64(hookWaitsTotal.WithLabelValues(hookWaitFailed)); got != failedWaits+1 {
+		t.Errorf("expected one more failed hook wait, got %f, had %f", got, failedWaits)
+	}
+
+	// All attached: released immediately.
+	if err := np.podConfigStore.SetDeviceAttached(podUID, "dev0", true); err != nil {
+		t.Fatal(err)
+	}
+	if rec := get(string(podUID)); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when all devices are attached, got %d %q", rec.Code, rec.Body.String())
+	}
+	if got := testutil.ToFloat64(hookWaitsTotal.WithLabelValues(hookWaitReleased)); got != releasedWaits+1 {
+		t.Errorf("expected one more released hook wait, got %f, had %f", got, releasedWaits)
+	}
+}
+
+// TestCreateContainerSkipsResumeWhenAttached verifies that a pod whose devices
+// are all attached gets its RDMA char devices without any attach work, even
+// with no request budget.
+func TestCreateContainerSkipsResumeWhenAttached(t *testing.T) {
+	podUID := types.UID("test-pod-attached")
+	np := &NetworkDriver{
+		podConfigStore:      mustNewPodConfigStore(),
+		eventRecorder:       record.NewFakeRecorder(10),
+		deviceAttachTimeout: time.Second,
+	}
+	cfg := nonexistentDeviceConfig()
+	cfg.Attached = true
+	cfg.RDMADevice.DevChars = []LinuxDevice{{Path: "/dev/infiniband/uverbs0", Type: "c", Major: 231, Minor: 192}}
+	if err := np.podConfigStore.SetDeviceConfig(podUID, "dev0", cfg); err != nil {
+		t.Fatalf("SetDeviceConfig() error: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), nriDeadlineMargin/2)
+	defer cancel()
+	adjust, _, err := np.CreateContainer(ctx, deadlineTestPod(podUID), &api.Container{Name: "ctr"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(adjust.Linux.Devices) != 1 {
+		t.Fatalf("expected the RDMA char device, got %#v", adjust.Linux.Devices)
+	}
+}
+
+func nonexistentDeviceConfig() DeviceConfig {
+	return DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "nonexistent0"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0-pod"},
+		},
+	}
+}
+
+func deadlineTestPod(podUID types.UID) *api.PodSandbox {
+	return &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      string(podUID),
+		Namespace: "test-ns",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: "/var/run/netns/test"},
+			},
+		},
+	}
+}
+
+func expectEvent(t *testing.T, recorder *record.FakeRecorder, reason string) {
+	t.Helper()
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, reason) {
+			t.Fatalf("expected event %s, got %q", reason, ev)
+		}
+	default:
+		t.Fatalf("expected a %s event", reason)
 	}
 }
 

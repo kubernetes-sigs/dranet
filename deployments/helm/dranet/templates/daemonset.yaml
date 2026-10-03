@@ -43,6 +43,14 @@ spec:
       {{- end }}
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
+      initContainers:
+        - name: install-hook
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/dranet-hook", "install", "/host{{ .Values.hookBinDir }}"]
+          volumeMounts:
+            - name: hook-bin
+              mountPath: /host{{ .Values.hookBinDir }}
       containers:
         - name: dranet
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -51,6 +59,7 @@ spec:
             - /dranet
             - --v={{ .Values.logVerbosity }}
             - --hostname-override=$(NODE_NAME)
+            - --hook-path={{ .Values.hookBinDir }}/dranet-hook
             {{- if .Values.metricsPort }}
             - --bind-address=:{{ .Values.metricsPort }}
             {{- end }}
@@ -71,6 +80,9 @@ spec:
             {{- end }}
             {{- if (hasKey .Values.args "moveIBInterfaces") }}
             - --move-ib-interfaces={{ .Values.args.moveIBInterfaces }}
+            {{- end }}
+            {{- if (hasKey .Values.args "deviceAttachTimeout") }}
+            - --device-attach-timeout={{ .Values.args.deviceAttachTimeout }}
             {{- end }}
             {{- if .Values.args.cloudProviderHint }}
             - --cloud-provider-hint={{ .Values.args.cloudProviderHint }}
@@ -158,6 +170,10 @@ spec:
         - name: dranet-run
           hostPath:
             path: /var/run/dranet
+            type: DirectoryOrCreate
+        - name: hook-bin
+          hostPath:
+            path: {{ .Values.hookBinDir }}
             type: DirectoryOrCreate
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

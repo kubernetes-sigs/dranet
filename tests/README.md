@@ -9,6 +9,12 @@
 
 4. Run `bats tests/`
 
+The suite builds the image with `--build-arg GOFLAGS=-tags=e2e`. The `e2e`
+build tag compiles in test hooks that the released binary does not have, such
+as `DRANET_E2E_ATTACH_DELAY` (`pkg/driver/attach_e2e.go`), which slows every
+device attach down so `tests/nri_timeout.bats` can reproduce hardware whose
+attach does not fit in the container runtime's NRI request timeout.
+
 # Best practices for writing integration tests
 
 * For clear and debuggable test failures, prefer using a suitable helper

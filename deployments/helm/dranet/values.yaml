@@ -27,6 +27,7 @@ args: {}
 #  inventoryMaxPollInterval: "1m"
 #  inventoryPollBurst: 5
 #  moveIBInterfaces: true
+#  deviceAttachTimeout: 30s
 #  cloudProviderHint: ""
 #  cloudProviderOptions:
 #    oke:
@@ -42,6 +43,13 @@ args: {}
 # the container, as the kubeletplugin library requires. Set this to match the
 # kubelet --root-dir on clusters that relocate it; the default suits a standard kubelet.
 kubeletRootDir: /var/lib/kubelet
+
+# hookBinDir is the host directory where an init container installs dranet-hook,
+# the OCI createRuntime hook the container runtime runs before starting the
+# containers of a Pod whose network devices are still being attached. The
+# directory must be writable and on a filesystem that allows executables (not
+# mounted noexec).
+hookBinDir: /opt/dranet/bin
 
 # Extra volumes and volume mounts for the dranet container.
 # The chart adds them after the built-in ones without changes.

@@ -34,6 +34,7 @@ import (
 	"github.com/google/cel-go/ext"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
+	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
@@ -70,6 +71,9 @@ var (
 	featureGates         string
 	cloudProviderOptions stringList
 
+	deviceAttachTimeout time.Duration
+	hookPath            string
+
 	kubeletRootDir string
 
 	ready atomic.Bool
@@ -91,6 +95,8 @@ func init() {
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 	flag.Var(&cloudProviderOptions, "cloud-provider-options", "A <provider>.<option>=<value> pair for a cloud provider. Repeat the flag for each option. Values can contain commas. The options of a provider apply only when that provider runs. Values must not contain secrets; flags are logged.")
+	flag.DurationVar(&deviceAttachTimeout, "device-attach-timeout", 30*time.Second, "Time allowed to attach a Pod's network devices when attaching them all does not fit in the container runtime NRI request timeout (containerd plugin_request_timeout, 2s by default): the attach continues in the background and the Pod's containers wait for it, at most 60s. With 0 the Pod sandbox fails instead, and the kubelet recreates it.")
+	flag.StringVar(&hookPath, "hook-path", "/opt/dranet/bin/dranet-hook", "Host path of the binary added as an OCI createRuntime hook to the containers of a Pod whose network devices are still being attached; dranet-hook by default, or any binary implementing the same contract. Empty disables the hook: those containers fail to create until the attach is done and the kubelet retries them.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -190,6 +196,13 @@ func main() {
 	defer store.Close()
 
 	opts = append(opts, driver.WithKubeletRootDir(kubeletRootDir))
+	if deviceAttachTimeout < 0 || deviceAttachTimeout > apis.DeviceAttachTimeoutMaxSeconds*time.Second {
+		klog.Fatalf("--device-attach-timeout must be between 0 and %ds, got %s", apis.DeviceAttachTimeoutMaxSeconds, deviceAttachTimeout)
+	}
+	opts = append(opts, driver.WithDeviceAttachTimeout(deviceAttachTimeout))
+	if hookPath != "" {
+		opts = append(opts, driver.WithHook(hookPath))
+	}
 
 	if celExpression != "" {
 		env, err := cel.NewEnv(

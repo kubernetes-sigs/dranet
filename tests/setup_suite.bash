@@ -8,8 +8,8 @@ function setup_suite {
   export CLUSTER_NAME="dranet-test-cluster"
   export IMAGE_NAME="registry.k8s.io/networking/dranet"
 
-  # Build the image
-  docker build -t "$IMAGE_NAME":test -f Dockerfile "$BATS_TEST_DIRNAME"/.. --load
+  # Build the image with the end-to-end hooks compiled in (pkg/driver/attach_e2e.go).
+  docker build -t "$IMAGE_NAME":test -f Dockerfile --build-arg GOFLAGS=-tags=e2e "$BATS_TEST_DIRNAME"/.. --load
 
   # Define the kind arguments in an array
   kind_args=(
