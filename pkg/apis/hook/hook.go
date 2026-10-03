@@ -19,6 +19,10 @@ limitations under the License.
 // environment and the daemon's wait endpoint. It has no dependencies, so a
 // hook binary stays small; the device model carried in EnvDevices is
 // apis.HookDevice in the parent package.
+//
+// Hooks are scoped to the Pod's network namespace. The environment names the
+// Pod and its devices, never a container, and a hook must not use the OCI
+// container state the runtime writes on its stdin.
 package hook
 
 const (
@@ -32,10 +36,9 @@ const (
 	WaitPath = "/wait"
 
 	// Environment of the hook process.
-	EnvPodUID        = "DRANET_POD_UID"
-	EnvPodNamespace  = "DRANET_POD_NAMESPACE"
-	EnvPodName       = "DRANET_POD_NAME"
-	EnvContainerName = "DRANET_CONTAINER_NAME"
+	EnvPodUID       = "DRANET_POD_UID"
+	EnvPodNamespace = "DRANET_POD_NAMESPACE"
+	EnvPodName      = "DRANET_POD_NAME"
 	// EnvNetNS is the path of the Pod's network namespace.
 	EnvNetNS = "DRANET_NETNS"
 	// EnvSocket is the unix socket serving WaitPath.

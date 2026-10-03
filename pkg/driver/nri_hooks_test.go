@@ -361,8 +361,13 @@ func TestRunPodSandboxDefersToHook(t *testing.T) {
 		env[k] = v
 	}
 	if env[hookapi.EnvPodUID] != string(podUID) || env[hookapi.EnvPodNamespace] != pod.Namespace || env[hookapi.EnvPodName] != pod.Name ||
-		env[hookapi.EnvContainerName] != ctr.Name || env[hookapi.EnvNetNS] != getNetworkNamespace(pod) || env[hookapi.EnvSocket] != hookapi.SocketPath {
+		env[hookapi.EnvNetNS] != getNetworkNamespace(pod) || env[hookapi.EnvSocket] != hookapi.SocketPath {
 		t.Fatalf("unexpected hook environment %v", hook.Env)
+	}
+	for k := range env {
+		if strings.Contains(strings.ToLower(k), "container") {
+			t.Fatalf("the hook environment must not name the container, got %s", k)
+		}
 	}
 	var devices []apis.HookDevice
 	if err := json.Unmarshal([]byte(env[hookapi.EnvDevices]), &devices); err != nil {
@@ -499,6 +504,170 @@ func TestHookWaitHandler(t *testing.T) {
 	if got := testutil.ToFloat64(hookWaitsTotal.WithLabelValues(hookWaitReleased)); got != releasedWaits+1 {
 		t.Errorf("expected one more released hook wait, got %f, had %f", got, releasedWaits)
 	}
+}
+
+// TestCreateContainerRuntimeHooks covers the profile providers' hooks: they
+// run after the barrier, once per distinct path and arguments, with each
+// device's data in the shared environment, whether or not the attach was
+// deferred; they are added to containers until one is created, and their
+// timeouts are bounded as a chain.
+func TestCreateContainerRuntimeHooks(t *testing.T) {
+	podUID := types.UID("test-pod-runtime-hooks")
+	pod := deadlineTestPod(podUID)
+	ctr := &api.Container{Name: "ctr"}
+	acme := &apis.RuntimeHook{Path: "/opt/acme/bin/acme-hook", Args: []string{"--post"}, TimeoutSeconds: 5}
+	acmeB := &apis.RuntimeHook{Path: "/opt/acme/bin/acme-hook", Args: []string{"--post"}, TimeoutSeconds: 5, Data: json.RawMessage(`{"rail":1}`)}
+	other := &apis.RuntimeHook{Path: "/opt/other/hook"}
+
+	newDriver := func(t *testing.T, attached bool, hooks ...*apis.RuntimeHook) *NetworkDriver {
+		t.Helper()
+		np := &NetworkDriver{
+			podConfigStore:      mustNewPodConfigStore(),
+			netdb:               inventory.New(),
+			eventRecorder:       record.NewFakeRecorder(10),
+			deviceAttachTimeout: 10 * time.Second,
+			hookPath:            "/opt/dranet/bin/dranet-hook",
+		}
+		for i, h := range hooks {
+			cfg := nonexistentDeviceConfig()
+			cfg.Attached = attached
+			cfg.RuntimeHook = h
+			if err := np.podConfigStore.SetDeviceConfig(podUID, "dev"+string(rune('0'+i)), cfg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return np
+	}
+	hookPaths := func(adjust *api.ContainerAdjustment) []string {
+		var paths []string
+		for _, h := range adjust.GetHooks().GetCreateRuntime() {
+			paths = append(paths, h.Path+" "+strings.Join(h.Args[1:], " "))
+		}
+		return paths
+	}
+
+	t.Run("after the barrier, deduplicated, with data", func(t *testing.T) {
+		np := newDriver(t, false, acme, acmeB, other)
+		slowAttach(t, 500*time.Millisecond)
+		ctx, cancel := shortRequest()
+		defer cancel()
+		if err := np.RunPodSandbox(ctx, pod); err != nil {
+			t.Fatalf("RunPodSandbox: %v", err)
+		}
+		ctx2, cancel2 := shortRequest()
+		defer cancel2()
+		adjust, _, err := np.CreateContainer(ctx2, pod, ctr)
+		if err != nil {
+			t.Fatalf("CreateContainer: %v", err)
+		}
+		want := []string{np.hookPath + " wait", "/opt/acme/bin/acme-hook --post", "/opt/other/hook "}
+		if got := hookPaths(adjust); !reflect.DeepEqual(got, want) {
+			t.Fatalf("hooks = %v, want %v", got, want)
+		}
+		for _, h := range adjust.Hooks.CreateRuntime {
+			if len(h.Env) == 0 || !reflect.DeepEqual(h.Env, adjust.Hooks.CreateRuntime[0].Env) {
+				t.Fatalf("every hook must get the same environment, got %#v", h)
+			}
+		}
+		if got := adjust.Hooks.CreateRuntime[2].Timeout.GetValue(); got != apis.RuntimeHookDefaultTimeoutSeconds {
+			t.Fatalf("default timeout = %d, want %d", got, apis.RuntimeHookDefaultTimeoutSeconds)
+		}
+		var devices []apis.HookDevice
+		for _, kv := range adjust.Hooks.CreateRuntime[0].Env {
+			if v, ok := strings.CutPrefix(kv, hookapi.EnvDevices+"="); ok {
+				if err := json.Unmarshal([]byte(v), &devices); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if len(devices) != 3 || string(devices[1].Data) != `{"rail":1}` || devices[0].Data != nil {
+			t.Fatalf("unexpected device data in %#v", devices)
+		}
+		waitForJob(t, np, podUID)
+	})
+
+	t.Run("without the barrier when the devices are attached", func(t *testing.T) {
+		np := newDriver(t, true, acme)
+		ctx, cancel := shortRequest()
+		defer cancel()
+		adjust, _, err := np.CreateContainer(ctx, pod, ctr)
+		if err != nil {
+			t.Fatalf("CreateContainer: %v", err)
+		}
+		if got := hookPaths(adjust); !reflect.DeepEqual(got, []string{"/opt/acme/bin/acme-hook --post"}) {
+			t.Fatalf("hooks = %v", got)
+		}
+	})
+
+	t.Run("once per pod: until a container carrying them starts", func(t *testing.T) {
+		np := newDriver(t, true, acme)
+		// The first start failed (no StartContainer): the retry, or the next
+		// container, carries the hooks again.
+		for _, name := range []string{"init", "init"} {
+			adjust, _, err := np.CreateContainer(context.Background(), pod, &api.Container{Name: name})
+			if err != nil || len(hookPaths(adjust)) != 1 {
+				t.Fatalf("expected the hooks on %s before any container started, got %v, %v", name, hookPaths(adjust), err)
+			}
+		}
+		if err := np.StartContainer(context.Background(), pod, &api.Container{Name: "init"}); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"sidecar", "app", "app"} {
+			adjust, _, err := np.CreateContainer(context.Background(), pod, &api.Container{Name: name})
+			if err != nil || adjust.GetHooks() != nil {
+				t.Fatalf("expected no hooks on %s after the first container started, got %#v, %v", name, adjust.GetHooks(), err)
+			}
+		}
+		cfg, _ := np.podConfigStore.GetDeviceConfig(podUID, "dev0")
+		if !cfg.RuntimeHookDone {
+			t.Fatal("expected the completion to be recorded with the device")
+		}
+		// A new sandbox runs them again (the reset also clears Attached;
+		// restore it so only the hook state is under test).
+		if _, err := np.podConfigStore.ResetAttachProgress(podUID); err != nil {
+			t.Fatal(err)
+		}
+		if err := np.podConfigStore.SetDeviceAttached(podUID, "dev0", true); err != nil {
+			t.Fatal(err)
+		}
+		adjust, _, err := np.CreateContainer(context.Background(), pod, ctr)
+		if err != nil || len(hookPaths(adjust)) != 1 {
+			t.Fatalf("expected the hooks again after a reset, got %v, %v", hookPaths(adjust), err)
+		}
+	})
+
+	t.Run("StartContainer without hooks is a no-op", func(t *testing.T) {
+		np := newDriver(t, true, nil)
+		if err := np.StartContainer(context.Background(), pod, ctr); err != nil {
+			t.Fatal(err)
+		}
+		if err := np.StartContainer(context.Background(), deadlineTestPod("unknown"), ctr); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("no hooks when the provider set none", func(t *testing.T) {
+		np := newDriver(t, true, nil)
+		adjust, _, err := np.CreateContainer(context.Background(), pod, ctr)
+		if err != nil {
+			t.Fatalf("CreateContainer: %v", err)
+		}
+		if adjust.GetHooks() != nil {
+			t.Fatalf("expected no hooks, got %#v", adjust.Hooks)
+		}
+	})
+
+	t.Run("chain over the maximum fails the container", func(t *testing.T) {
+		var hooks []*apis.RuntimeHook
+		for i := 0; i*apis.RuntimeHookMaxTimeoutSeconds <= apis.RuntimeHookChainMaxTimeoutSeconds; i++ {
+			hooks = append(hooks, &apis.RuntimeHook{Path: "/opt/slow/hook" + string(rune('a'+i)), TimeoutSeconds: apis.RuntimeHookMaxTimeoutSeconds})
+		}
+		np := newDriver(t, true, hooks...)
+		_, _, err := np.CreateContainer(context.Background(), pod, ctr)
+		if err == nil || !strings.Contains(err.Error(), "over the maximum") {
+			t.Fatalf("expected the chain cap error, got %v", err)
+		}
+	})
 }
 
 // TestCreateContainerSkipsResumeWhenAttached verifies that a pod whose devices

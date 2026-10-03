@@ -13,11 +13,13 @@ starting before all of its devices are attached.
 
 | Setting | Owner | Default | Scope |
 |---|---|---|---|
-| `plugin_request_timeout` | containerd, `[plugins."io.containerd.nri.v1.nri"]` | `2s` | Every NRI request to DRANET: `RunPodSandbox`, `CreateContainer`, `StopPodSandbox`, `RemovePodSandbox`. A reply after the deadline disconnects the plugin and the runtime continues as if the request had succeeded. |
-| `--runtime-request-timeout` | kubelet | `2m` | Every CRI call, including the whole `RunPodSandbox` (CNI and all NRI plugins) and each `CreateContainer`. |
-| Pod worker retry | kubelet, not configurable | `10s`, with up to 50% jitter | How soon the kubelet retries a Pod after a failed container creation. |
+| `plugin_request_timeout` | containerd, `[plugins."io.containerd.nri.v1.nri"]` | `2s` | Every NRI request to DRANET: `RunPodSandbox`, `CreateContainer`, `StartContainer`, `StopPodSandbox`, `RemovePodSandbox`. A reply after the deadline disconnects the plugin and the runtime continues as if the request had succeeded. |
+| `--runtime-request-timeout` | kubelet | `2m` | Every CRI call, including the whole `RunPodSandbox` (CNI and all NRI plugins), each `CreateContainer` and each `StartContainer`, which runs the OCI hooks. |
+| Pod worker retry | kubelet, not configurable | `10s`, with up to 50% jitter | How soon the kubelet retries a Pod after a container failed to create or to start. |
 | `--device-attach-timeout` | DRANET | `30s`, at most `60s` | Time allowed to attach a Pod's devices once `RunPodSandbox` had to return before they were all attached. `0` disables deferring: the sandbox fails instead. |
-| Hook `timeout` | DRANET, per container | remaining attach time | The runtime kills the OCI hook and fails the container creation when it expires. |
+| Hook `timeout` | DRANET, per container | remaining attach time | The runtime kills the OCI hook and fails the container start when it expires. |
+| Provider hook `timeoutSeconds` | profile provider, per hook | `10`, at most `30` | Same mechanism, for the hooks a profile provider adds after DRANET's. |
+| Hook chain | DRANET, per container | at most `90s` | Upper bound on the sum of the timeouts of a container's hooks: the longest barrier and one provider hook at its maximum always fit; a container whose chain is longer fails to create. |
 
 Attaching one device takes a few hundred milliseconds on some hardware, so a
 Pod that claims several devices does not fit in the default NRI request
@@ -27,9 +29,14 @@ describes what DRANET does when the attach does not fit.
 
 ### Pod lifecycle
 
-The sandbox and the containers are created by different CRI calls. DRANET
-takes part in both through NRI, and in container creation also through an
-OCI hook executed by the low-level runtime (runc).
+The sandbox is created by one CRI call, and each container by two:
+`CreateContainer` builds the container's OCI spec, and `StartContainer` has
+the low-level runtime (runc) create the container and then start its
+process. runc executes the OCI `createRuntime` hooks of the spec between
+those two steps, when the container's namespaces exist and before its
+process runs. DRANET takes part through NRI in the sandbox creation and in
+both container calls, and through the `createRuntime` hooks it adds to the
+spec.
 
 ```mermaid
 sequenceDiagram
@@ -56,27 +63,32 @@ sequenceDiagram
     C->>D: NRI CreateContainer (budget: plugin_request_timeout)
     D->>D: wait on the job up to budget - 200ms
     alt job ended
-        D-->>C: adjustment: RDMA char devices
+        D-->>C: adjustment: RDMA char devices, provider hooks
     else job still running
-        D-->>C: adjustment: RDMA char devices + createRuntime hook dranet-hook
+        D-->>C: adjustment: RDMA char devices, hook dranet-hook, provider hooks
     end
+    C-->>K: created
+    K->>C: StartContainer
     C->>R: create
     R->>D: dranet-hook: GET /wait?pod=UID (blocks)
     D-->>R: 200 all attached, or 500 with the reason
+    R->>R: provider hooks, in order
     R-->>C: created, or create failed with the hook's stderr
-    C-->>K: created, or error (kubelet retries in ~10s)
-    K->>C: StartContainer
+    C->>D: NRI StartContainer (records that the hooks ran)
+    C->>R: start
+    C-->>K: started, or error (kubelet creates a new container in ~10s)
 
     note over K,R: Next containers
     K->>C: CreateContainer
     C->>D: NRI CreateContainer
-    D-->>C: adjustment: RDMA char devices (devices attached, no hook)
+    D-->>C: adjustment: RDMA char devices (devices attached, hooks ran)
+    K->>C: StartContainer
 ```
 
 The sandbox is reported ready to the kubelet when `RunPodSandbox` returns.
-The kubelet then pulls the images and creates the containers, so with a
-deferred attach the image pulls and the remaining device attach run at the
-same time.
+The kubelet then pulls the images and creates and starts the containers, so
+with a deferred attach the image pulls and the remaining device attach run
+at the same time.
 
 ### Attach job
 
@@ -117,14 +129,16 @@ fails its container start; the kubelet recreates the container and its
 For each container of the Pod the NRI `CreateContainer` hook checks the Pod's
 job:
 
-* All devices attached: the container is created.
+* All devices attached: the container is created without a hook.
 * Job still running and the hook binary is configured: DRANET adds
   `dranet-hook` to the container as an OCI `createRuntime` hook, with the
-  Pod's remaining attach time as the hook timeout. The runtime runs the hook
-  on the host before the container is created; the hook blocks until the job
-  ends. On success the container is created; on failure the hook exits
-  non-zero with the reason, the container creation fails, the message appears
-  in the Pod's events, and the kubelet retries.
+  Pod's remaining attach time as the hook timeout. When the kubelet starts
+  the container, runc runs the hook on the host after it created the
+  container's namespaces and before it runs the process; the hook blocks
+  until the job ends. On success the process starts; on failure the hook
+  exits non-zero with the reason, the container start fails, the message
+  appears in the Pod's `Failed` event, and the kubelet creates a new
+  container.
 * Job still running and no hook binary (`--hook-path=`): the container
   creation fails with the progress (`4/6 attached`) and the kubelet retries
   about ten seconds later. This is the fallback when the hook cannot be
@@ -134,33 +148,54 @@ job:
   `NetworkDeviceAttachFailed`. The sandbox stays and the kubelet keeps
   retrying this error; delete the Pod to start over.
 
-No container of the Pod runs before every device the Pod claimed is attached
-and configured.
+No process of the Pod's containers runs before every device the Pod claimed
+is attached and configured.
+
+When a profile provider returned a runtime hook for a device of the Pod (see
+[Webhook Providers](../contributing/webhook-providers.md#runtime-hook-api-runtimehook-true)),
+DRANET runs it once per Pod, before the Pod's first container runs: it adds
+the hook, after its own, to the containers it creates until one of them
+starts, whether or not the attach was deferred, one hook per distinct path
+and arguments. runc executes hooks in list order and stops at the first
+failure, so a provider hook runs with every device attached and configured
+and never needs the wait endpoint. The runtime calls NRI `StartContainer`
+once runc created the container, so when DRANET receives it every hook of
+the container exited `0`; DRANET records this in the checkpoint and the
+later containers of the Pod, and restarts, are created without the hooks.
+A new sandbox runs them again. The hooks execute inside the runtime's
+`StartContainer`, which the kubelet bounds with `--runtime-request-timeout`;
+the per-hook and chain limits above keep the chain well inside it.
+
+DRANET is scoped to the Pod's network namespace, and so are the provider
+hooks: they may change network state in that namespace and nothing else.
+They receive the Pod and its devices, not the container, and must not use
+the OCI container state the runtime writes on their stdin.
 
 ### Pods with several containers
 
 The barrier is a property of the Pod, not of a container: all containers of
 a Pod share one network namespace, so all of them wait for the same job.
 
-* The kubelet creates a Pod's containers one at a time, in order: init
-  containers first, then application containers. The first container created
-  carries the hook and waits; by the time the kubelet creates the next ones
-  the job has ended, so they are created without a hook and without delay.
+* The kubelet creates and starts a Pod's containers one at a time, in
+  order: init containers first, then application containers. The first
+  container carries the hooks and waits in its start; by the time the
+  kubelet creates the next ones the job has ended and the provider hooks
+  ran, so they are created without hooks and start without delay.
 * Init containers, restartable init containers (sidecars), application
   containers, and ephemeral containers (`kubectl debug`) all go through
-  `CreateContainer` and are gated the same way. A container that does not use
-  the devices waits like the others; it shares the namespace that is being
-  set up.
+  `CreateContainer` and `StartContainer` and are gated the same way. A
+  container that does not use the devices waits like the others; it shares
+  the namespace that is being set up.
 * A container restart after a crash creates a new container; the Pod's
-  devices are already attached, so no hook is injected and the restart is
-  not delayed.
+  devices are already attached and the provider hooks ran, so no hook is
+  injected and the restart is not delayed.
 * A Pod with several `ResourceClaims` has one job for all of its devices.
 * If the kubelet ever creates two containers of a Pod at the same time, they
   share the job; DRANET holds no lock while waiting, so neither delays the
   other's request.
 * A hook that fails leaves the other containers unaffected: the kubelet
-  retries the failed one, and DRANET starts a new job for the remaining
-  devices if the deadline has not passed.
+  creates a new container in place of the failed one, and DRANET starts a
+  new job for the remaining devices if the deadline has not passed.
 
 ### Behavior changes
 
@@ -169,10 +204,10 @@ a Pod share one network namespace, so all of them wait for the same job.
 | Attach fits in the NRI request | All devices attached in `RunPodSandbox`. | Unchanged. |
 | Attach does not fit in the NRI request | The runtime disconnected DRANET at the deadline and started the Pod with the devices attached so far. After five disconnects DRANET exited. | `RunPodSandbox` returns before the deadline; the Pod's containers wait for the job through the OCI hook, or the sandbox fails when `--device-attach-timeout=0`. DRANET stays connected. |
 | A device fails to attach in `RunPodSandbox` | The sandbox fails. | Unchanged. |
-| A device fails to attach after `RunPodSandbox` returned | Not possible. | The container creation fails with the reason; a new job attaches the remaining devices until the deadline, then `NetworkDeviceAttachFailed`. |
+| A device fails to attach after `RunPodSandbox` returned | Not possible. | The container start fails with the reason (the creation, without the hook binary); a new job attaches the remaining devices until the deadline, then `NetworkDeviceAttachFailed`. |
 | Pod events | `NetworkDeviceAttachFailed` on an attach error. | Also `NetworkDeviceAttachDeferred`, `NetworkDeviceAttachTimeout`, and `NetworkDeviceAttachFailed` when the deadline passes. The kubelet's `Failed` event carries the hook's reason. |
 | `ResourceClaim` status | Written once per claim when `RunPodSandbox` finished. | Written per device as each is attached, with one field manager per device (`dra.net/<device>`), so progress is visible while the job runs. |
-| Container OCI spec | RDMA character devices. | RDMA character devices, plus a `createRuntime` hook on containers created while the job runs (visible with `crictl inspect` under `hooks.createRuntime`). |
+| Container OCI spec | RDMA character devices. | RDMA character devices, plus a `createRuntime` hook on containers created while the job runs, and the profile provider's hooks when it returned one (visible with `crictl inspect` under `hooks.createRuntime`). |
 | Node | None. | `dranet-hook` installed under `/opt/dranet/bin` by an init container; the daemon serves `/var/run/dranet/hook.sock`. |
 | Flags | None. | `--device-attach-timeout`, `--hook-path`. |
 | Metrics | NRI request counts and latency. | Also the attach, barrier and hook metrics listed below. |
@@ -188,42 +223,52 @@ profile providers of the preparation side (see
 [Webhook Providers](../contributing/webhook-providers.md)). It follows the
 same rule as the providers: DRANET passes the hook everything it decided for
 the Pod, so the hook does not look the Pod or its devices up elsewhere while
-they are changing. `--hook-path` selects the binary, `dranet-hook` by default;
-any binary that implements this contract can replace it.
+they are changing. DRANET's own hook, `dranet-hook`, waits for the attach;
+the hooks a profile provider returns run after it. All of them receive the
+same environment.
 
-The runtime executes the hook as `<path> wait`, as an OCI `createRuntime`
-hook, with this environment:
+The runtime executes DRANET's hook as `<path> wait`, and a provider's hook as
+`<path> <args>`, as OCI `createRuntime` hooks, with this environment:
 
 | Variable | Content |
 |---|---|
 | `DRANET_POD_UID` | UID of the Pod. |
 | `DRANET_POD_NAMESPACE`, `DRANET_POD_NAME` | Namespace and name of the Pod. |
-| `DRANET_CONTAINER_NAME` | Name of the container being created. |
 | `DRANET_NETNS` | Path of the Pod's network namespace. |
 | `DRANET_SOCKET` | Unix socket serving the wait endpoint below. |
 | `DRANET_DEVICES` | JSON array with one entry per device of the Pod. |
+
+The environment names the Pod and its devices, never the container: the
+hooks are scoped to the network namespace.
 
 Each `DRANET_DEVICES` entry has the device name used in the `ResourceSlice`
 and the `ResourceClaim`, the claim (`namespace`, `name`), the identifiers of
 the device on the host (`host`: `name`, `mac_address`, `pci_address`, the same
 object the providers receive), the interface name inside the Pod
-(`interface`), the RDMA link device (`rdmaLinkDev`), and the network
-configuration DRANET applies inside the Pod (`config`, a `NetworkConfig`):
+(`interface`), the RDMA link device (`rdmaLinkDev`), the network
+configuration DRANET applies inside the Pod (`config`, a `NetworkConfig`),
+and the data the profile provider attached to its hook for this device
+(`data`, opaque to DRANET):
 
 ```json
 [{"name": "slow0",
   "claim": {"namespace": "default", "name": "pod-slow-attach-nics-mlrz9"},
   "host": {"name": "slow0", "mac_address": "3a:f7:45:09:67:38"},
   "interface": "slow0",
-  "config": {"interface": {"name": "slow0"}}}]
+  "config": {"interface": {"name": "slow0"}},
+  "data": {"fabric": "a", "rail": 1}}]
 ```
 
-The OCI container state on stdin is not needed. The hook:
+The runtime writes the OCI container state on the hook's stdin; a hook must
+not use it. The container is not the hook's concern, only the Pod's network
+namespace at `DRANET_NETNS`. A hook:
 
-* Exits `0` only after the DRANET daemon reports the Pod's devices attached.
+* Exits `0` only after the DRANET daemon reports the Pod's devices attached
+  (DRANET's hook), or after its post-configuration is applied (a provider's
+  hook, which runs after DRANET's).
 * Exits non-zero, with the reason on stderr, in every other case, including
-  when the daemon is not reachable. The container must not be created
-  without its devices.
+  when the daemon is not reachable. The container must not start without
+  its devices.
 
 The daemon serves the wait endpoint on `/var/run/dranet/hook.sock`, in the
 host directory the DaemonSet already shares for its database:
@@ -247,7 +292,7 @@ The request blocks until the Pod's job ends. The response body is JSON:
 
 The environment and the wait endpoint are in the dependency-free Go package
 `pkg/apis/hook`, so a hook binary stays small; the device model
-(`HookDevice`) is in `pkg/apis`.
+(`HookDevice`) and `RuntimeHook` are in `pkg/apis`.
 
 The `install` subcommand of `dranet-hook` copies the binary to a host
 directory; the DaemonSet runs it in an init container because the image has
@@ -257,12 +302,17 @@ Helm chart) must be writable and on a filesystem that allows executables
 
 ### Extending
 
-A provider that needs to act on the node when a Pod's containers are created,
-with the devices already in the Pod's namespace, ships its own hook binary
-and points `--hook-path` at it. The binary waits on `DRANET_SOCKET` first,
-then does its work with the data in its environment. It replaces
-`dranet-hook`; there is one hook, and DRANET does not chain hooks of other
-components.
+A profile provider that needs to act on the Pod's network namespace once the
+devices are in it, before the Pod's first container runs, returns a runtime
+hook from `GetRuntimeHook` at prepare time. DRANET records it with the
+device and runs it once per Pod after its own hook, with the provider's
+`data` in the device's `DRANET_DEVICES` entry. The provider ships the binary
+to the node; DRANET does not install it. The hook may only change network
+state in that namespace; it does not interact with the Pod's containers.
+
+`--hook-path` selects DRANET's own hook, `dranet-hook` by default, and is
+meant for its install location; the environment and the wait endpoint are
+the contract for a replacement.
 
 DRANET registers with NRI index `00`. NRI appends each plugin's hooks in
 plugin-index order and the runtime executes OCI hooks in list order, so a
@@ -273,7 +323,8 @@ DRANET is responsible for.
 Logic that attaches or configures devices belongs in the daemon, through the
 provider interfaces, not in the hook. The providers are called at
 `NodePrepareResources`, before the sandbox exists, and the attach job applies
-what they returned.
+what they returned; a provider hook only adds post-configuration on top of
+that result.
 
 ### Metrics
 
@@ -291,15 +342,17 @@ do when it moves.
 | `attach_deadline_exceeded_total` | Container creations refused because the Pod's devices were not attached within `--device-attach-timeout`. | The Pod does not start and the kubelet keeps retrying: delete the Pod to start over, read its `NetworkDeviceAttachFailed` event for the device error. |
 | `hook_waits_total{result}` | Waits of `dranet-hook`: `released` (container started), `failed` (attach failed, the start failed with the reason), `abandoned` (the runtime killed the hook at its timeout). | `failed` and `abandoned` come with a `NetworkDeviceAttach` event on the Pod; `abandoned` also means `--device-attach-timeout` ran out while a container waited. |
 | `hook_wait_duration_seconds` | Time containers spent at the barrier. | Start latency added to Pods; raise `plugin_request_timeout` so the attach completes in `RunPodSandbox`. |
-| `container_hooks_total{type}` | `createRuntime` hooks added to containers: `barrier` (`dranet-hook`). Counted per container, so kubelet retries count again. | `barrier` growing means attaches are being deferred. |
-| `nri_plugin_requests_total{method,status}`, `nri_plugin_requests_latency_seconds{method,status}` | Every NRI request. | A latency close to `nri_request_timeout_seconds` on any method risks a disconnect. |
+| `container_hooks_total{type}` | `createRuntime` hooks added to containers: `barrier` (`dranet-hook`) and `provider` (a profile provider's hook). Counted per container, so kubelet retries count again. | `barrier` growing means attaches are being deferred. |
+| `runtime_hooks_completed_total` | Pods whose provider hooks ran (a container carrying them reached its start). | When it lags behind `container_hooks_total{type="provider"}`, the hooks fail or time out; the Pod's `Failed` events have the hook's stderr. |
+| `nri_plugin_requests_total{method,status}`, `nri_plugin_requests_latency_seconds{method,status}` | Every NRI request, including `StartContainer`. | A latency close to `nri_request_timeout_seconds` on any method risks a disconnect. |
 
 ### Containerd settings that affect the barrier
 
 * `reject_oci_hook_adjustment` in the NRI default validator refuses hooks
   injected by NRI plugins; with it enabled, containers of a Pod whose
-  attach is still running fail to create with a validation error. Leave it
-  disabled or do not defer (`--device-attach-timeout=0`).
+  attach is still running, or whose profile has a provider hook, fail to
+  create with a validation error. Leave it disabled or do not defer
+  (`--device-attach-timeout=0`) and use profiles without hooks.
 * `required_plugins` in the same validator makes the runtime reject a
   container that DRANET did not process, for example while DRANET is
   disconnected. It is the containerd-side guard for the case where the NRI
@@ -310,10 +363,10 @@ do when it moves.
 
 `kubectl describe pod` shows the containers in `ContainerCreating` while the
 hook waits, and the events in order: `NetworkDeviceAttachDeferred` with the
-devices attached at sandbox creation, then `Created` and `Started` once the
-job ends. A failed attach shows a `Failed` event whose message ends with the
-hook's reason, for example `network devices not attached (4/6): error moving
-network device ... to namespace ...`.
+devices attached at sandbox creation, `Created`, then `Started` once the job
+ends. A failed attach shows a `Failed` event for the container start whose
+message contains the hook's reason, for example `network devices not
+attached (4/6): error moving network device ... to namespace ...`.
 
 `kubectl get resourceclaim -o yaml` shows `status.devices` growing as devices
 are attached. The DRANET log of the node reports `RunPodSandbox returning

@@ -185,7 +185,6 @@ dump_debug_info() {
   run jq -r '.info.runtimeSpec.hooks.createRuntime[0].env[]' <<<"$spec"
   assert_output --partial "DRANET_POD_UID=$(kubectl get pod "$POD" -o jsonpath='{.metadata.uid}')"
   assert_output --partial "DRANET_POD_NAME=$POD"
-  assert_output --partial "DRANET_CONTAINER_NAME=agnhost"
   assert_output --partial "DRANET_NETNS=/var/run/netns/"
   assert_output --partial "DRANET_SOCKET=/var/run/dranet/hook.sock"
   devices=$(jq -r '.info.runtimeSpec.hooks.createRuntime[0].env[] | select(startswith("DRANET_DEVICES=")) | sub("^DRANET_DEVICES="; "")' <<<"$spec")

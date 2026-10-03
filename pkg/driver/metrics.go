@@ -35,6 +35,7 @@ const (
 	methodStopPodSandbox          = "StopPodSandbox"
 	methodRemovePodSandbox        = "RemovePodSandbox"
 	methodCreateContainer         = "CreateContainer"
+	methodStartContainer          = "StartContainer"
 )
 
 // Results of attaching a Pod's devices, as seen by RunPodSandbox and by the
@@ -56,7 +57,8 @@ const (
 
 // Kinds of OCI createRuntime hooks added to containers; see containerHooksTotal.
 const (
-	hookTypeBarrier = "barrier"
+	hookTypeBarrier  = "barrier"
+	hookTypeProvider = "provider"
 )
 
 var registerMetricsOnce sync.Once
@@ -78,6 +80,7 @@ func registerMetrics() {
 		prometheus.MustRegister(hookWaitsTotal)
 		prometheus.MustRegister(hookWaitDurationSeconds)
 		prometheus.MustRegister(containerHooksTotal)
+		prometheus.MustRegister(runtimeHooksCompletedTotal)
 	})
 }
 
@@ -191,7 +194,15 @@ var (
 		Namespace: "dranet",
 		Subsystem: "driver",
 		Name:      "container_hooks_total",
-		Help: "OCI createRuntime hooks added to containers, by type: barrier (dranet-hook, added when the Pod's devices were still being attached). " +
+		Help: "OCI createRuntime hooks added to containers, by type: barrier (dranet-hook, added when the Pod's devices were still being attached) " +
+			"and provider (a profile provider's runtime hook, added to a Pod's containers until one of them starts). " +
 			"A hook is counted on every container it is added to, so kubelet retries count again.",
 	}, []string{"type"})
+	runtimeHooksCompletedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "runtime_hooks_completed_total",
+		Help: "Pods whose profile provider runtime hooks ran: a container carrying them reached its start. " +
+			"When this lags behind dranet_driver_container_hooks_total{type=\"provider\"}, the hooks fail or time out; the Pod's Failed events have the hook's stderr.",
+	})
 )

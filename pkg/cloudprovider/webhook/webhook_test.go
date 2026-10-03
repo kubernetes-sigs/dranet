@@ -385,3 +385,83 @@ func TestWebhookReleaseProfileConfigPassesClaimUID(t *testing.T) {
 		t.Fatalf("ReleaseProfileConfig failed: %v", err)
 	}
 }
+
+func TestWebhookGetRuntimeHook(t *testing.T) {
+	ctx := context.Background()
+	newServer := func(caps Capabilities, body string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case PathHealth:
+				json.NewEncoder(w).Encode(caps)
+			case PathGetRuntimeHook:
+				var req ProfileRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Config == nil || req.Config.Profile != "test-profile" || req.Claim == nil {
+					http.Error(w, "expected the same request as GetProfileConfig", http.StatusBadRequest)
+					return
+				}
+				w.Write([]byte(body))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+	}
+	claim := &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default", UID: "claim-123"}}
+	config := &apis.NetworkConfig{Profile: "test-profile"}
+
+	t.Run("declared and returned", func(t *testing.T) {
+		srv := newServer(Capabilities{ProfileProvider: true, RuntimeHook: true}, `{"path":"/opt/acme/bin/acme-hook","args":["--post"],"timeoutSeconds":5,"data":{"fabric":"a"}}`)
+		defer srv.Close()
+		provider, err := NewWebhookProvider(ctx, srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !provider.HasRuntimeHook() {
+			t.Fatal("expected the runtime hook capability")
+		}
+		hook, err := provider.GetRuntimeHook(cloudprovider.DeviceIdentifiers{}, claim, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hook == nil || hook.Path != "/opt/acme/bin/acme-hook" || len(hook.Args) != 1 || hook.TimeoutSeconds != 5 || string(hook.Data) != `{"fabric":"a"}` {
+			t.Fatalf("unexpected hook %#v", hook)
+		}
+	})
+
+	t.Run("declared, none for this device", func(t *testing.T) {
+		srv := newServer(Capabilities{ProfileProvider: true, RuntimeHook: true}, `null`)
+		defer srv.Close()
+		provider, err := NewWebhookProvider(ctx, srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hook, err := provider.GetRuntimeHook(cloudprovider.DeviceIdentifiers{}, claim, config)
+		if err != nil || hook != nil {
+			t.Fatalf("expected no hook, got %#v, %v", hook, err)
+		}
+	})
+
+	t.Run("not declared", func(t *testing.T) {
+		srv := newServer(Capabilities{ProfileProvider: true}, `{"path":"/opt/acme/bin/acme-hook"}`)
+		defer srv.Close()
+		provider, err := NewWebhookProvider(ctx, srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hook, err := provider.GetRuntimeHook(cloudprovider.DeviceIdentifiers{}, claim, config)
+		if err != nil || hook != nil {
+			t.Fatalf("expected no hook without the capability, got %#v, %v", hook, err)
+		}
+	})
+
+	t.Run("requires the profile provider capability", func(t *testing.T) {
+		srv := newServer(Capabilities{CloudProvider: true, RuntimeHook: true}, `{"path":"/opt/acme/bin/acme-hook"}`)
+		defer srv.Close()
+		provider, err := NewWebhookProvider(ctx, srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if provider.HasRuntimeHook() {
+			t.Fatal("the runtime hook capability must require the profile provider")
+		}
+	})
+}

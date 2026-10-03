@@ -27,6 +27,11 @@ spec:
   - name: app
     image: registry.k8s.io/e2e-test-images/agnhost:2.54
     command: ["sleep", "infinity"]
+  # A second container: the provider's runtime hook runs once per pod, with
+  # the first container, and not again for this one.
+  - name: second
+    image: registry.k8s.io/e2e-test-images/agnhost:2.54
+    command: ["sleep", "infinity"]
   resourceClaims:
   - name: dummy1
     resourceClaimTemplateName: dranet-python-claim

@@ -24,6 +24,7 @@ import (
 	"math"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -106,28 +107,45 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 	return adjust, update, err
 }
 
-func (np *NetworkDriver) createContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+func (np *NetworkDriver) createContainer(ctx context.Context, pod *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	logger := klog.FromContext(ctx)
 	adjust := &api.ContainerAdjustment{}
 
 	// The container must not start until every device of the Pod is attached.
+	var hooks []*api.Hook
 	if pending, _ := np.pendingDevices(podConfig); pending > 0 {
 		barrier, err := np.gateContainerOnAttach(ctx, pod)
 		if err != nil {
 			return nil, nil, err
 		}
 		if barrier != nil {
+			hooks = append(hooks, barrier)
 			containerHooksTotal.WithLabelValues(hookTypeBarrier).Inc()
-			// The attach may have progressed while waiting.
-			podConfig, _ = np.podConfigStore.GetPodConfig(types.UID(pod.GetUid()))
-			env, err := np.hookEnv(pod, ctr, podConfig)
-			if err != nil {
-				return nil, nil, err
-			}
-			barrier.Env = env
-			adjust.AddHooks(&api.Hooks{CreateRuntime: []*api.Hook{barrier}})
-			logger.V(2).Info("Added the createRuntime hook to the container", "hookTimeout", barrier.Timeout.GetValue())
 		}
+		// The attach may have progressed while waiting.
+		podConfig, _ = np.podConfigStore.GetPodConfig(types.UID(pod.GetUid()))
+	}
+	// The profile providers' hooks run after the barrier, with the devices
+	// attached and configured, once per Pod: they are added to the containers
+	// created until one of them starts (StartContainer).
+	providerHooks := runtimeHooks(podConfig)
+	containerHooksTotal.WithLabelValues(hookTypeProvider).Add(float64(len(providerHooks)))
+	hooks = append(hooks, providerHooks...)
+	if len(hooks) > 0 {
+		env, err := np.hookEnv(pod, podConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		chainTimeout := 0
+		for _, hook := range hooks {
+			hook.Env = env
+			chainTimeout += int(hook.Timeout.GetValue())
+		}
+		if chainTimeout > apis.RuntimeHookChainMaxTimeoutSeconds {
+			return nil, nil, fmt.Errorf("the hooks of pod %s/%s may take up to %ds, over the maximum of %ds for one container", pod.GetNamespace(), pod.GetName(), chainTimeout, apis.RuntimeHookChainMaxTimeoutSeconds)
+		}
+		adjust.AddHooks(&api.Hooks{CreateRuntime: hooks})
+		logger.V(2).Info("Added createRuntime hooks to the container", "hooks", len(hooks), "chainTimeout", chainTimeout)
 	}
 
 	// Containers only care about the RDMA char devices.
@@ -188,10 +206,45 @@ func (np *NetworkDriver) gateContainerOnAttach(ctx context.Context, pod *api.Pod
 	}, nil
 }
 
-// hookEnv is the environment of the createRuntime hook of a container: what
-// DRANET decided for the Pod (package apis/hook), so the hook does not look
-// the Pod or its devices up elsewhere while they change.
-func (np *NetworkDriver) hookEnv(pod *api.PodSandbox, ctr *api.Container, podConfig PodConfig) ([]string, error) {
+// runtimeHooks returns the profile providers' hooks for the Pod, one per
+// distinct path and arguments, in a stable order, or nothing once a container
+// carrying them was started. Devices sharing a hook each carry their own data
+// in the hook environment.
+func runtimeHooks(podConfig PodConfig) []*api.Hook {
+	seen := map[string]bool{}
+	var hooks []*api.Hook
+	for _, config := range podConfig.DeviceConfigs {
+		h := config.RuntimeHook
+		if h == nil || config.RuntimeHookDone {
+			continue
+		}
+		key := h.Path + "\x00" + strings.Join(h.Args, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		timeout := h.TimeoutSeconds
+		if timeout == 0 {
+			timeout = apis.RuntimeHookDefaultTimeoutSeconds
+		}
+		hooks = append(hooks, &api.Hook{
+			Path:    h.Path,
+			Args:    append([]string{filepath.Base(h.Path)}, h.Args...),
+			Timeout: api.Int(timeout),
+		})
+	}
+	sort.Slice(hooks, func(i, j int) bool {
+		return hooks[i].Path+strings.Join(hooks[i].Args, " ") < hooks[j].Path+strings.Join(hooks[j].Args, " ")
+	})
+	return hooks
+}
+
+// hookEnv is the environment of every createRuntime hook of the Pod's
+// containers: what DRANET decided for the Pod (package apis/hook), so a hook
+// does not look the Pod or its devices up elsewhere while they change. It
+// names the Pod and its devices, never the container: hooks are scoped to the
+// network namespace.
+func (np *NetworkDriver) hookEnv(pod *api.PodSandbox, podConfig PodConfig) ([]string, error) {
 	devices := make([]apis.HookDevice, 0, len(podConfig.DeviceConfigs))
 	for name, config := range podConfig.DeviceConfigs {
 		device := apis.HookDevice{
@@ -208,6 +261,9 @@ func (np *NetworkDriver) hookEnv(pod *api.PodSandbox, ctr *api.Container, podCon
 			conf := config.NetworkInterfaceConfigInPod
 			device.Config = &conf
 		}
+		if config.RuntimeHook != nil {
+			device.Data = config.RuntimeHook.Data
+		}
 		devices = append(devices, device)
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
@@ -223,11 +279,39 @@ func (np *NetworkDriver) hookEnv(pod *api.PodSandbox, ctr *api.Container, podCon
 		hookapi.EnvPodUID + "=" + pod.GetUid(),
 		hookapi.EnvPodNamespace + "=" + pod.GetNamespace(),
 		hookapi.EnvPodName + "=" + pod.GetName(),
-		hookapi.EnvContainerName + "=" + ctr.GetName(),
 		hookapi.EnvNetNS + "=" + ns,
 		hookapi.EnvSocket + "=" + hookapi.SocketPath,
 		hookapi.EnvDevices + "=" + string(devicesJSON),
 	}, nil
+}
+
+// StartContainer records that the Pod's runtime hooks ran. The runtime calls it
+// after it created the container's task, which is the OCI create that runs
+// the createRuntime hooks, and before it starts the process; reaching it means
+// every hook of the container exited 0. Later containers of the Pod are
+// created without the provider hooks.
+func (np *NetworkDriver) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid, "container", ctr.Name)
+	start := time.Now()
+	status := statusNoop
+	defer func() {
+		nriPluginRequestsTotal.WithLabelValues(methodStartContainer, status).Inc()
+		nriPluginRequestsLatencySeconds.WithLabelValues(methodStartContainer, status).Observe(time.Since(start).Seconds())
+	}()
+	podUID := types.UID(pod.GetUid())
+	podConfig, ok := np.podConfigStore.GetPodConfig(podUID)
+	if !ok || len(runtimeHooks(podConfig)) == 0 {
+		return nil
+	}
+	if err := np.podConfigStore.SetRuntimeHooksDone(podUID); err != nil {
+		status = statusFailed
+		logger.Error(err, "Failed to record that the runtime hooks ran")
+		return nil
+	}
+	status = statusSuccess
+	runtimeHooksCompletedTotal.Inc()
+	logger.V(2).Info("Runtime hooks ran for the pod")
+	return nil
 }
 
 // attachJobForContainer returns the job a container must wait on, or nil when

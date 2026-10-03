@@ -623,6 +623,25 @@ func (db *DB) GetProfileConfig(deviceName string, claim *resourceapi.ResourceCla
 	return p.GetProfileConfig(id, claim, config)
 }
 
+// GetRuntimeHook asks the profile provider for the hook to run when the Pod's
+// containers are created; nil when the provider has none.
+func (db *DB) GetRuntimeHook(deviceName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error) {
+	p, ok := db.getProfileProvider().(cloudprovider.RuntimeHookProvider)
+	if !ok {
+		return nil, nil
+	}
+
+	db.mu.RLock()
+	device, exists := db.deviceStore[deviceName]
+	db.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("device %s not found in inventory", deviceName)
+	}
+
+	return p.GetRuntimeHook(getDeviceIdentifiers(&device), claim, config)
+}
+
 // ReleaseProfileConfig delegates the teardown of a dynamic profile to the cloud provider.
 func (db *DB) ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error {
 	p := db.getProfileProvider()

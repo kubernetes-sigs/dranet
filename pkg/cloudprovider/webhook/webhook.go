@@ -40,6 +40,7 @@ const (
 	PathGetDeviceConfig      = "/GetDeviceConfig"
 	PathGetProfileConfig     = "/GetProfileConfig"
 	PathReleaseProfileConfig = "/ReleaseProfileConfig"
+	PathGetRuntimeHook       = "/GetRuntimeHook"
 	PathHealth               = "/health"
 )
 
@@ -47,6 +48,8 @@ const (
 type Capabilities struct {
 	CloudProvider   bool `json:"cloudProvider"`
 	ProfileProvider bool `json:"profileProvider"`
+	// RuntimeHook declares PathGetRuntimeHook; it requires ProfileProvider.
+	RuntimeHook bool `json:"runtimeHook,omitempty"`
 }
 
 // API Contracts (JSON payloads)
@@ -77,6 +80,10 @@ func (p *WebhookProvider) HasCloudProvider() bool {
 
 func (p *WebhookProvider) HasProfileProvider() bool {
 	return p.caps.ProfileProvider
+}
+
+func (p *WebhookProvider) HasRuntimeHook() bool {
+	return p.caps.ProfileProvider && p.caps.RuntimeHook
 }
 
 func newWebhookClient(endpoint string) (*http.Client, *url.URL, error) {
@@ -135,6 +142,7 @@ func OnWebhook(ctx context.Context, endpoint string) bool {
 
 var _ cloudprovider.CloudInstance = &WebhookProvider{}
 var _ cloudprovider.ProfileProvider = &WebhookProvider{}
+var _ cloudprovider.RuntimeHookProvider = &WebhookProvider{}
 
 // NewWebhookProvider initializes the HTTP client and fetches capabilities.
 func NewWebhookProvider(ctx context.Context, endpoint string) (*WebhookProvider, error) {
@@ -180,6 +188,9 @@ func (p *WebhookProvider) post(path string, reqPayload interface{}, respObj inte
 		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
 	}
 	if (path == PathGetProfileConfig || path == PathReleaseProfileConfig) && !p.caps.ProfileProvider {
+		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
+	}
+	if path == PathGetRuntimeHook && !p.HasRuntimeHook() {
 		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
 	}
 
@@ -262,4 +273,23 @@ func (p *WebhookProvider) ReleaseProfileConfig(id cloudprovider.DeviceIdentifier
 	}
 
 	return p.post(PathReleaseProfileConfig, req, nil)
+}
+
+// GetRuntimeHook asks the webhook for the hook to run on the node when the
+// Pod's containers are created; nil when the webhook does not declare the
+// capability or answers null.
+func (p *WebhookProvider) GetRuntimeHook(id cloudprovider.DeviceIdentifiers, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error) {
+	if !p.HasRuntimeHook() {
+		return nil, nil
+	}
+	req := ProfileRequest{
+		Device: id,
+		Claim:  claim,
+		Config: config,
+	}
+	var hook *apis.RuntimeHook
+	if err := p.post(PathGetRuntimeHook, req, &hook); err != nil {
+		return nil, err
+	}
+	return hook, nil
 }

@@ -71,6 +71,7 @@ type inventoryDB interface {
 	RequestRescan()
 	GetProfileConfig(deviceName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
 	ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
+	GetRuntimeHook(deviceName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error)
 }
 
 // WithFilter
