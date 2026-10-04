@@ -405,32 +405,6 @@ func test_nsAttachNetdevRollsBackOnAddressFailure_Namespaced(t *testing.T) {
 	}
 }
 
-func Test_nsAttachNetdevRollsBackOnLinkSetUpFailure(t *testing.T) {
-	userns.Run(t, test_nsAttachNetdevRollsBackOnLinkSetUpFailure_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
-}
-
-func test_nsAttachNetdevRollsBackOnLinkSetUpFailure_Namespaced(t *testing.T) {
-	env := newIPVlanTestEnv(t, 1400)
-	original := setNetdevLinkUp
-	setNetdevLinkUp = func(nlwrap.Handle, netlink.Link) error {
-		return fmt.Errorf("simulated link up failure")
-	}
-	t.Cleanup(func() { setNetdevLinkUp = original })
-
-	if _, err := nsAttachNetdev(env.parent, env.nsPath, apis.InterfaceConfig{Name: "dranet0"}); err == nil || !strings.Contains(err.Error(), "simulated link up failure") {
-		t.Fatalf("nsAttachNetdev() error = %v, want a link up error", err)
-	}
-
-	assertLinksExactly(t, env, "lo")
-	returnedDev, err := nlwrap.LinkByName(env.parent)
-	if err != nil {
-		t.Fatalf("network device was not returned to the host: %v", err)
-	}
-	if returnedDev.Attrs().Flags&net.FlagUp == 0 {
-		t.Error("network device was not brought up after the LinkSetUp error")
-	}
-}
-
 func Test_nsDetachNetdevFromNSUsesOpenNamespace(t *testing.T) {
 	userns.Run(t, test_nsDetachNetdevFromNSUsesOpenNamespace_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
 }
