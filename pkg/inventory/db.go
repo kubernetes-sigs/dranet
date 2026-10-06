@@ -17,10 +17,13 @@ limitations under the License.
 package inventory
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
 	"net"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -106,10 +109,9 @@ type DB struct {
 	// topology helpers to a synthetic sysfs in unit tests.
 	deviceAttributeMachineModifiers []deviceattribute.MachineModifier
 
-	// infinibandPath and pciDevicePath, when set, redirect the sysfs lookups
-	// IsIBOnlyDevice makes to a synthetic sysfs in unit tests.
-	infinibandPath string
-	pciDevicePath  string
+	// sysfsRoot, when set, redirects the sysfs reads IsIBOnlyDevice makes to a
+	// synthetic sysfs in unit tests.
+	sysfsRoot string
 }
 
 type Option func(*DB)
@@ -728,27 +730,13 @@ func (db *DB) IsIBOnlyDevice(deviceName string) bool {
 	if pciAttr.StringValue == nil {
 		return true
 	}
-	if pciBaseClass(db.pciDeviceRoot(), *pciAttr.StringValue) != pciBaseClassNetwork {
+	root := cmp.Or(db.sysfsRoot, "/sys")
+	if pciBaseClass(filepath.Join(root, "bus/pci/devices"), *pciAttr.StringValue) != pciBaseClassNetwork {
 		// eRDMA and friends: not a network controller, so no netdev exists.
 		return true
 	}
-	return !rdmaHasEthernetPort(db.infinibandRoot(), *rdmaAttr.StringValue)
-}
-
-// infinibandRoot and pciDeviceRoot return the sysfs trees IsIBOnlyDevice
-// reads, which unit tests redirect to a synthetic sysfs.
-func (db *DB) infinibandRoot() string {
-	if db.infinibandPath != "" {
-		return db.infinibandPath
-	}
-	return sysInfinibandPath
-}
-
-func (db *DB) pciDeviceRoot() string {
-	if db.pciDevicePath != "" {
-		return db.pciDevicePath
-	}
-	return sysBusPCIDevicesPath
+	layers := rdmaPortLinkLayers(filepath.Join(root, "class/infiniband"), *rdmaAttr.StringValue)
+	return !slices.Contains(layers, linkLayerEthernet)
 }
 
 // GetRDMADeviceName returns the RDMA link name (e.g. "mlx5_0") for an IB-only
@@ -769,7 +757,7 @@ func (db *DB) GetRDMADeviceName(deviceName string) (string, error) {
 // isNetworkDevice checks the class is 0x2, defined for all types of network controllers
 // https://pcisig.com/sites/default/files/files/PCI_Code-ID_r_1_11__v24_Jan_2019.pdf
 func isNetworkDevice(dev *ghw.PCIDevice) bool {
-	return dev.Class.ID == "02"
+	return dev.Class.ID == pciBaseClassNetwork
 }
 
 // isAllocatableNetworkDevice reports whether dranet can ever prepare this

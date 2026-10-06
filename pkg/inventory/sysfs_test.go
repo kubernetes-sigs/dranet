@@ -463,7 +463,7 @@ func TestPCIAddressForRDMADevice(t *testing.T) {
 	})
 }
 
-func TestRDMAHasEthernetPort(t *testing.T) {
+func TestRDMAPortLinkLayers(t *testing.T) {
 	dir := t.TempDir()
 	for port, layer := range map[string]string{
 		"rocep231s0/ports/1": "Ethernet\n",
@@ -485,17 +485,17 @@ func TestRDMAHasEthernetPort(t *testing.T) {
 
 	testCases := []struct {
 		device string
-		want   bool
+		want   []string
 	}{
-		{device: "rocep231s0", want: true},
-		{device: "mlx5_0", want: false},
-		{device: "mlx4_0", want: true},
-		{device: "noports", want: false},
-		{device: "absent", want: false},
+		{device: "rocep231s0", want: []string{"Ethernet"}},
+		{device: "mlx5_0", want: []string{"InfiniBand"}},
+		{device: "mlx4_0", want: []string{"InfiniBand", "Ethernet"}},
+		{device: "noports", want: nil},
+		{device: "absent", want: nil},
 	}
 	for _, tc := range testCases {
-		if got := rdmaHasEthernetPort(dir, tc.device); got != tc.want {
-			t.Errorf("rdmaHasEthernetPort(%q) = %v, want %v", tc.device, got, tc.want)
+		if diff := cmp.Diff(tc.want, rdmaPortLinkLayers(dir, tc.device)); diff != "" {
+			t.Errorf("rdmaPortLinkLayers(%q) mismatch (-want +got):\n%s", tc.device, diff)
 		}
 	}
 }

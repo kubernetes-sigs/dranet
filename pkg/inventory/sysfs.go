@@ -275,8 +275,6 @@ func pciAddressForNetInterface(ifName string) (*pciAddress, error) {
 
 const (
 	sysInfinibandPath = "/sys/class/infiniband/"
-	// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-bus-pci
-	sysBusPCIDevicesPath = "/sys/bus/pci/devices/"
 	// linkLayerEthernet is what an RDMA device reports when its transport rides
 	// a netdev (RoCE, iWARP). A real InfiniBand port reports "InfiniBand".
 	linkLayerEthernet = "Ethernet"
@@ -284,31 +282,34 @@ const (
 	pciBaseClassNetwork = "02"
 )
 
-// rdmaHasEthernetPort reports whether any port of an RDMA device has an
-// Ethernet link layer. Every port is checked because link layers are per
-// port: a VPI adapter (mlx4) can run port 1 as InfiniBand and port 2 as
-// Ethernet. /sys/class/infiniband is netns-tagged, but in the default shared
-// RDMA netns mode an RDMA device stays bound to the host namespace (the
-// kernel refuses to move it and mirrors it into other namespaces with compat
-// devices), so this still reads while the device's netdev lives in a pod's
-// namespace.
-func rdmaHasEthernetPort(basePath, rdmaDevName string) bool {
+// rdmaPortLinkLayers returns the link layer of every port of an RDMA device,
+// in port order, nil when its ports cannot be listed. basePath is a directory
+// holding RDMA devices, such as /sys/class/infiniband or a PCI device's
+// infiniband/ directory. Link layers are per port: a VPI adapter (mlx4) can
+// run port 1 as InfiniBand and port 2 as Ethernet.
+//
+// /sys/class/infiniband is netns-tagged, but in the default shared RDMA netns
+// mode an RDMA device stays bound to the host namespace (the kernel refuses
+// to move it and mirrors it into other namespaces with compat devices), so
+// this still reads while the device's netdev lives in a pod's namespace.
+func rdmaPortLinkLayers(basePath, rdmaDevName string) []string {
 	portsDir := filepath.Join(basePath, rdmaDevName, "ports")
 	ports, err := os.ReadDir(portsDir)
 	if err != nil {
 		klog.V(4).Infof("Could not list ports of RDMA device %s: %v", rdmaDevName, err)
-		return false
+		return nil
 	}
+	var layers []string
 	for _, port := range ports {
 		body, err := os.ReadFile(filepath.Join(portsDir, port.Name(), "link_layer"))
 		if err != nil {
 			continue
 		}
-		if strings.TrimSpace(string(body)) == linkLayerEthernet {
-			return true
+		if layer := strings.TrimSpace(string(body)); layer != "" {
+			layers = append(layers, layer)
 		}
 	}
-	return false
+	return layers
 }
 
 // pciBaseClass reads the base class byte of a PCI device ("02" for a network

@@ -988,8 +988,6 @@ func TestIsIBOnlyDevice(t *testing.T) {
 	// adapter (network class, InfiniBand on port 1 and Ethernet on port 2) and
 	// one eRDMA device (not a network class).
 	root := t.TempDir()
-	ibRoot := filepath.Join(root, "class/infiniband")
-	pciRoot := filepath.Join(root, "bus/pci/devices")
 	writeTestSysfsFile(t, root, "class/infiniband/rocep231s0/ports/1/link_layer", "Ethernet\n")
 	writeTestSysfsFile(t, root, "bus/pci/devices/0000:e7:00.0/class", "0x020000\n")
 	writeTestSysfsFile(t, root, "class/infiniband/mlx5_0/ports/1/link_layer", "InfiniBand\n")
@@ -1002,9 +1000,8 @@ func TestIsIBOnlyDevice(t *testing.T) {
 
 	device := func(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute) *DB {
 		return &DB{
-			deviceStore:    map[string]resourceapi.Device{"dev": {Name: "dev", Attributes: attrs}},
-			infinibandPath: ibRoot,
-			pciDevicePath:  pciRoot,
+			deviceStore: map[string]resourceapi.Device{"dev": {Name: "dev", Attributes: attrs}},
+			sysfsRoot:   root,
 		}
 	}
 
