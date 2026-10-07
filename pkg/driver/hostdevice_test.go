@@ -379,6 +379,32 @@ func subscribeLinkEvents(t *testing.T, index int) (<-chan []string, chan struct{
 	return result, done
 }
 
+func Test_nsAttachNetdevRollsBackOnAddressFailure(t *testing.T) {
+	userns.Run(t, test_nsAttachNetdevRollsBackOnAddressFailure_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func test_nsAttachNetdevRollsBackOnAddressFailure_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, 1400)
+	config := apis.InterfaceConfig{
+		Name: "dranet0",
+		// The first address succeeds and the duplicate makes AddrAdd fail after
+		// the link has moved into the container namespace.
+		Addresses: []string{"192.0.2.10/24", "192.0.2.10/24"},
+	}
+	if _, err := nsAttachNetdev(env.parent, env.nsPath, config); err == nil || !strings.Contains(err.Error(), "failed to set up address") {
+		t.Fatalf("nsAttachNetdev() error = %v, want an address setup error", err)
+	}
+
+	assertLinksExactly(t, env, "lo")
+	returnedDev, err := nlwrap.LinkByName(env.parent)
+	if err != nil {
+		t.Fatalf("network device was not returned to the host: %v", err)
+	}
+	if returnedDev.Attrs().Flags&net.FlagUp == 0 {
+		t.Error("network device was not brought up after the address setup error")
+	}
+}
+
 func Test_nsDetachNetdevFromNSUsesOpenNamespace(t *testing.T) {
 	userns.Run(t, test_nsDetachNetdevFromNSUsesOpenNamespace_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
 }

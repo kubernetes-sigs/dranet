@@ -49,7 +49,6 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	if err = netlink.LinkSetDown(hostDev); err != nil {
 		return nil, fmt.Errorf("failed to set %q down: %w", hostIfName, err)
 	}
-
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container network namespace %s: %w", containerNsPAth, err)
@@ -129,25 +128,32 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	if err != nil && !errors.Is(err, netlink.ErrDumpInterrupted) {
 		return nil, fmt.Errorf("failed to move interface %s to container namespace %s: %w", hostIfName, containerNsPAth, err)
 	}
+	networkData, err := setupNetdevInNS(containerNs, containerNsPAth, ifName, interfaceConfig)
+	if err != nil {
+		// Return the device to the host so the next attempt finds it there.
+		return nil, errors.Join(err, nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName))
+	}
+	return networkData, nil
+}
 
+func setupNetdevInNS(containerNs netns.NsHandle, containerNsPath string, ifName string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
 	// to avoid golang problem with goroutines we create the socket in the
 	// namespace and use it directly
 	nhNs, err := nlwrap.NewHandleAt(containerNs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get netlink handle in container namespace %s: %w", containerNsPAth, err)
+		return nil, fmt.Errorf("failed to get netlink handle in container namespace %s: %w", containerNsPath, err)
 	}
 	defer nhNs.Close()
 
 	nsLink, err := nhNs.LinkByName(ifName)
 	if err != nil {
-		return nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
+		return nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPath, err)
 	}
 
 	// Apply before the link comes up so it never answers ARP or accepts router
 	// advertisements with the wrong policy.
 	if err := applyInterfaceSysctlConfig(containerNs, ifName, interfaceConfig); err != nil {
-		rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName)
-		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
+		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPath, err)
 	}
 
 	networkData := &resourceapi.NetworkDeviceData{
@@ -163,14 +169,14 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		}
 		err = nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}})
 		if err != nil {
-			return nil, fmt.Errorf("failed to set up address %s on namespace %s: %w", address, containerNsPAth, err)
+			return nil, fmt.Errorf("failed to set up address %s on namespace %s: %w", address, containerNsPath, err)
 		}
 		networkData.IPs = append(networkData.IPs, address)
 	}
 
 	err = nhNs.LinkSetUp(nsLink)
 	if err != nil {
-		return nil, fmt.Errorf("failed to set up interface %s on namespace %s: %w", nsLink.Attrs().Name, containerNsPAth, err)
+		return nil, fmt.Errorf("failed to set up interface %s on namespace %s: %w", nsLink.Attrs().Name, containerNsPath, err)
 	}
 
 	return networkData, nil
