@@ -506,6 +506,13 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 	}
 
+	// Optional provider validation of the exact host-derived config about to be
+	// checkpointed. On error: return via PrepareResult.Err, leave the interface
+	// on the host, do not call SetDeviceConfig (kubernetes-sigs/dranet#278).
+	if err := np.netdb.ValidateHostNetworkConfig(result.Device, &deviceCfg.NetworkInterfaceConfigInPod); err != nil {
+		return fmt.Errorf("host network config validation failed for device %s: %w", result.Device, err)
+	}
+
 	if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
 		return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 	}

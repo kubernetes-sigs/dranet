@@ -54,3 +54,18 @@ type ProfileProvider interface {
 	// previously allocated for the given claim and profile.
 	ReleaseProfileConfig(id DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error
 }
+
+// HostNetworkConfigValidator is an optional interface that a cloud provider may
+// implement to validate the host-derived network configuration Dranet is about
+// to persist for a device, immediately before checkpointing via SetDeviceConfig.
+//
+// Validation is read-only: it must not mutate or restore host network state
+// (ownership boundary from kubernetes-sigs/dranet#42). On error, prepare returns
+// via PrepareResult.Err, leaves the interface on the host, and allows kubelet
+// to retry. Providers that do not implement this interface retain current
+// behavior (no-op).
+type HostNetworkConfigValidator interface {
+	// ValidateHostNetworkConfig receives the exact NetworkConfig (routes, rules,
+	// addresses, etc.) Dranet is about to persist for the given device.
+	ValidateHostNetworkConfig(id DeviceIdentifiers, config *apis.NetworkConfig) error
+}
