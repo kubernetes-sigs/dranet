@@ -15,39 +15,51 @@
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
-  name: dummy-interface-arp
+  name: dummy-interface-slaac
 spec:
   devices:
+    # Two interfaces: the first one the hook processes fails its wait and is
+    # returned to the host, the second is never moved. Both end up on the host.
     requests:
-    - name: req-dummy-arp
+    - name: req-dummy-slaac
       exactly:
         deviceClassName: dra.net
         selectors:
         - cel:
-            expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "dummy0"
+            expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "dummy1"
+    - name: req-dummy-slaac2
+      exactly:
+        deviceClassName: dra.net
+        selectors:
+        - cel:
+            expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "dummy2"
     config:
-    - opaque:
+    - requests: ["req-dummy-slaac"]
+      opaque:
         driver: dra.net
         parameters:
           interface:
-            name: dranet-arp
-            arpIgnore: 1
-            arpAnnounce: 2
-            acceptRA: 0
-            dadTransmits: 0
-            routerSolicitationDelay: 0
+            name: dranet-slaac
+            addressing: SLAAC
+    - requests: ["req-dummy-slaac2"]
+      opaque:
+        driver: dra.net
+        parameters:
+          interface:
+            name: dranet-slaac2
+            addressing: SLAAC
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: pod-arp-test
+  name: pod-slaac-test
   labels:
-    app: arp
+    app: slaac
 spec:
   containers:
-  - name: agnhost-arp
+  - name: agnhost-slaac
     image: registry.k8s.io/e2e-test-images/agnhost:2.54
     command: ["sleep", "infinity"]
   resourceClaims:
-  - name: arp-net
-    resourceClaimName: dummy-interface-arp
+  - name: slaac-net
+    resourceClaimName: dummy-interface-slaac

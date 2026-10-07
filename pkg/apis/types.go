@@ -59,7 +59,7 @@ type InterfaceConfig struct {
 	Type InterfaceType `json:"type,omitempty"`
 
 	// Addressing selects the IP address configuration strategy:
-	// "Static" (default), "DHCP", or "Unnumbered".
+	// "Static" (default), "DHCP", "SLAAC", or "Unnumbered".
 	// An empty value is treated as "Static".
 	Addressing AddressingMode `json:"addressing,omitempty"`
 
@@ -129,6 +129,54 @@ type InterfaceConfig struct {
 	// must be requested explicitly.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
 
+	// DADTransmits controls how many Duplicate Address Detection probes the
+	// interface sends for a new IPv6 address through
+	// /proc/sys/net/ipv6/conf/<iface>/dad_transmits. 0 disables DAD, which makes
+	// an autoconfigured address usable immediately instead of holding it
+	// tentative for about a second per probe.
+	// Moving the interface resets it to the destination namespace default, so it
+	// must be requested explicitly.
+	DADTransmits *int32 `json:"dadTransmits,omitempty"`
+
+	// RouterSolicitationDelay controls how long the interface waits before
+	// sending its first Router Solicitation through
+	// /proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay, in seconds.
+	// The kernel default of 1 spreads solicitations out across a shared link; 0
+	// solicits immediately, which matters when the Pod has to acquire an address
+	// within the runtime's sandbox deadline.
+	// Moving the interface resets it to the destination namespace default, so it
+	// must be requested explicitly.
+	RouterSolicitationDelay *int32 `json:"routerSolicitationDelay,omitempty"`
+
+	// RouterSolicitationInterval controls how long the interface waits before
+	// it repeats a Router Solicitation that got no answer, through
+	// /proc/sys/net/ipv6/conf/<iface>/router_solicitation_interval, in seconds.
+	// The kernel default of 4 lets one solicitation into a wait bounded by the
+	// runtime's sandbox deadline, so a lost solicitation or a delayed answer
+	// fails the sandbox. Addressing "SLAAC" defaults it to 1.
+	// Moving the interface resets it to the destination namespace default, so it
+	// must be requested explicitly.
+	RouterSolicitationInterval *int32 `json:"routerSolicitationInterval,omitempty"`
+
+	// DisableIPv6 turns IPv6 off or on for the interface through
+	// /proc/sys/net/ipv6/conf/<iface>/disable_ipv6. An interface takes the
+	// destination namespace default when it moves or is created there, and some
+	// CNI plugins disable IPv6 in the Pod namespace on IPv4-only clusters, so an
+	// interface that needs IPv6 there has to request it explicitly. Addressing
+	// "SLAAC" defaults it to false.
+	DisableIPv6 *bool `json:"disableIPv6,omitempty"`
+
+	// AddrGenMode selects how the kernel generates the interface identifier of
+	// the interface's IPv6 addresses through
+	// /proc/sys/net/ipv6/conf/<iface>/addr_gen_mode: 0 derives it from the
+	// hardware address (EUI-64), 1 generates no link-local address, 2 uses a
+	// stable secret, and 3 generates a random one. Mode 2 needs a stable_secret
+	// in the Pod namespace, which a new namespace does not have, so the kernel
+	// rejects it there. An IPVLAN child shares its parent's hardware address, so
+	// EUI-64 would give it the parent's own addresses; addressing "SLAAC" on an
+	// IPVLAN interface defaults it to 3.
+	AddrGenMode *int32 `json:"addrGenMode,omitempty"`
+
 	// VRF specifies the Virtual Routing and Forwarding domain this interface should belong to.
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.
@@ -169,6 +217,12 @@ const (
 	AddressingModeStatic AddressingMode = "Static"
 	// AddressingModeDHCP obtains network configuration via DHCP.
 	AddressingModeDHCP AddressingMode = "DHCP"
+	// AddressingModeSLAAC lets the kernel autoconfigure the interface from IPv6
+	// router advertisements instead of copying the host's addresses in. The
+	// driver enables IPv6 and router advertisement acceptance, brings the
+	// interface up, and waits for the resulting address to become usable before
+	// the Pod starts. It is valid for passthrough and IPVLAN interfaces.
+	AddressingModeSLAAC AddressingMode = "SLAAC"
 	// AddressingModeUnnumbered brings the interface up without driver configuring
 	// IP addresses or routes. Valid only for subinterfaces.
 	AddressingModeUnnumbered AddressingMode = "Unnumbered"
@@ -179,6 +233,15 @@ const (
 // moving the device itself into the Pod's network namespace (passthrough).
 func (c InterfaceConfig) IsSubinterface() bool {
 	return c.Type == InterfaceTypeIPVLAN
+}
+
+// HasIPv6Sysctls reports whether the configuration sets any of the
+// per-interface IPv6 settings. The kernel creates those settings only for an
+// interface whose MTU is at least MinIPv6MTU, so the callers that apply them
+// check the MTU first.
+func (c InterfaceConfig) HasIPv6Sysctls() bool {
+	return c.AcceptRA != nil || c.DADTransmits != nil || c.RouterSolicitationDelay != nil ||
+		c.RouterSolicitationInterval != nil || c.DisableIPv6 != nil || c.AddrGenMode != nil
 }
 
 // IPVlanConfig holds the mode and flag of an IPVLAN subinterface.

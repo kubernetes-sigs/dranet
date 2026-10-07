@@ -20,8 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -30,6 +32,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	resourcev1 "k8s.io/api/resource/v1"
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +41,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/dranet/internal/nlwrap"
 	userns "sigs.k8s.io/dranet/internal/testutils"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
@@ -1473,6 +1477,66 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 			},
 		},
 		{
+			// The addresses come from router advertisements; the merged config
+			// gets the SLAAC defaults an IPVLAN child needs.
+			name: "SLAAC subinterface is allowed without addresses",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-slaac", Namespace: "default", Name: "claim-subif-slaac"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-slaac"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: "IPVLAN", Addressing: apis.AddressingModeSLAAC}}, true
+				}
+			},
+			wantPodConfig: &PodConfig{
+				DeviceConfigs: map[string]DeviceConfig{
+					"net-dev-0": {
+						Claim: types.NamespacedName{
+							Namespace: "default",
+							Name:      "claim-subif-slaac",
+						},
+						DeviceSnapshot: &resourcev1.Device{Name: "net-dev-0"},
+						NetworkInterfaceConfigInHost: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{
+								Name: "dummy0",
+							},
+						},
+						NetworkInterfaceConfigInPod: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{
+								Name:                       "dummy0",
+								Type:                       "IPVLAN",
+								Addressing:                 apis.AddressingModeSLAAC,
+								AcceptRA:                   ptr.To[int32](2),
+								DADTransmits:               ptr.To[int32](0),
+								RouterSolicitationDelay:    ptr.To[int32](0),
+								RouterSolicitationInterval: ptr.To[int32](1),
+								DisableIPv6:                ptr.To(false),
+								AddrGenMode:                ptr.To[int32](3),
+								IPVlan:                     &apis.IPVlanConfig{Mode: apis.IPVlanModeL2, Flag: apis.IPVlanFlagBridge},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "provider-selected subinterface rejects a user hardwareAddr",
 			claim: &resourcev1.ResourceClaim{
 				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-hwaddr", Namespace: "default", Name: "claim-subif-hwaddr"},
@@ -1963,5 +2027,92 @@ func TestClearStaleRouteSources(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGetRouteInfoDropsAdvertisedRoutes covers the route inheritance behind
+// prepareDevice: with dropAdvertised set, the routes learned from router
+// advertisements are left for the Pod to re-learn, and everything else is
+// copied as before. The advertised default route is the one that matters:
+// netlink reports it with a synthesised ::/0 destination, so without the filter
+// it would be copied in as a static route that is never revalidated.
+func TestGetRouteInfoDropsAdvertisedRoutes(t *testing.T) {
+	userns.Run(t, testGetRouteInfoDropsAdvertisedRoutes_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testGetRouteInfoDropsAdvertisedRoutes_Namespaced(t *testing.T) {
+	la := netlink.NewLinkAttrs()
+	la.Name = "dummyra"
+	if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: la}); err != nil {
+		t.Fatalf("failed to add dummy link: %v", err)
+	}
+	link, err := netlink.LinkByName(la.Name)
+	if err != nil {
+		t.Fatalf("failed to get link: %v", err)
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		t.Fatalf("failed to set link up: %v", err)
+	}
+	for _, cidr := range []string{"192.0.2.5/24", "2001:db8:2::5/64"} {
+		addr, err := netlink.ParseAddr(cidr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr.Flags = unix.IFA_F_NODAD
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			t.Fatalf("failed to add address %s: %v", cidr, err)
+		}
+	}
+
+	mustCIDR := func(s string) *net.IPNet {
+		_, ipnet, err := net.ParseCIDR(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ipnet
+	}
+	gateway := net.ParseIP("fe80::1")
+	for _, route := range []*netlink.Route{
+		// What a router advertisement installs: a default route, proto ra.
+		{LinkIndex: link.Attrs().Index, Dst: mustCIDR("::/0"), Gw: gateway, Protocol: unix.RTPROT_RA, Priority: 1024},
+		// And a more specific route it may advertise too (RFC 4191).
+		{LinkIndex: link.Attrs().Index, Dst: mustCIDR("2001:db8:100::/48"), Gw: gateway, Protocol: unix.RTPROT_RA, Priority: 1024},
+		// Routes configured on the host by hand, IPv6 and IPv4.
+		{LinkIndex: link.Attrs().Index, Dst: mustCIDR("2001:db8:99::/64"), Gw: gateway, Protocol: unix.RTPROT_STATIC},
+		{LinkIndex: link.Attrs().Index, Dst: mustCIDR("10.10.0.0/24"), Protocol: unix.RTPROT_BOOT, Scope: netlink.SCOPE_LINK},
+	} {
+		if err := netlink.RouteAdd(route); err != nil {
+			t.Fatalf("failed to add route %v: %v", route, err)
+		}
+	}
+
+	handle, err := nlwrap.NewHandle()
+	if err != nil {
+		t.Fatalf("failed to open a netlink handle: %v", err)
+	}
+	defer handle.Close()
+
+	destinations := func(dropAdvertised bool) []string {
+		routes, _, err := getRouteInfo(handle, la.Name, link, dropAdvertised)
+		if err != nil {
+			t.Fatalf("getRouteInfo(dropAdvertised=%v) error: %v", dropAdvertised, err)
+		}
+		var got []string
+		for _, r := range routes {
+			got = append(got, r.Destination)
+		}
+		sort.Strings(got)
+		return got
+	}
+
+	// The IPv4 prefix route the address created is copied like any other
+	// IPv4 route; the IPv6 one is dropped by the existing proto=kernel rule.
+	want := []string{"10.10.0.0/24", "192.0.2.0/24", "2001:db8:99::/64"}
+	if diff := cmp.Diff(want, destinations(true)); diff != "" {
+		t.Errorf("getRouteInfo(dropAdvertised=true) destinations mismatch (-want +got):\n%s", diff)
+	}
+	want = []string{"10.10.0.0/24", "192.0.2.0/24", "2001:db8:100::/48", "2001:db8:99::/64", "::/0"}
+	if diff := cmp.Diff(want, destinations(false)); diff != "" {
+		t.Errorf("getRouteInfo(dropAdvertised=false) destinations mismatch (-want +got):\n%s", diff)
 	}
 }

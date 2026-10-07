@@ -203,6 +203,66 @@ wait_for_ready_pods() {
   run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/accept_ra
   assert_success
   assert_output "0"
+
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/dad_transmits
+  assert_success
+  assert_output "0"
+
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/router_solicitation_delay
+  assert_success
+  assert_output "0"
+}
+
+# Nothing sends router advertisements on a dummy interface, so this exercises the
+# other half of SLAAC: the readiness wait gives up within its budget and the
+# interface goes back to the host instead of staying in a namespace that is about
+# to be torn down. The claim takes two interfaces: whichever the hook processes
+# first fails its wait and is returned, and the other is never moved, so both
+# have to be on the host afterwards.
+@test "SLAAC addressing rolls the interfaces back when no advertisement arrives" {
+  for dev in dummy1 dummy2; do
+    docker exec "$CLUSTER_NAME"-worker bash -c "ip link add $dev type dummy"
+    docker exec "$CLUSTER_NAME"-worker bash -c "ip link set up dev $dev"
+  done
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_slaac.yaml
+
+  # The sandbox must fail rather than start the workload without an address.
+  run kubectl wait --for=condition=ready pod/pod-slaac-test --timeout=30s
+  assert_failure
+
+  # Only the rollback path produces these: an event saying the interface went
+  # back to the host, and SLAACReady=False on the claim. Checked before the pod
+  # is deleted, because teardown also returns the dummies to the host.
+  run kubectl get events --field-selector involvedObject.name=pod-slaac-test,reason=NetworkDeviceNotReady -o jsonpath='{.items[*].message}'
+  assert_success
+  assert_output --partial "did not complete IPv6 autoconfiguration"
+  assert_output --partial "returned to the host"
+  run kubectl get resourceclaim dummy-interface-slaac -o jsonpath='{.status.devices[*].conditions[?(@.type=="SLAACReady")].status}'
+  assert_success
+  assert_output --partial "False"
+
+  # Stop the kubelet's sandbox retries before looking at the host: each attempt
+  # holds the dummies inside the Pod namespace for the length of the readiness wait.
+  kubectl delete pod pod-slaac-test --wait=true --timeout=60s
+
+  # Both interfaces are back on the host, under their original names and up, so a
+  # retry would have started from the same state as the first attempt.
+  for dev in dummy1 dummy2; do
+    run docker exec "$CLUSTER_NAME"-worker bash -c "ip link show $dev"
+    assert_success
+    assert_output --partial "UP"
+  done
+  for dev in dranet-slaac dranet-slaac2; do
+    run docker exec "$CLUSTER_NAME"-worker bash -c "ip link show $dev"
+    assert_failure
+  done
+
+  kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_slaac.yaml --ignore-not-found
+  for dev in dummy1 dummy2; do
+    docker exec "$CLUSTER_NAME"-worker bash -c "ip link del $dev" || true
+  done
 }
 
 @test "dummy interface with IP addresses ResourceClaimTemplate" {

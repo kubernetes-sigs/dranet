@@ -158,6 +158,16 @@
         "featureGates": {
           "type": "string",
           "description": "Comma-separated feature gate settings in key=value format"
+        },
+        "slaacReadyTimeout": {
+          "type": "string",
+          "description": "How long to wait for an interface using addressing: SLAAC to pick up an address from IPv6 router advertisements inside the Pod, for example 1500ms.",
+          "pattern": "^[0-9]+(ns|us|ms|s|m|h)$"
+        },
+        "slaacRollbackReserve": {
+          "type": "string",
+          "description": "The least time a SLAAC wait leaves of the container runtime's request for taking the interface back out of the Pod, for example 500ms.",
+          "pattern": "^[0-9]+(ns|us|ms|s|m|h)$"
         }
       },
       "allOf": [

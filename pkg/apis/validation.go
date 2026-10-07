@@ -38,6 +38,23 @@ const (
 	MaxInterfaceNameLen = 15
 )
 
+// UnmarshalConfig unmarshals the NetworkConfig from a runtime.RawExtension as
+// written, without applying defaults. Use it for a configuration that
+// ValidateConfig has accepted and that is merged with the cloud provider
+// configuration afterwards: defaults that depend on the interface type, such
+// as the SLAAC ones, have to be applied to the merged configuration, where the
+// provider may have set the type.
+func UnmarshalConfig(raw *runtime.RawExtension) (*NetworkConfig, error) {
+	if raw == nil || len(raw.Raw) == 0 {
+		return nil, nil
+	}
+	var config NetworkConfig
+	if err := json.UnmarshalCaseSensitivePreserveInts(raw.Raw, &config); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON data: %w", err)
+	}
+	return &config, nil
+}
+
 // ValidateConfig unmarshals and validates the NetworkConfig from a runtime.RawExtension.
 // It performs strict unmarshalling and then defaults and validates the result via Validate.
 // Returns the parsed NetworkConfig and a slice of errors if any validation fails.
@@ -162,13 +179,50 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, validateSubinterfaceOnlyConfig(cfg, fieldPath)...)
 	}
 
-	if !slices.Contains([]AddressingMode{"", AddressingModeStatic, AddressingModeDHCP, AddressingModeUnnumbered}, cfg.Addressing) {
+	if !slices.Contains([]AddressingMode{"", AddressingModeStatic, AddressingModeDHCP, AddressingModeSLAAC, AddressingModeUnnumbered}, cfg.Addressing) {
 		allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' is not supported", fieldPath, cfg.Addressing))
 	}
 
 	// The deprecated dhcp field may only coexist with "DHCP" addressing.
 	if cfg.DHCP != nil && *cfg.DHCP && cfg.Addressing != "" && cfg.Addressing != AddressingModeDHCP {
 		allErrors = append(allErrors, fmt.Errorf("%s: dhcp is deprecated and conflicts with addressing '%s'", fieldPath, cfg.Addressing))
+	}
+
+	// SLAAC owns the interface's IPv6 addressing, so nothing else may configure
+	// it; IPv4 has no autoconfiguration to conflict with, so IPv4 addresses are
+	// still allowed.
+	if cfg.Addressing == AddressingModeSLAAC {
+		if cfg.DisableIPv6 != nil && *cfg.DisableIPv6 {
+			allErrors = append(allErrors, fmt.Errorf("%s.disableIPv6: true disables IPv6 and cannot be combined with addressing '%s'", fieldPath, AddressingModeSLAAC))
+		}
+		if cfg.AddrGenMode != nil {
+			switch mode := *cfg.AddrGenMode; {
+			case mode == 1:
+				// Without a link-local address the interface never solicits a
+				// router advertisement and waits for an unsolicited one.
+				allErrors = append(allErrors, fmt.Errorf("%s.addrGenMode: 1 generates no link-local address, so the interface never solicits a router advertisement, and cannot be combined with addressing '%s'", fieldPath, AddressingModeSLAAC))
+			case mode == 2:
+				// Stable privacy needs a stable_secret, which a new Pod
+				// namespace does not have and the claim cannot set.
+				allErrors = append(allErrors, fmt.Errorf("%s.addrGenMode: 2 needs a stable_secret, which the Pod namespace does not have, and cannot be combined with addressing '%s'; use 3", fieldPath, AddressingModeSLAAC))
+			case mode == 0 && cfg.IsSubinterface():
+				// An IPVLAN child shares its parent's hardware address, so
+				// EUI-64 gives it the parent's own addresses.
+				allErrors = append(allErrors, fmt.Errorf("%s.addrGenMode: 0 derives the parent's own addresses on a subinterface (type: %s), which shares its parent's hardware address, and cannot be combined with addressing '%s'; use 3", fieldPath, cfg.Type, AddressingModeSLAAC))
+			}
+		}
+		for i, addr := range cfg.Addresses {
+			prefix, err := netip.ParsePrefix(addr)
+			if err != nil {
+				continue // reported with the other address format errors below
+			}
+			if !prefix.Addr().Unmap().Is4() {
+				allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: '%s' is an IPv6 address, which addressing '%s' autoconfigures; only IPv4 addresses can be set with it", fieldPath, i, addr, AddressingModeSLAAC))
+			}
+		}
+		if cfg.AcceptRA != nil && *cfg.AcceptRA == 0 {
+			allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: 0 disables router advertisements and cannot be combined with addressing '%s'", fieldPath, AddressingModeSLAAC))
+		}
 	}
 
 	// Unnumbered is only valid for subinterfaces and cannot carry addresses.
@@ -233,9 +287,46 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: must be between 0 and 2, got %d", fieldPath, *cfg.AcceptRA))
 	}
 
-	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be set.
-	if cfg.AcceptRA != nil && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
-		allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: requires an mtu of at least %d, got %d", fieldPath, MinIPv6MTU, *cfg.MTU))
+	if cfg.DADTransmits != nil && *cfg.DADTransmits < 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s.dadTransmits: must not be negative, got %d", fieldPath, *cfg.DADTransmits))
+	}
+
+	if cfg.AddrGenMode != nil && (*cfg.AddrGenMode < 0 || *cfg.AddrGenMode > 3) {
+		allErrors = append(allErrors, fmt.Errorf("%s.addrGenMode: must be between 0 and 3, got %d", fieldPath, *cfg.AddrGenMode))
+	}
+
+	if cfg.RouterSolicitationDelay != nil && *cfg.RouterSolicitationDelay < 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s.routerSolicitationDelay: must not be negative, got %d", fieldPath, *cfg.RouterSolicitationDelay))
+	}
+
+	if cfg.RouterSolicitationInterval != nil && *cfg.RouterSolicitationInterval < 1 {
+		allErrors = append(allErrors, fmt.Errorf("%s.routerSolicitationInterval: must be at least 1, got %d", fieldPath, *cfg.RouterSolicitationInterval))
+	}
+
+	// The kernel creates no IPv6 settings below this MTU, so none of the IPv6
+	// sysctls can be set and autoconfiguration cannot run.
+	if cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
+		if cfg.Addressing == AddressingModeSLAAC {
+			// SLAAC implies the IPv6 sysctls, so report the cause once instead of
+			// once per setting it defaulted.
+			allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' requires an mtu of at least %d, got %d", fieldPath, AddressingModeSLAAC, MinIPv6MTU, *cfg.MTU))
+		} else {
+			for _, requested := range []struct {
+				field string
+				set   bool
+			}{
+				{"acceptRA", cfg.AcceptRA != nil},
+				{"dadTransmits", cfg.DADTransmits != nil},
+				{"routerSolicitationDelay", cfg.RouterSolicitationDelay != nil},
+				{"routerSolicitationInterval", cfg.RouterSolicitationInterval != nil},
+				{"disableIPv6", cfg.DisableIPv6 != nil},
+				{"addrGenMode", cfg.AddrGenMode != nil},
+			} {
+				if requested.set {
+					allErrors = append(allErrors, fmt.Errorf("%s.%s: requires an mtu of at least %d, got %d", fieldPath, requested.field, MinIPv6MTU, *cfg.MTU))
+				}
+			}
+		}
 	}
 
 	if cfg.VRF != nil {
@@ -414,6 +505,9 @@ func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
 		config.Interface.GROIPv4MaxSize != nil || config.Interface.DisableEBPFPrograms != nil ||
 		config.Interface.Forwarding != nil || config.Interface.ARPIgnore != nil ||
 		config.Interface.ARPAnnounce != nil || config.Interface.AcceptRA != nil ||
+		config.Interface.DADTransmits != nil || config.Interface.RouterSolicitationDelay != nil ||
+		config.Interface.RouterSolicitationInterval != nil ||
+		config.Interface.DisableIPv6 != nil || config.Interface.AddrGenMode != nil ||
 		config.Interface.VRF != nil || config.Interface.IPVlan != nil {
 		allErrors = append(allErrors, fmt.Errorf("interface configuration is not supported for RDMA-only devices (no network interface present)"))
 	}
