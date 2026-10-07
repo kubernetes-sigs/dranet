@@ -7,9 +7,15 @@ function setup_suite {
   # Define the name of the kind cluster
   export CLUSTER_NAME="dranet-test-cluster"
   export IMAGE_NAME="registry.k8s.io/networking/dranet"
+  export AGNHOST_IMAGE="registry.k8s.io/e2e-test-images/agnhost:2.66.1"
 
-  # Build the image
+  # Build the driver image and pre-bake ethtool into agnhost so tests do not
+  # pull images or Alpine packages at runtime inside kind pods.
   docker build -t "$IMAGE_NAME":test -f Dockerfile "$BATS_TEST_DIRNAME"/.. --load
+  docker build -t "$AGNHOST_IMAGE" - <<EOF
+FROM $AGNHOST_IMAGE
+RUN for i in 1 2 3 4 5; do apk add --no-cache ethtool && break || sleep 3; done
+EOF
 
   # Define the kind arguments in an array
   kind_args=(
@@ -33,6 +39,7 @@ function setup_suite {
   kind "${kind_args[@]}"
 
   kind load docker-image "$IMAGE_NAME":test --name "$CLUSTER_NAME"
+  kind load docker-image "$AGNHOST_IMAGE" --name "$CLUSTER_NAME"
 
   # Creating BPF and cgroup mounts on the Kind nodes.
   NODES=$(kind get nodes --name ${CLUSTER_NAME})
@@ -44,12 +51,6 @@ function setup_suite {
   _install=$(sed -e s#"$IMAGE_NAME".*#"$IMAGE_NAME":test# -e 's/--v=4/--v=4\n        - --filter=/' < "$BATS_TEST_DIRNAME"/../install.yaml)
   printf '%s' "${_install}" | kubectl apply -f -
   kubectl wait --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet
-
-  # Expose a webserver in the default namespace
-  kubectl run web --image=httpd:2 --labels="app=web" --expose --port=80
-
-  # test depend on external connectivity that can be very flaky
-  sleep 5
 }
 
 function teardown_suite {

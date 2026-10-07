@@ -1965,3 +1965,149 @@ func TestClearStaleRouteSources(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareAndUnpreparePassthroughLinkState(t *testing.T) {
+	userns.Run(t, testPrepareAndUnpreparePassthroughLinkState, syscall.CLONE_NEWNET)
+}
+
+func testPrepareAndUnpreparePassthroughLinkState(t *testing.T) {
+	ctx := t.Context()
+	const testDriverName = "test.driver"
+
+	createUpDummy := func(t *testing.T, name string) {
+		t.Helper()
+		la := netlink.NewLinkAttrs()
+		la.Name = name
+		if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: la}); err != nil {
+			t.Fatalf("LinkAdd(%s): %v", name, err)
+		}
+		link, err := netlink.LinkByName(name)
+		if err != nil {
+			t.Fatalf("LinkByName(%s): %v", name, err)
+		}
+		if err := netlink.LinkSetUp(link); err != nil {
+			t.Fatalf("LinkSetUp(%s): %v", name, err)
+		}
+	}
+
+	t.Run("passthrough link is set down during Prepare and restored during Unprepare", func(t *testing.T) {
+		const ifName = "dummy-prep"
+		createUpDummy(t, ifName)
+
+		db := newFakeInventoryDB()
+		db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) {
+			return ifName, nil
+		}
+		db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+			return resourcev1.Device{Name: deviceName}, true
+		}
+
+		np := &NetworkDriver{
+			netdb:          db,
+			driverName:     testDriverName,
+			podConfigStore: mustNewPodConfigStore(),
+			eventRecorder:  record.NewFakeRecorder(10),
+		}
+
+		claim := &resourcev1.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{UID: "claim-prep-down", Namespace: "default", Name: "claim-prep-down"},
+			Status: resourcev1.ResourceClaimStatus{
+				ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+					{Resource: "pods", Name: "pod-1", UID: "pod-prep-down"},
+				},
+				Allocation: &resourcev1.AllocationResult{
+					Devices: resourcev1.DeviceAllocationResult{
+						Results: []resourcev1.DeviceRequestAllocationResult{
+							{Driver: testDriverName, Device: "dev-0", Request: "req-0"},
+						},
+					},
+				},
+			},
+		}
+
+		res := np.prepareResourceClaim(ctx, claim)
+		if res.Err != nil {
+			t.Fatalf("prepareResourceClaim failed: %v", res.Err)
+		}
+
+		link, err := netlink.LinkByName(ifName)
+		if err != nil {
+			t.Fatalf("LinkByName(%s): %v", ifName, err)
+		}
+		if link.Attrs().Flags&syscall.IFF_UP != 0 {
+			t.Fatalf("expected %s to be set DOWN during PrepareResourceClaims, flags=%v", ifName, link.Attrs().Flags)
+		}
+
+		if err := np.unprepareResourceClaim(ctx, kubeletplugin.NamespacedObject{
+			NamespacedName: types.NamespacedName{Namespace: "default", Name: "claim-prep-down"},
+			UID:            "claim-prep-down",
+		}); err != nil {
+			t.Fatalf("unprepareResourceClaim failed: %v", err)
+		}
+
+		link, err = netlink.LinkByName(ifName)
+		if err != nil {
+			t.Fatalf("LinkByName(%s): %v", ifName, err)
+		}
+		if link.Attrs().Flags&syscall.IFF_UP == 0 {
+			t.Fatalf("expected %s to be restored UP during UnprepareResourceClaims when never moved, flags=%v", ifName, link.Attrs().Flags)
+		}
+	})
+
+	t.Run("subinterface parent link stays up during Prepare", func(t *testing.T) {
+		const ifName = "dummy-subif"
+		createUpDummy(t, ifName)
+
+		db := newFakeInventoryDB()
+		db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) {
+			return ifName, nil
+		}
+		db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+			return &apis.NetworkConfig{
+				Interface: apis.InterfaceConfig{
+					Type:       apis.InterfaceTypeIPVLAN,
+					Addressing: apis.AddressingModeUnnumbered,
+				},
+			}, true
+		}
+		db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+			return resourcev1.Device{Name: deviceName}, true
+		}
+
+		np := &NetworkDriver{
+			netdb:          db,
+			driverName:     testDriverName,
+			podConfigStore: mustNewPodConfigStore(),
+			eventRecorder:  record.NewFakeRecorder(10),
+		}
+
+		claim := &resourcev1.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{UID: "claim-subif-up", Namespace: "default", Name: "claim-subif-up"},
+			Status: resourcev1.ResourceClaimStatus{
+				ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+					{Resource: "pods", Name: "pod-2", UID: "pod-subif-up"},
+				},
+				Allocation: &resourcev1.AllocationResult{
+					Devices: resourcev1.DeviceAllocationResult{
+						Results: []resourcev1.DeviceRequestAllocationResult{
+							{Driver: testDriverName, Device: "dev-0", Request: "req-0"},
+						},
+					},
+				},
+			},
+		}
+
+		res := np.prepareResourceClaim(ctx, claim)
+		if res.Err != nil {
+			t.Fatalf("prepareResourceClaim failed: %v", res.Err)
+		}
+
+		link, err := netlink.LinkByName(ifName)
+		if err != nil {
+			t.Fatalf("LinkByName(%s): %v", ifName, err)
+		}
+		if link.Attrs().Flags&syscall.IFF_UP == 0 {
+			t.Fatalf("expected parent interface %s for ipvlan to remain UP during PrepareResourceClaims, flags=%v", ifName, link.Attrs().Flags)
+		}
+	})
+}

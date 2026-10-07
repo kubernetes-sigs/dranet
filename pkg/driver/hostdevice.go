@@ -33,41 +33,128 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// podNetnsHandle holds open netlink handles for the host and pod network
+// namespaces so RunPodSandbox can attach and configure all devices for a pod
+// without repeatedly opening namespaces, switching threads with setns, or
+// creating netlink sockets per device. Handles are initialized lazily on first
+// use.
+type podNetnsHandle struct {
+	nsPath      string
+	containerNs netns.NsHandle
+	hostHandle  nlwrap.Handle
+	hostSocket  *nl.NetlinkSocket
+	podHandle   nlwrap.Handle
+}
+
+func newPodNetnsHandle(nsPath string) *podNetnsHandle {
+	return &podNetnsHandle{
+		nsPath:      nsPath,
+		containerNs: netns.None(),
+	}
+}
+
+func (h *podNetnsHandle) ensureHost() (nlwrap.Handle, *nl.NetlinkSocket, error) {
+	if h.hostHandle.Handle == nil {
+		nh, err := nlwrap.NewHandle()
+		if err != nil {
+			return nlwrap.Handle{}, nil, fmt.Errorf("could not get host netlink handle: %w", err)
+		}
+		h.hostHandle = nh
+	}
+	if h.hostSocket == nil {
+		s, err := nl.GetNetlinkSocketAt(netns.None(), netns.None(), unix.NETLINK_ROUTE)
+		if err != nil {
+			return nlwrap.Handle{}, nil, fmt.Errorf("could not get network namespace handle: %w", err)
+		}
+		h.hostSocket = s
+	}
+	return h.hostHandle, h.hostSocket, nil
+}
+
+func (h *podNetnsHandle) ensurePod() (netns.NsHandle, nlwrap.Handle, error) {
+	if !h.containerNs.IsOpen() {
+		ns, err := netns.GetFromPath(h.nsPath)
+		if err != nil {
+			return netns.None(), nlwrap.Handle{}, fmt.Errorf("failed to get container network namespace %s: %w", h.nsPath, err)
+		}
+		h.containerNs = ns
+	}
+	if h.podHandle.Handle == nil {
+		nhNs, err := nlwrap.NewHandleAt(h.containerNs)
+		if err != nil {
+			return netns.None(), nlwrap.Handle{}, fmt.Errorf("failed to get netlink handle in container namespace %s: %w", h.nsPath, err)
+		}
+		h.podHandle = nhNs
+	}
+	return h.containerNs, h.podHandle, nil
+}
+
+func (h *podNetnsHandle) Close() {
+	if h.podHandle.Handle != nil {
+		h.podHandle.Close()
+		h.podHandle = nlwrap.Handle{}
+	}
+	if h.hostSocket != nil {
+		h.hostSocket.Close()
+		h.hostSocket = nil
+	}
+	if h.hostHandle.Handle != nil {
+		h.hostHandle.Close()
+		h.hostHandle = nlwrap.Handle{}
+	}
+	if h.containerNs.IsOpen() {
+		_ = h.containerNs.Close()
+		h.containerNs = netns.None()
+	}
+}
+
+// attachNetdev is nsAttachNetdevWithHandle behind a variable so tests can
+// simulate slow device attachment.
+var attachNetdev = nsAttachNetdevWithHandle
+
 func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
-	hostDev, err := nlwrap.LinkByName(hostIfName)
+	h := newPodNetnsHandle(containerNsPAth)
+	defer h.Close()
+	data, _, err := nsAttachNetdevWithHandle(h, hostIfName, interfaceConfig)
+	return data, err
+}
+
+func nsAttachNetdevWithHandle(h *podNetnsHandle, hostIfName string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, netlink.Link, error) {
+	containerNsPAth := h.nsPath
+	hostHandle, s, err := h.ensureHost()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get link for interface %s: %w", hostIfName, err)
+		return nil, nil, err
+	}
+
+	hostDev, err := hostHandle.LinkByName(hostIfName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get link for interface %s: %w", hostIfName, err)
 	}
 
 	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be
 	// set. Reject it before the link is touched so the host device stays usable.
 	if interfaceConfig.AcceptRA != nil && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
-		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
+		return nil, nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
 	}
 
-	// Devices can be renamed only when down
-	if err = netlink.LinkSetDown(hostDev); err != nil {
-		return nil, fmt.Errorf("failed to set %q down: %w", hostIfName, err)
+	// Devices can be renamed only when down. Skip the netlink call if
+	// PrepareResourceClaims already set the interface down.
+	if hostDev.Attrs().Flags&net.FlagUp != 0 {
+		if err = hostHandle.LinkSetDown(hostDev); err != nil {
+			return nil, nil, fmt.Errorf("failed to set %q down: %w", hostIfName, err)
+		}
 	}
 
-	containerNs, err := netns.GetFromPath(containerNsPAth)
+	containerNs, nhNs, err := h.ensurePod()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get container network namespace %s: %w", containerNsPAth, err)
+		return nil, nil, err
 	}
-	defer containerNs.Close()
 
 	attrs := hostDev.Attrs()
 
 	// copy from netlink.LinkModify(dev) using only the parts needed
 	flags := unix.NLM_F_REQUEST | unix.NLM_F_ACK
 	req := nl.NewNetlinkRequest(unix.RTM_NEWLINK, flags)
-	// Get a netlink socket in current namespace
-	s, err := nl.GetNetlinkSocketAt(netns.None(), netns.None(), unix.NETLINK_ROUTE)
-	if err != nil {
-		return nil, fmt.Errorf("could not get network namespace handle: %w", err)
-	}
-	defer s.Close()
-
 	req.Sockets = map[int]*nl.SocketHandle{
 		unix.NETLINK_ROUTE: {Socket: s},
 	}
@@ -127,27 +214,19 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 
 	_, err = req.Execute(unix.NETLINK_ROUTE, 0)
 	if err != nil && !errors.Is(err, netlink.ErrDumpInterrupted) {
-		return nil, fmt.Errorf("failed to move interface %s to container namespace %s: %w", hostIfName, containerNsPAth, err)
+		return nil, nil, fmt.Errorf("failed to move interface %s to container namespace %s: %w", hostIfName, containerNsPAth, err)
 	}
-
-	// to avoid golang problem with goroutines we create the socket in the
-	// namespace and use it directly
-	nhNs, err := nlwrap.NewHandleAt(containerNs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get netlink handle in container namespace %s: %w", containerNsPAth, err)
-	}
-	defer nhNs.Close()
 
 	nsLink, err := nhNs.LinkByName(ifName)
 	if err != nil {
-		return nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
+		return nil, nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
 	}
 
 	// Apply before the link comes up so it never answers ARP or accepts router
 	// advertisements with the wrong policy.
 	if err := applyInterfaceSysctlConfig(containerNs, ifName, interfaceConfig); err != nil {
 		rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName)
-		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
+		return nil, nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
 	}
 
 	networkData := &resourceapi.NetworkDeviceData{
@@ -163,17 +242,17 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		}
 		err = nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}})
 		if err != nil {
-			return nil, fmt.Errorf("failed to set up address %s on namespace %s: %w", address, containerNsPAth, err)
+			return nil, nil, fmt.Errorf("failed to set up address %s on namespace %s: %w", address, containerNsPAth, err)
 		}
 		networkData.IPs = append(networkData.IPs, address)
 	}
 
 	err = nhNs.LinkSetUp(nsLink)
 	if err != nil {
-		return nil, fmt.Errorf("failed to set up interface %s on namespace %s: %w", nsLink.Attrs().Name, containerNsPAth, err)
+		return nil, nil, fmt.Errorf("failed to set up interface %s on namespace %s: %w", nsLink.Attrs().Name, containerNsPAth, err)
 	}
 
-	return networkData, nil
+	return networkData, nsLink, nil
 }
 
 func nsDetachNetdev(containerNsPAth string, devName string, outName string) error {

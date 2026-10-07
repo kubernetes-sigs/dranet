@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
+	"github.com/vishvananda/netlink"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +40,32 @@ import (
 // The NRI hooks are time sensitive, any slow operation needs to be added on the DRA hooks and only
 // the information necessary should passed to the NRI hooks via the np.podConfigStore so it can be executed
 // quickly.
+
+// defaultNRIReplyMargin is the time reserved at the end of an NRI request for
+// the reply to reach the runtime before its plugin_request_timeout fires.
+const defaultNRIReplyMargin = 200 * time.Millisecond
+
+// errNRIBudgetExceeded is returned when attaching the Pod's devices does not fit
+// in the NRI request budget. The runtime treats a plugin error returned before
+// its deadline as a failure of the sandbox (cleaning up the network namespace
+// and letting the kubelet retry), whereas a reply after the deadline
+// disconnects the plugin and starts the Pod without its devices.
+var errNRIBudgetExceeded = errors.New("not enough time left in the NRI request to attach all the network devices; increase the container runtime NRI plugin_request_timeout")
+
+func requestBudget(ctx context.Context, margin time.Duration) (context.Context, context.CancelFunc) {
+	if margin <= 0 {
+		margin = defaultNRIReplyMargin
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return ctx, func() {}
+	}
+	return context.WithDeadline(ctx, deadline.Add(-margin))
+}
+
+func (np *NetworkDriver) requestBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+	return requestBudget(ctx, np.nriReplyMargin)
+}
 
 func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
 	logger := klog.FromContext(ctx)
@@ -144,8 +171,13 @@ func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox)
 	}
 	return err
 }
+
 func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
 	logger := klog.FromContext(ctx)
+	podUID := types.UID(pod.GetUid())
+	if deadline, ok := ctx.Deadline(); ok {
+		nriRequestTimeoutSeconds.Set(time.Until(deadline).Round(100 * time.Millisecond).Seconds())
+	}
 	// get the pod network namespace
 	ns := getNetworkNamespace(pod)
 	// host network pods can not allocate network devices because it impact the host
@@ -153,77 +185,68 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 		return fmt.Errorf("RunPodSandbox pod %s/%s using host network can not claim host devices", pod.Namespace, pod.Name)
 	}
 	// store the Pod network namespace in the pod config store
-	np.podConfigStore.SetPodNetNs(types.UID(pod.GetUid()), ns)
+	np.podConfigStore.SetPodNetNs(podUID, ns)
+
+	total := len(podConfig.DeviceConfigs)
+	if total == 0 {
+		return nil
+	}
+
+	nsHandle := newPodNetnsHandle(ns)
+	defer nsHandle.Close()
+
+	budgetCtx, cancel := np.requestBudget(ctx)
+	defer cancel()
+	budgetDeadline, hasDeadline := budgetCtx.Deadline()
+
+	failTimeout := func(attached int) error {
+		sandboxAttachTotal.WithLabelValues(attachResultRejected).Inc()
+		np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachTimeout",
+			"attached %d/%d network devices to pod %s/%s within the container runtime NRI request timeout; failing the sandbox so the pod does not start with missing devices. Increase the container runtime NRI plugin_request_timeout",
+			attached, total, pod.GetNamespace(), pod.GetName())
+		logger.Info("RunPodSandbox out of request budget, failing the sandbox", "attached", attached, "total", total)
+		return fmt.Errorf("attached %d/%d network devices: %w", attached, total, errNRIBudgetExceeded)
+	}
 
 	// Track all the status updates needed for the resource claims of the pod.
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
-	// Process the configurations of the ResourceClaim
+	loopStart := time.Now()
+	attached := 0
 	for deviceName, config := range podConfig.DeviceConfigs {
+		if budgetCtx.Err() != nil || (hasDeadline && attached > 0 && time.Until(budgetDeadline) < time.Since(loopStart)/time.Duration(attached)) {
+			return failTimeout(attached)
+		}
 		logger.V(4).Info("RunPodSandbox processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
+		deviceStart := time.Now()
+		resourceClaimStatusDevice, err := np.attachDevice(ctx, pod, ns, nsHandle, deviceName, config)
+		if err != nil {
+			deviceAttachDurationSeconds.WithLabelValues(attachResultFailed).Observe(time.Since(deviceStart).Seconds())
+			sandboxAttachTotal.WithLabelValues(attachResultFailed).Inc()
+			return err
+		}
+		deviceAttachDurationSeconds.WithLabelValues(attachResultAttached).Observe(time.Since(deviceStart).Seconds())
+		attached++
+		if budgetCtx.Err() != nil {
+			return failTimeout(attached)
+		}
+
 		resourceClaim := types.NamespacedName{Name: config.Claim.Name, Namespace: config.Claim.Namespace}
 		resourceClaimStatus := statusUpdates[resourceClaim]
-		if statusUpdates[resourceClaim] == nil {
+		if resourceClaimStatus == nil {
 			resourceClaimStatus = resourceapply.ResourceClaimStatus()
 			statusUpdates[resourceClaim] = resourceClaimStatus
 		}
-		// resourceClaim status for this specific device
-		resourceClaimStatusDevice := resourceapply.
-			AllocatedDeviceStatus().
-			WithDevice(deviceName).
-			WithDriver(np.driverName).
-			WithPool(np.nodeName)
-
-		ifName := config.NetworkInterfaceConfigInHost.Interface.Name
-
-		// Block 1: netdev operations — only when a network interface is present.
-		if ifName != "" {
-			if config.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-				if err := createSubinterfaceInNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
-					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceCreateFailed",
-						"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
-					return err
-				}
-			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
-				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
-					"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
-				return err
-			}
-		}
-
-		// Block 2: RDMA link device — independent of whether a netdev exists.
-		// For IB-only devices (no netdev) this is the only operation here;
-		// for RoCE (netdev + RDMA) it runs after the netdev block above.
-		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
-			if err := attachRdmaToNS(ctx, config.RDMADevice.LinkDev, ns, resourceClaimStatusDevice); err != nil {
-				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "RDMADeviceAttachFailed",
-					"failed to attach RDMA device %s to pod %s/%s: %v", config.RDMADevice.LinkDev, pod.GetNamespace(), pod.GetName(), err)
-				return err
-			}
-		}
-
-		// Block 3: Status conditions for IB-only devices (no netdev).
-		// In exclusive RDMA mode the RDMA link was moved above; in shared mode
-		// char-device injection (createContainer) is sufficient. Either way the
-		// device is ready, so emit the condition unconditionally.
-		if ifName == "" && config.RDMADevice.LinkDev != "" {
-			resourceClaimStatusDevice.WithConditions(
-				metav1apply.Condition().
-					WithType("Ready").
-					WithReason("RDMAOnlyDeviceReady").
-					WithStatus(metav1.ConditionTrue).
-					WithLastTransitionTime(metav1.Now()),
-			)
-		}
-
 		resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
 	}
+
+	sandboxAttachTotal.WithLabelValues(attachResultAttached).Inc()
 	// do not block the handler to update the status
 	for claim, status := range statusUpdates {
 		resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).WithStatus(status)
 		claimLogger := klog.LoggerWithValues(logger, "claim", klog.KRef(claim.Namespace, claim.Name))
 		go func() {
-			ctxStatus, cancel := context.WithTimeout(klog.NewContext(context.Background(), claimLogger), 3*time.Second)
-			defer cancel()
+			ctxStatus, cancelStatus := context.WithTimeout(klog.NewContext(context.Background(), claimLogger), 3*time.Second)
+			defer cancelStatus()
 			_, err := np.kubeClient.ResourceV1().ResourceClaims(claim.Namespace).ApplyStatus(ctxStatus,
 				resourceClaimApply,
 				metav1.ApplyOptions{FieldManager: np.driverName, Force: true},
@@ -237,6 +260,58 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 	}
 
 	return nil
+}
+
+func (np *NetworkDriver) attachDevice(ctx context.Context, pod *api.PodSandbox, ns string, nsHandle *podNetnsHandle, deviceName string, config DeviceConfig) (*resourceapply.AllocatedDeviceStatusApplyConfiguration, error) {
+	resourceClaimStatusDevice := resourceapply.
+		AllocatedDeviceStatus().
+		WithDevice(deviceName).
+		WithDriver(np.driverName).
+		WithPool(np.nodeName)
+
+	ifName := config.NetworkInterfaceConfigInHost.Interface.Name
+
+	// Block 1: netdev operations — only when a network interface is present.
+	if ifName != "" {
+		if config.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
+			if err := createSubinterfaceInNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceCreateFailed",
+					"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
+				return nil, err
+			}
+		} else if err := attachNetdevToNS(ctx, ns, nsHandle, deviceName, config, resourceClaimStatusDevice); err != nil {
+			np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
+				"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
+			return nil, err
+		}
+	}
+
+	// Block 2: RDMA link device — independent of whether a netdev exists.
+	// For IB-only devices (no netdev) this is the only operation here;
+	// for RoCE (netdev + RDMA) it runs after the netdev block above.
+	if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
+		if err := attachRdmaToNS(ctx, config.RDMADevice.LinkDev, ns, resourceClaimStatusDevice); err != nil {
+			np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "RDMADeviceAttachFailed",
+				"failed to attach RDMA device %s to pod %s/%s: %v", config.RDMADevice.LinkDev, pod.GetNamespace(), pod.GetName(), err)
+			return nil, err
+		}
+	}
+
+	// Block 3: Status conditions for IB-only devices (no netdev).
+	// In exclusive RDMA mode the RDMA link was moved above; in shared mode
+	// char-device injection (createContainer) is sufficient. Either way the
+	// device is ready, so emit the condition unconditionally.
+	if ifName == "" && config.RDMADevice.LinkDev != "" {
+		resourceClaimStatusDevice.WithConditions(
+			metav1apply.Condition().
+				WithType("Ready").
+				WithReason("RDMAOnlyDeviceReady").
+				WithStatus(metav1.ConditionTrue).
+				WithLastTransitionTime(metav1.Now()),
+		)
+	}
+
+	return resourceClaimStatusDevice, nil
 }
 
 // attachRdmaToNS moves the RDMA link device into the pod network namespace and
@@ -261,13 +336,17 @@ func attachRdmaToNS(ctx context.Context, linkDev, ns string, resourceClaimStatus
 // attachNetdevToNS moves the host network interface into the pod network namespace,
 // applies all associated configuration (ethtool, eBPF, routes, rules, neighbors),
 // and records the resulting status conditions on resourceClaimStatusDevice.
-func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+func attachNetdevToNS(ctx context.Context, ns string, nsHandle *podNetnsHandle, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
 	ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger := klog.LoggerWithValues(klog.FromContext(ctx), "device", deviceName, "interface", ifName, "netns", ns)
 	logger.V(2).Info("RunPodSandbox processing Network device")
+	if nsHandle == nil {
+		nsHandle = newPodNetnsHandle(ns)
+		defer nsHandle.Close()
+	}
 	// TODO config options to rename the device and pass parameters
 	// use https://github.com/opencontainers/runtime-spec/pull/1271
-	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
+	networkData, nsLink, err := attachNetdev(nsHandle, ifName, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
@@ -286,7 +365,7 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 	) // End of WithNetworkData
 
 	// Configure the moved device (ethtool, vrf, routes, neighbors, rules)
-	return configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice)
+	return configureNetdevInNSWithHandle(ctx, ns, nsHandle, nsLink, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice)
 }
 
 // createSubinterfaceInNS creates a subinterface in the pod network namespace,
@@ -330,6 +409,10 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 // configureNetdevInNS applies common L3 configurations (ethtool, eBPF, VRF, routes, rules, and neighbors)
 // to a network interface inside the container's network namespace and marks the claim status as NetworkReady.
 func configureNetdevInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, ifNameInNs string, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+	return configureNetdevInNSWithHandle(ctx, ns, nil, nil, deviceName, config, ifNameInNs, resourceClaimStatusDevice)
+}
+
+func configureNetdevInNSWithHandle(ctx context.Context, ns string, nsHandle *podNetnsHandle, nsLink netlink.Link, deviceName string, config DeviceConfig, ifNameInNs string, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
 	logger := klog.FromContext(ctx)
 	var err error
 
@@ -352,36 +435,58 @@ func configureNetdevInNS(ctx context.Context, ns, deviceName string, config Devi
 		}
 	}
 
-	vrfTable := 0
-	if config.NetworkInterfaceConfigInPod.Interface.VRF != nil {
-		vrfTable, err = applyVRFConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Interface.VRF)
-		if err != nil {
-			return fmt.Errorf("error configuring VRF for device %s in ns %s: %w", deviceName, ns, err)
+	hasVRF := config.NetworkInterfaceConfigInPod.Interface.VRF != nil
+	hasRoutes := len(config.NetworkInterfaceConfigInPod.Routes) > 0
+	hasRules := !hasVRF && len(config.NetworkInterfaceConfigInPod.Rules) > 0
+	hasNeighbors := len(config.NetworkInterfaceConfigInPod.Neighbors) > 0
+
+	if hasVRF || hasRoutes || hasRules || hasNeighbors {
+		if nsHandle == nil {
+			nsHandle = newPodNetnsHandle(ns)
+			defer nsHandle.Close()
 		}
-	}
-
-	// Configure routes
-	err = applyRoutingConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Routes, vrfTable)
-	if err != nil {
-		logger.Error(err, "RunPodSandbox error configuring routing", "podInterface", ifNameInNs)
-		return fmt.Errorf("error configuring device %s routes on namespace %s: %v", deviceName, ns, err)
-	}
-
-	// Configure rules
-	// If VRF is enabled, rules are not needed/supported as routing is handled by the VRF table + l3mdev.
-	if vrfTable == 0 {
-		err = applyRulesConfig(ns, config.NetworkInterfaceConfigInPod.Rules)
+		containerNs, nhNs, err := nsHandle.ensurePod()
 		if err != nil {
-			logger.Error(err, "RunPodSandbox error configuring rules")
-			return fmt.Errorf("error configuring device %s rules on namespace %s: %v", deviceName, ns, err)
+			return err
 		}
-	}
+		if (hasVRF || hasRoutes || hasNeighbors) && nsLink == nil {
+			nsLink, err = nhNs.LinkByName(ifNameInNs)
+			if err != nil {
+				return fmt.Errorf("link not found for interface %s on namespace %s: %w", ifNameInNs, ns, err)
+			}
+		}
 
-	// Configure neighbors
-	err = applyNeighborConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Neighbors)
-	if err != nil {
-		logger.Error(err, "RunPodSandbox failed to apply neighbor configuration", "podInterface", ifNameInNs)
-		return fmt.Errorf("failed to apply neighbor configuration for interface %s in namespace %s: %w", ifNameInNs, ns, err)
+		vrfTable := 0
+		if hasVRF {
+			vrfTable, err = applyVRFConfigWithHandle(containerNs, nhNs, nsLink, config.NetworkInterfaceConfigInPod.Interface.VRF)
+			if err != nil {
+				return fmt.Errorf("error configuring VRF for device %s in ns %s: %w", deviceName, ns, err)
+			}
+		}
+
+		// Configure routes
+		err = applyRoutingConfigWithHandle(ns, nhNs, nsLink, config.NetworkInterfaceConfigInPod.Routes, vrfTable)
+		if err != nil {
+			logger.Error(err, "RunPodSandbox error configuring routing", "podInterface", ifNameInNs)
+			return fmt.Errorf("error configuring device %s routes on namespace %s: %v", deviceName, ns, err)
+		}
+
+		// Configure rules
+		// If VRF is enabled, rules are not needed/supported as routing is handled by the VRF table + l3mdev.
+		if vrfTable == 0 {
+			err = applyRulesConfigWithHandle(ns, nhNs, config.NetworkInterfaceConfigInPod.Rules)
+			if err != nil {
+				logger.Error(err, "RunPodSandbox error configuring rules")
+				return fmt.Errorf("error configuring device %s rules on namespace %s: %v", deviceName, ns, err)
+			}
+		}
+
+		// Configure neighbors
+		err = applyNeighborConfigWithHandle(nhNs, nsLink, config.NetworkInterfaceConfigInPod.Neighbors)
+		if err != nil {
+			logger.Error(err, "RunPodSandbox failed to apply neighbor configuration", "podInterface", ifNameInNs)
+			return fmt.Errorf("failed to apply neighbor configuration for interface %s in namespace %s: %w", ifNameInNs, ns, err)
+		}
 	}
 
 	resourceClaimStatusDevice.WithConditions(
