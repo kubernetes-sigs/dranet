@@ -47,6 +47,9 @@ func registerMetrics() {
 		prometheus.MustRegister(nriPluginRequestsLatencySeconds)
 		prometheus.MustRegister(publishedDevicesTotal)
 		prometheus.MustRegister(lastPublishedTime)
+		prometheus.MustRegister(nriPluginDisconnectsTotal)
+		prometheus.MustRegister(nriPluginReconnectAttempt)
+		prometheus.MustRegister(netdbReconnectAttempt)
 	})
 }
 
@@ -86,5 +89,40 @@ var (
 		Subsystem: "driver",
 		Name:      "last_published_time_seconds",
 		Help:      "The timestamp of the last successful resource publication.",
+	})
+	// nriPluginDisconnectsTotal counts every time containerd closes its ttrpc
+	// connection to this plugin (stub.WithOnClose), e.g. after an NRI request
+	// exceeds containerd's plugin_request_timeout. Distinct from
+	// nri_plugin_requests_total{status="failed"}: a disconnect can happen after
+	// the local handler already returned success, since containerd gives up and
+	// tears down the connection independently of whether/how the handler finishes.
+	nriPluginDisconnectsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "nri_plugin_disconnects_total",
+		Help:      "Total number of times containerd closed its NRI plugin connection to dranet (e.g. on plugin_request_timeout).",
+	})
+	// nriPluginReconnectAttempt and netdbReconnectAttempt track the current
+	// attempt number in Start()'s restart loop for each subsystem (the NRI
+	// plugin connection, and the host network device database, respectively).
+	// Both loops are capped at maxAttempts before the process exits via
+	// klog.Fatalf, so either value approaching maxAttempts is an early warning
+	// ahead of that exit, whereas the container restart itself only becomes
+	// visible afterwards, via kube_pod_container_status_restarts_total. Split
+	// into two metrics rather than one gauge with a "component" label, matching
+	// this file's existing convention of naming metrics per subsystem
+	// (nri_plugin_requests_total vs. dra_plugin_requests_total) rather than
+	// sharing one metric across subsystems via a label.
+	nriPluginReconnectAttempt = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "nri_plugin_reconnect_attempt",
+		Help:      "Current attempt number (0-indexed) in the restart loop for the NRI plugin connection. Resets to 0 on process restart; approaches maxAttempts before the process exits.",
+	})
+	netdbReconnectAttempt = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "netdb_reconnect_attempt",
+		Help:      "Current attempt number (0-indexed) in the restart loop for the host network device database. Resets to 0 on process restart; approaches maxAttempts before the process exits.",
 	})
 )
