@@ -269,8 +269,10 @@ func testGetExcludedUplinkInterfaces_Namespaced(t *testing.T) {
 	bridgeAddr, _ := netlink.ParseAddr("192.168.1.2/24")
 
 	tests := []struct {
-		name           string
-		setup          func(t *testing.T)
+		name  string
+		setup func(t *testing.T)
+		// uplinks is the explicit override; nil means fall back to detection.
+		uplinks        sets.Set[string]
 		expectedResult sets.Set[string]
 	}{
 		{
@@ -341,6 +343,70 @@ func testGetExcludedUplinkInterfaces_Namespaced(t *testing.T) {
 			},
 			expectedResult: sets.New[string]("eth0"),
 		},
+		{
+			// Control for the explicit-uplink cases below: with no flag, detection
+			// picks the rail too, because it is the only IPv6 default route. The
+			// cases that set the flag expect the rail to stay allocatable, which
+			// they can only do if the flag really replaced detection.
+			name: "Detection alone excludes a rail that advertises its own IPv6 default",
+			setup: func(t *testing.T) {
+				addDummyUplink(t, "eth0", bridgeAddr, defaultIPv4, gwIPv4)
+				addRailNIC(t, "rail0")
+			},
+			expectedResult: sets.New[string]("eth0", "rail0"),
+		},
+		{
+			// A fabric NIC that receives its own default route, as RDMA rails do
+			// from Router Advertisements, would otherwise be detected as an
+			// uplink and disappear from the inventory. Naming the real uplink
+			// explicitly keeps it allocatable.
+			name: "Explicit uplink replaces detection",
+			setup: func(t *testing.T) {
+				addDummyUplink(t, "eth0", bridgeAddr, defaultIPv4, gwIPv4)
+				// A fabric NIC with default routes of its own. Detection alone
+				// would exclude it (see the control case above), so this result
+				// holds only if the flag replaced detection.
+				addRailNIC(t, "rail0")
+			},
+			uplinks:        sets.New[string]("eth0"),
+			expectedResult: sets.New[string]("eth0"),
+		},
+		{
+			// A typo in --uplink-interfaces must not switch detection off with
+			// nothing in its place: when none of the names exist, detection
+			// runs instead, the real uplink stays excluded, and so does the rail
+			// with its own IPv6 default, which is how detection running is seen.
+			name: "Explicit uplinks that all do not exist fall back to detection",
+			setup: func(t *testing.T) {
+				addDummyUplink(t, "eth0", bridgeAddr, defaultIPv4, gwIPv4)
+				addRailNIC(t, "rail0")
+			},
+			uplinks:        sets.New[string]("eth00"),
+			expectedResult: sets.New[string]("eth0", "rail0"),
+		},
+		{
+			// The DaemonSet runs one flag value on every node, so in a cluster
+			// with several node shapes the list names the uplink of each shape
+			// and every node is missing some of them. The names that exist here
+			// are used, the rest ignored, and detection stays off: the fabric
+			// NIC with its own default route remains allocatable.
+			name: "Explicit uplinks for several node shapes use the ones present",
+			setup: func(t *testing.T) {
+				addDummyUplink(t, "eth0", bridgeAddr, defaultIPv4, gwIPv4)
+				addRailNIC(t, "rail0")
+			},
+			uplinks:        sets.New[string]("eth0", "ens3"),
+			expectedResult: sets.New[string]("eth0"),
+		},
+		{
+			name: "Explicit uplink still excludes its children",
+			setup: func(t *testing.T) {
+				br := addBridgeUplink(t, "br0", bridgeAddr, defaultIPv4, gwIPv4)
+				addChildDummy(t, "vf0", br.Attrs().Index)
+			},
+			uplinks:        sets.New[string]("br0"),
+			expectedResult: sets.New[string]("br0", "vf0"),
+		},
 	}
 
 	for _, tt := range tests {
@@ -363,7 +429,7 @@ func testGetExcludedUplinkInterfaces_Namespaced(t *testing.T) {
 
 			tt.setup(t)
 
-			got := getExcludedUplinkInterfaces()
+			got := getExcludedUplinkInterfaces(tt.uplinks)
 			if diff := cmp.Diff(tt.expectedResult, got); diff != "" {
 				t.Errorf("getExcludedUplinkInterfaces() mismatch (-want +got):\n%s", diff)
 			}
@@ -442,10 +508,67 @@ func addBridgeUplink(t *testing.T, name string, addr *netlink.Addr, defaultDst *
 	return link
 }
 
+// addChildlessDummy creates a standalone dummy interface with an address and no
+// routes, for callers that install their own.
+func addChildlessDummy(t *testing.T, name, cidr string) netlink.Link {
+	t.Helper()
+	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}
+	if err := netlink.LinkAdd(dummy); err != nil {
+		t.Fatalf("failed to add dummy %s: %v", name, err)
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		t.Fatalf("failed to look up dummy %s: %v", name, err)
+	}
+	addr, err := netlink.ParseAddr(cidr)
+	if err != nil {
+		t.Fatalf("failed to parse %s: %v", cidr, err)
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		t.Fatalf("failed to add address to %s: %v", name, err)
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		t.Fatalf("failed to set %s up: %v", name, err)
+	}
+	return link
+}
+
 // addDummyUplink creates a dummy interface, assigns it an address, brings it
 // up, and installs an IPv4 default route through it so it looks like the
 // active default-gateway uplink. Used when we need a parent that can host
 // macvlan/ipvlan children (which attach via ParentIndex, not MasterIndex).
+// addRailNIC creates a dummy that looks like a fabric rail NIC: an IPv4 and an
+// IPv6 address, and a default route in each family. The IPv4 default uses a
+// distinct metric only because IPv4 rejects two identical-metric defaults and
+// eth0 already has one at the kernel default; the IPv6 default is the only one
+// in its family, so detection would select the rail for IPv6, which is exactly
+// what happens on fabrics that advertise a default route by Router
+// Advertisement. A test that names eth0 explicitly therefore only passes if the
+// flag really replaced detection.
+func addRailNIC(t *testing.T, name string) netlink.Link {
+	t.Helper()
+	rail := addChildlessDummy(t, name, "192.168.2.2/24")
+	v6Addr, err := netlink.ParseAddr("2001:db8:2::2/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v6Addr.Flags = unix.IFA_F_NODAD
+	if err := netlink.AddrAdd(rail, v6Addr); err != nil {
+		t.Fatalf("failed to add IPv6 address to %s: %v", name, err)
+	}
+	_, defaultIPv4, _ := net.ParseCIDR("0.0.0.0/0")
+	_, defaultIPv6, _ := net.ParseCIDR("::/0")
+	for _, route := range []*netlink.Route{
+		{Family: netlink.FAMILY_V4, Dst: defaultIPv4, Gw: net.ParseIP("192.168.2.1"), LinkIndex: rail.Attrs().Index, Priority: 200, Table: unix.RT_TABLE_MAIN},
+		{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: net.ParseIP("2001:db8:2::1"), LinkIndex: rail.Attrs().Index, Priority: 1024, Table: unix.RT_TABLE_MAIN},
+	} {
+		if err := netlink.RouteAdd(route); err != nil {
+			t.Fatalf("failed to install default route via %s: %v", name, err)
+		}
+	}
+	return rail
+}
+
 func addDummyUplink(t *testing.T, name string, addr *netlink.Addr, defaultDst *net.IPNet, gw net.IP) netlink.Link {
 	t.Helper()
 	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}

@@ -21,7 +21,11 @@
         },
         "pullPolicy": {
           "type": "string",
-          "enum": ["Always", "IfNotPresent", "Never"]
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
         }
       }
     },
@@ -44,7 +48,10 @@
       "type": "object"
     },
     "metricsPort": {
-      "type": ["integer", "null"],
+      "type": [
+        "integer",
+        "null"
+      ],
       "minimum": 1,
       "maximum": 65535
     },
@@ -126,7 +133,16 @@
         },
         "cloudProviderHint": {
           "type": "string",
-          "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "CKS", "webhook", "NONE"],
+          "enum": [
+            "GCE",
+            "AZURE",
+            "OKE",
+            "AWS",
+            "ALIBABA",
+            "CKS",
+            "webhook",
+            "NONE"
+          ],
           "description": "Hint for the cloud provider plugin; auto-detected if unset"
         },
         "cloudProviderOptions": {
@@ -148,7 +164,11 @@
         },
         "profileProvider": {
           "type": "string",
-          "enum": ["cloud", "webhook", "none"],
+          "enum": [
+            "cloud",
+            "webhook",
+            "none"
+          ],
           "description": "Provider for user profile configuration"
         },
         "webhookURL": {
@@ -158,6 +178,10 @@
         "featureGates": {
           "type": "string",
           "description": "Comma-separated feature gate settings in key=value format"
+        },
+        "uplinkInterfaces": {
+          "type": "string",
+          "description": "Comma-separated names of the host's uplink interfaces, kept out of the inventory along with their children instead of detecting them from the default routes."
         }
       },
       "allOf": [
@@ -168,7 +192,9 @@
                 "const": "webhook"
               }
             },
-            "required": ["cloudProviderHint"]
+            "required": [
+              "cloudProviderHint"
+            ]
           },
           "then": {
             "properties": {
@@ -176,7 +202,9 @@
                 "minLength": 1
               }
             },
-            "required": ["webhookURL"]
+            "required": [
+              "webhookURL"
+            ]
           }
         },
         {
@@ -186,7 +214,9 @@
                 "const": "webhook"
               }
             },
-            "required": ["profileProvider"]
+            "required": [
+              "profileProvider"
+            ]
           },
           "then": {
             "properties": {
@@ -194,7 +224,9 @@
                 "minLength": 1
               }
             },
-            "required": ["webhookURL"]
+            "required": [
+              "webhookURL"
+            ]
           }
         }
       ]
@@ -209,7 +241,9 @@
             "minLength": 1
           }
         },
-        "required": ["name"]
+        "required": [
+          "name"
+        ]
       }
     },
     "extraVolumeMounts": {
@@ -226,7 +260,10 @@
             "minLength": 1
           }
         },
-        "required": ["name", "mountPath"]
+        "required": [
+          "name",
+          "mountPath"
+        ]
       }
     },
     "nodeSelector": {
