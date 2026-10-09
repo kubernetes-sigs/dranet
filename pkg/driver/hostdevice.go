@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -33,7 +34,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
+func nsAttachNetdev(ctx context.Context, hostIfName string, containerNsPAth string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
 	hostDev, err := nlwrap.LinkByName(hostIfName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get link for interface %s: %w", hostIfName, err)
@@ -145,7 +146,7 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 
 	// Apply before the link comes up so it never answers ARP or accepts router
 	// advertisements with the wrong policy.
-	if err := applyInterfaceSysctlConfig(containerNs, ifName, interfaceConfig); err != nil {
+	if err := applyInterfaceSysctlConfig(ctx, containerNs, ifName, interfaceConfig); err != nil {
 		rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName)
 		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
 	}
@@ -158,7 +159,7 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	for _, address := range interfaceConfig.Addresses {
 		ip, ipnet, err := net.ParseCIDR(address)
 		if err != nil {
-			klog.Infof("failed to parse address %s : %v", address, err)
+			klog.FromContext(ctx).Error(err, "Failed to parse address", "address", address)
 			continue // this should not happen since it has been already validated
 		}
 		err = nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}})

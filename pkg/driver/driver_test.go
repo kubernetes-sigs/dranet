@@ -156,10 +156,10 @@ func TestStop(t *testing.T) {
 	podUID2 := types.UID("pod-2")
 
 	// Pod 1: Prepared but no NRI activity
-	np.podConfigStore.SetDeviceConfig(podUID1, "random-dev-1", DeviceConfig{})
+	np.podConfigStore.SetDeviceConfig(context.Background(), podUID1, "random-dev-1", DeviceConfig{})
 
 	// Pod 2: Prepared and has recent NRI activity
-	np.podConfigStore.SetDeviceConfig(podUID2, "random-dev-1", DeviceConfig{})
+	np.podConfigStore.SetDeviceConfig(context.Background(), podUID2, "random-dev-1", DeviceConfig{})
 	np.podConfigStore.UpdateLastNRIActivity(podUID2, fakeClock.Now())
 
 	cancelCalled := false
@@ -170,7 +170,7 @@ func TestStop(t *testing.T) {
 	// Run Stop in a separate goroutine because it will block
 	stopDone := make(chan struct{})
 	go func() {
-		np.Stop(cancel)
+		np.Stop(context.Background(), cancel)
 		close(stopDone)
 	}()
 

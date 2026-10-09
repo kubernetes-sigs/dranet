@@ -58,12 +58,13 @@ const (
 // information so the NRI hooks can perform the configuration and attachment of Pods at runtime.
 
 func (np *NetworkDriver) PublishResources(ctx context.Context) {
-	klog.V(2).Infof("Publishing resources")
+	logger := klog.FromContext(ctx)
+	logger.V(2).Info("Publishing resources")
 	for {
 		select {
 		// Wait for updates from the host-discovered (live) device inventory
 		case live := <-np.netdb.GetResources(ctx):
-			klog.V(3).Infof("Got %d devices from inventory: %s", len(live), formatDeviceNames(live, 15))
+			logger.V(3).Info("Got devices from inventory", "count", len(live), "devices", formatDeviceNames(live, 15))
 
 			// Fetch device snapshots from BoltDB store and merge
 			merged := live
@@ -75,7 +76,7 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 			// Apply filtering on the merged set of devices
 			filtered := filter.FilterDevices(np.celProgram, merged)
 
-			klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
+			logger.V(3).Info("Publishing devices in ResourceSlice(s) after database merging and filtering", "count", len(filtered), "devices", formatDeviceNames(filtered, 15))
 
 			np.publishResourcesPrometheusMetrics(filtered)
 
@@ -86,12 +87,12 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 			}
 			err := np.draPlugin.PublishResources(ctx, resources)
 			if err != nil {
-				klog.Error(err, "unexpected error trying to publish resources")
+				logger.Error(err, "Unexpected error trying to publish resources")
 			} else {
 				lastPublishedTime.SetToCurrentTime()
 			}
 		case <-ctx.Done():
-			klog.Error(ctx.Err(), "context canceled")
+			logger.V(2).Info("Stopping resource publishing", "reason", ctx.Err())
 			return
 		}
 	}
@@ -109,7 +110,7 @@ func (np *NetworkDriver) publishResourcesPrometheusMetrics(devices []resourceapi
 }
 
 func (np *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
-	klog.V(2).Infof("PrepareResourceClaims is called: number of claims: %d", len(claims))
+	klog.FromContext(ctx).V(2).Info("PrepareResourceClaims is called", "claims", len(claims))
 	start := time.Now()
 	defer func() {
 		draPluginRequestsLatencySeconds.WithLabelValues(methodPrepareResourceClaims).Observe(time.Since(start).Seconds())
@@ -139,10 +140,11 @@ func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*re
 	if len(claims) == 0 {
 		return nil, nil
 	}
+	logger := klog.FromContext(ctx)
 	result := make(map[types.UID]kubeletplugin.PrepareResult)
 
 	for _, claim := range claims {
-		klog.V(2).Infof("NodePrepareResources: Claim Request %s/%s", claim.Namespace, claim.Name)
+		logger.V(2).Info("NodePrepareResources: Claim Request", "claim", klog.KObj(claim))
 		result[claim.UID] = np.prepareResourceClaim(ctx, claim)
 	}
 	return result, nil
@@ -152,13 +154,15 @@ func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*re
 // This happens in the kubelet so it can be a "slow" operation, so we can execute fast in RunPodsandbox, that happens in the
 // container runtime and has strong expectactions to be executed fast (default hook timeout is 2 seconds).
 func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
-	klog.V(2).Infof("PrepareResourceClaim Claim %s/%s", claim.Namespace, claim.Name)
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "claim", klog.KObj(claim), "claimUID", claim.UID)
+	ctx = klog.NewContext(ctx, logger)
+	logger.V(2).Info("PrepareResourceClaim")
 	start := time.Now()
 	defer func() {
-		klog.V(2).Infof("PrepareResourceClaim Claim %s/%s  took %v", claim.Namespace, claim.Name, time.Since(start))
+		logger.V(2).Info("PrepareResourceClaim finished", "duration", time.Since(start))
 	}()
 	if len(claim.Status.ReservedFor) == 0 {
-		klog.Infof("no pods allocated to claim %s/%s", claim.Namespace, claim.Name)
+		logger.Info("No pods allocated to claim")
 		return kubeletplugin.PrepareResult{}
 	}
 	if len(claim.Status.ReservedFor) > 1 {
@@ -176,6 +180,8 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 	}
 	podUID := reserved.UID
+	logger = klog.LoggerWithValues(logger, "podUID", podUID)
+	ctx = klog.NewContext(ctx, logger)
 
 	nlHandle, err := nlwrap.NewHandle()
 	if err != nil {
@@ -184,7 +190,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 	}
 
-	rulesByTable, err := getRuleInfo(nlHandle)
+	rulesByTable, err := getRuleInfo(ctx, nlHandle)
 	if err != nil {
 		return kubeletplugin.PrepareResult{
 			Err: fmt.Errorf("error getting rule info: %v", err),
@@ -210,7 +216,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 
 	if len(errorList) > 0 {
 		joinedErr := errors.Join(errorList...)
-		klog.Infof("claim %s contain errors: %v", claim.UID, joinedErr)
+		logger.Error(joinedErr, "Claim contains errors")
 		np.eventRecorder.Eventf(claim, v1.EventTypeWarning, "ClaimPrepareFailed", "%v", joinedErr)
 		return kubeletplugin.PrepareResult{
 			Err: fmt.Errorf("claim %s contain errors: %w", claim.UID, joinedErr),
@@ -230,8 +236,10 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Handle, claim *resourceapi.ResourceClaim, podUID types.UID, result resourceapi.DeviceRequestAllocationResult, rulesByTable map[int][]apis.RuleConfig) error {
 	// Idempotency check: reuse the device configuration if it already exists, as a
 	// second resolution would allocate new profile resources and leak the stored ones.
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "device", result.Device)
+	ctx = klog.NewContext(ctx, logger)
 	if _, ok := np.podConfigStore.GetDeviceConfig(podUID, result.Device); ok {
-		klog.V(4).Infof("device %s of pod %s is already prepared, reusing the stored configuration", result.Device, podUID)
+		logger.V(4).Info("Device is already prepared, reusing the stored configuration")
 		return nil
 	}
 
@@ -261,7 +269,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		return errors.Join(configErrors...)
 	}
 
-	mergedConf, err := np.getDeviceNetworkConfig(result.Device, claim, userConf)
+	mergedConf, err := np.getDeviceNetworkConfig(ctx, result.Device, claim, userConf)
 	if err != nil {
 		return err
 	}
@@ -275,18 +283,18 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	defer func() {
 		if !deviceCommitted && netconf.Profile != "" {
 			if err := np.netdb.ReleaseProfileConfig(result.Device, claim.UID, &netconf); err != nil {
-				klog.Errorf("failed to release profile config for claim %v device %v: %v", claim.UID, result.Device, err)
+				logger.Error(err, "Failed to release profile config")
 			}
 		}
 	}()
 
-	klog.V(4).Infof("PrepareResourceClaim %s/%s final Configuration %#v", claim.Namespace, claim.Name, netconf)
+	logger.V(4).Info("PrepareResourceClaim final configuration", "config", fmt.Sprintf("%#v", netconf))
 	// Query the local discovery database (netdb) for the card's clean attributes
 	var deviceSnapshot *resourceapi.Device
 	if device, ok := np.netdb.GetDevice(result.Device); ok {
 		deviceSnapshot = &device
 	} else {
-		klog.Warningf("Failed to find device %s in inventory for claim %s", result.Device, claim.UID)
+		logger.Info("Failed to find device in inventory")
 	}
 
 	deviceCfg := DeviceConfig{
@@ -319,12 +327,12 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		if err != nil {
 			return fmt.Errorf("failed to get RDMA device name for IB-only device %s: %v", result.Device, err)
 		}
-		deviceCfg.RDMADevice = buildRDMAConfig(rdmaDevName)
-		if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
+		deviceCfg.RDMADevice = buildRDMAConfig(ctx, rdmaDevName)
+		if err := np.podConfigStore.SetDeviceConfig(ctx, podUID, result.Device, deviceCfg); err != nil {
 			return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 		}
 		deviceCommitted = true
-		klog.V(4).Infof("IB-only claim resources for pod %s : %#v", podUID, deviceCfg)
+		logger.V(4).Info("IB-only claim resources", "config", fmt.Sprintf("%#v", deviceCfg))
 		return nil
 	}
 
@@ -338,6 +346,8 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		return fmt.Errorf("failed to get netlink to interface %s: %v", ifName, err)
 	}
 	deviceCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
+	logger = klog.LoggerWithValues(logger, "interface", ifName)
+	ctx = klog.NewContext(ctx, logger)
 
 	if deviceCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
 		// If the interface name was not explicitly overridden, use the same
@@ -366,7 +376,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
 	// ... but we DO NOT apply them in the root namespace
 	if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeDHCP {
-		klog.V(2).Infof("trying to get network configuration via DHCP")
+		logger.V(2).Info("Trying to get network configuration via DHCP")
 		contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		ip, routes, lease, err := getDHCP(contextCancel, ifName)
@@ -430,11 +440,11 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 
 	// For non-subinterface type, obtain the routes and rules associated with the interface.
 	if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-		routes, tables, err := getRouteInfo(nlHandle, ifName, link)
+		routes, tables, err := getRouteInfo(ctx, nlHandle, ifName, link)
 		if err != nil {
 			return err
 		}
-		clearStaleRouteSources(routes, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses)
+		clearStaleRouteSources(ctx, routes, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses)
 		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 
 		// If VRF is enabled, we do not need to copy the rules from the host
@@ -442,7 +452,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		if deviceCfg.NetworkInterfaceConfigInPod.Interface.VRF == nil {
 			for _, table := range tables.UnsortedList() {
 				if rules, ok := rulesByTable[table]; ok {
-					klog.V(5).Infof("Adding %d rules for table %d associated with interface %s", len(rules), table, ifName)
+					logger.V(5).Info("Adding rules for table associated with interface", "rules", len(rules), "table", table)
 					deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, rules...)
 					// Avoid adding the same rule twice
 					delete(rulesByTable, table)
@@ -454,7 +464,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	// Obtain the neighbors associated to the interface
 	neighs, err := nlHandle.NeighList(link.Attrs().Index, netlink.FAMILY_ALL)
 	if err != nil {
-		klog.Infof("failed to get neighbors for interface %s: %v", ifName, err)
+		logger.Error(err, "Failed to get neighbors for interface")
 	}
 	for _, neigh := range neighs {
 		if neigh.IP == nil || neigh.HardwareAddr == nil {
@@ -482,7 +492,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: Unnumbered", result.Device, iface.Type)
 		}
 		if iface.Addressing == apis.AddressingModeUnnumbered {
-			klog.V(2).Infof("device %s: unnumbered %s interface requested; skipping address and route configuration", result.Device, iface.Type)
+			logger.V(2).Info("Unnumbered interface requested; skipping address and route configuration", "type", iface.Type)
 		}
 	}
 
@@ -491,8 +501,8 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && !np.rdmaSharedMode {
 			return fmt.Errorf("device %s: interface type %q (subinterface) is not supported with exclusive RDMA mode; use shared RDMA mode", result.Device, deviceCfg.NetworkInterfaceConfigInPod.Interface.Type)
 		}
-		klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
-		deviceCfg.RDMADevice = buildRDMAConfig(rdmaDev)
+		logger.V(2).Info("PrepareResourceClaim processing RDMA device", "rdmaDevice", rdmaDev)
+		deviceCfg.RDMADevice = buildRDMAConfig(ctx, rdmaDev)
 	}
 
 	// Remove the pinned programs before the NRI hooks since it
@@ -500,22 +510,22 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	// TODO: check if there is some other way to do this
 	if deviceCfg.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms != nil &&
 		*deviceCfg.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms {
-		err := unpinBPFPrograms(ifName)
+		err := unpinBPFPrograms(ctx, ifName)
 		if err != nil {
-			klog.Infof("error unpinning ebpf programs for %s : %v", ifName, err)
+			logger.Error(err, "Error unpinning ebpf programs")
 		}
 	}
 
-	if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
+	if err := np.podConfigStore.SetDeviceConfig(ctx, podUID, result.Device, deviceCfg); err != nil {
 		return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 	}
 	deviceCommitted = true
-	klog.V(4).Infof("Claim Resources for pod %s : %#v", podUID, deviceCfg)
+	logger.V(4).Info("Claim resources", "config", fmt.Sprintf("%#v", deviceCfg))
 	return nil
 }
 
 func (np *NetworkDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
-	klog.V(2).Infof("UnprepareResourceClaims is called: number of claims: %d", len(claims))
+	klog.FromContext(ctx).V(2).Info("UnprepareResourceClaims is called", "claims", len(claims))
 	start := time.Now()
 	defer func() {
 		draPluginRequestsLatencySeconds.WithLabelValues(methodUnprepareResourceClaims).Observe(time.Since(start).Seconds())
@@ -548,16 +558,18 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 
 	result := make(map[types.UID]error)
 	for _, claim := range claims {
-		err := np.unprepareResourceClaim(ctx, claim)
+		logger := klog.LoggerWithValues(klog.FromContext(ctx), "claim", klog.KRef(claim.Namespace, claim.Name), "claimUID", claim.UID)
+		err := np.unprepareResourceClaim(klog.NewContext(ctx, logger), claim)
 		result[claim.UID] = err
 		if err != nil {
-			klog.Infof("error unpreparing ressources for claim %s/%s : %v", claim.Namespace, claim.Name, err)
+			logger.Error(err, "Error unpreparing resources for claim")
 		}
 	}
 	return result, nil
 }
 
-func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+func (np *NetworkDriver) unprepareResourceClaim(ctx context.Context, claim kubeletplugin.NamespacedObject) error {
+	logger := klog.FromContext(ctx)
 	for _, podUID := range np.podConfigStore.ListPods() {
 		podCfg, ok := np.podConfigStore.GetPodConfig(podUID)
 		if !ok {
@@ -575,20 +587,20 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 						// Non-fatal: the lease expires on its own, which is the
 						// behaviour without this release. Failing here would
 						// instead block the pod's teardown.
-						klog.Infof("failed to release DHCP lease for claim %v device %s: %v", claim.NamespacedName, deviceName, err)
+						logger.Error(err, "Failed to release DHCP lease", "podUID", podUID, "device", deviceName)
 					}
 					cancel()
 				}
 				if devCfg.NetworkInterfaceConfigInPod.Profile != "" {
 					if err := np.netdb.ReleaseProfileConfig(deviceName, claim.UID, &devCfg.NetworkInterfaceConfigInPod); err != nil {
-						klog.Errorf("failed to release profile config for claim %v: %v", claim.NamespacedName, err)
+						logger.Error(err, "Failed to release profile config", "podUID", podUID, "device", deviceName)
 					}
 				}
 			}
 		}
 	}
 
-	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+	np.podConfigStore.DeleteClaim(ctx, claim.NamespacedName)
 	return nil
 }
 
@@ -622,7 +634,8 @@ func formatDeviceNames(devices []resourceapi.Device, max int) string {
 
 // buildRDMAConfig populates an RDMAConfig for the given rdma device name.
 // It resolves the rdma_cm and per-device character device paths to LinuxDevice entries.
-func buildRDMAConfig(rdmaDevName string) RDMAConfig {
+func buildRDMAConfig(ctx context.Context, rdmaDevName string) RDMAConfig {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "rdmaDevice", rdmaDevName)
 	cfg := RDMAConfig{LinkDev: rdmaDevName}
 	charDevices := sets.New[string]()
 	charDevices.Insert(rdmaCmPath)
@@ -630,7 +643,7 @@ func buildRDMAConfig(rdmaDevName string) RDMAConfig {
 	for _, devpath := range charDevices.UnsortedList() {
 		dev, err := GetDeviceInfo(devpath)
 		if err != nil {
-			klog.Infof("fail to get device info for %s : %v", devpath, err)
+			logger.Error(err, "Failed to get device info", "path", devpath)
 		} else {
 			cfg.DevChars = append(cfg.DevChars, dev)
 		}
@@ -653,7 +666,8 @@ func validateVFMTU(vfName, pfName string, requestedMTU, pfMTU int) error {
 // by the route table they are associated with. It returns a map where keys are
 // table IDs and values are slices of RuleConfig. Rules associated with the
 // main or local tables are ignored.
-func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
+func getRuleInfo(ctx context.Context, nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
+	logger := klog.FromContext(ctx)
 	rulesByTable := make(map[int][]apis.RuleConfig)
 	rules, err := nlHandle.RuleList(netlink.FAMILY_ALL)
 	if err != nil {
@@ -672,7 +686,7 @@ func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
 		}
 		// Only care about rules with route tables associated, and exclude main and local tables.
 		if rule.Table > 0 && rule.Table != unix.RT_TABLE_MAIN && rule.Table != unix.RT_TABLE_LOCAL {
-			klog.V(5).Infof("Found rule %s for table %d", rule.String(), rule.Table)
+			logger.V(5).Info("Found rule for table", "rule", rule.String(), "table", rule.Table)
 			rulesByTable[rule.Table] = append(rulesByTable[rule.Table], ruleCfg)
 		}
 	}
@@ -683,7 +697,8 @@ func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
 // It filters out routes that are not suitable for pod namespaces, such as
 // routes in the local table. It returns the list of suitable routes and a set
 // of the route table IDs to which they belong.
-func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]apis.RouteConfig, sets.Set[int], error) {
+func getRouteInfo(ctx context.Context, nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]apis.RouteConfig, sets.Set[int], error) {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "interface", ifName)
 	routes := []apis.RouteConfig{}
 	tables := sets.Set[int]{}
 	filter := &netlink.Route{
@@ -697,25 +712,25 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 		routeCfg := apis.RouteConfig{}
 		// routes need a destination
 		if route.Dst == nil {
-			klog.V(5).Infof("Skipping route %s for interface %s because it has no destination", route.String(), ifName)
+			logger.V(5).Info("Skipping route because it has no destination", "route", route.String())
 			continue
 		}
 		// Do not copy routes from the local table because they are specific
 		// to the host and the kernel will manage the local routing
 		// table within the pod's network namespace.
 		if route.Table == unix.RT_TABLE_LOCAL {
-			klog.V(5).Infof("Skipping route %s for interface %s because it is in the local table", route.String(), ifName)
+			logger.V(5).Info("Skipping route because it is in the local table", "route", route.String())
 			continue
 		}
 		// Discard IPv6 link-local routes, but allow IPv4 link-local.
 		if route.Dst.IP.To4() == nil {
 			if route.Dst.IP.IsLinkLocalUnicast() {
-				klog.V(5).Infof("Skipping IPv6 link-local route %s for interface %s", route.String(), ifName)
+				logger.V(5).Info("Skipping IPv6 link-local route", "route", route.String())
 				continue
 			}
 			// Discard IPv6 proto=kernel routes
 			if route.Protocol == unix.RTPROT_KERNEL {
-				klog.V(5).Infof("Skipping IPv6 proto=kernel route %s for interface %s", route.String(), ifName)
+				logger.V(5).Info("Skipping IPv6 proto=kernel route", "route", route.String())
 				continue
 			}
 		}
@@ -731,7 +746,7 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 		routes = append(routes, routeCfg)
 		// Collect table IDs for rules lookup later.
 		if route.Table > 0 {
-			klog.V(5).Infof("Found route table %d for interface %s", route.Table, ifName)
+			logger.V(5).Info("Found route table", "table", route.Table)
 			tables.Insert(route.Table)
 		}
 	}
@@ -743,7 +758,8 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 // kernel rejects a route whose prefsrc is not a local address with EINVAL, and
 // the Pod may get different addresses than the host had (DHCP, or addresses
 // set in the claim). Without a source the kernel picks one itself.
-func clearStaleRouteSources(routes []apis.RouteConfig, addresses []string) {
+func clearStaleRouteSources(ctx context.Context, routes []apis.RouteConfig, addresses []string) {
+	logger := klog.FromContext(ctx)
 	podIPs := sets.New[string]()
 	for _, addr := range addresses {
 		if ip, _, err := net.ParseCIDR(addr); err == nil {
@@ -752,7 +768,7 @@ func clearStaleRouteSources(routes []apis.RouteConfig, addresses []string) {
 	}
 	for i := range routes {
 		if routes[i].Source != "" && !podIPs.Has(routes[i].Source) {
-			klog.V(4).Infof("Clearing source %s of route %s: address not assigned in the Pod", routes[i].Source, routes[i].Destination)
+			logger.V(4).Info("Clearing route source: address not assigned in the Pod", "source", routes[i].Source, "destination", routes[i].Destination)
 			routes[i].Source = ""
 		}
 	}
@@ -761,10 +777,10 @@ func clearStaleRouteSources(routes []apis.RouteConfig, addresses []string) {
 // getDeviceNetworkConfig merges the user configuration with the cloud provider configuration and resolves the dynamic profile.
 // User configuration always takes precedence in case of conflicts.
 // The merged result is defaulted and validated before it is returned.
-func (np *NetworkDriver) getDeviceNetworkConfig(device string, claim *resourceapi.ResourceClaim, userConf *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+func (np *NetworkDriver) getDeviceNetworkConfig(ctx context.Context, device string, claim *resourceapi.ResourceClaim, userConf *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	cloudConf, ok := np.netdb.GetDeviceConfig(device)
 	if ok && cloudConf != nil {
-		klog.V(4).Infof("Found cloud provider configuration for device %s: %#v", device, cloudConf)
+		klog.FromContext(ctx).V(4).Info("Found cloud provider configuration for device", "config", fmt.Sprintf("%#v", cloudConf))
 	}
 	mergedConf := apis.MergeNetworkConfig(userConf, cloudConf)
 

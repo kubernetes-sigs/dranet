@@ -55,8 +55,8 @@ func TestCreateContainerNoDuplicateDevices(t *testing.T) {
 			DevChars: rdmaDevChars,
 		},
 	}
-	np.podConfigStore.SetDeviceConfig(podUID, "eth0", deviceCfg)
-	np.podConfigStore.SetDeviceConfig(podUID, "eth1", deviceCfg)
+	np.podConfigStore.SetDeviceConfig(context.Background(), podUID, "eth0", deviceCfg)
+	np.podConfigStore.SetDeviceConfig(context.Background(), podUID, "eth1", deviceCfg)
 
 	adjust, _, err := np.CreateContainer(context.Background(), pod, ctr)
 	if err != nil {
@@ -84,11 +84,11 @@ func TestCreateContainerUsesPersistedConfigAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newBoltCheckpointer() error: %v", err)
 	}
-	store1, err := newPodConfigStoreWithCheckpointer(cp1)
+	store1, err := newPodConfigStoreWithCheckpointer(context.Background(), cp1)
 	if err != nil {
-		t.Fatalf("NewPodConfigStore() error: %v", err)
+		t.Fatalf("NewPodConfigStore(context.Background()) error: %v", err)
 	}
-	store1.SetDeviceConfig(podUID, "eth0", deviceCfg) //nolint:errcheck
+	store1.SetDeviceConfig(context.Background(), podUID, "eth0", deviceCfg) //nolint:errcheck
 	if err := store1.Close(); err != nil {
 		t.Fatalf("Close() error: %v", err)
 	}
@@ -97,9 +97,9 @@ func TestCreateContainerUsesPersistedConfigAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newBoltCheckpointer() after restart error: %v", err)
 	}
-	storeAfterRestart, err := newPodConfigStoreWithCheckpointer(cp2)
+	storeAfterRestart, err := newPodConfigStoreWithCheckpointer(context.Background(), cp2)
 	if err != nil {
-		t.Fatalf("NewPodConfigStore() after restart error: %v", err)
+		t.Fatalf("NewPodConfigStore(context.Background()) after restart error: %v", err)
 	}
 	defer storeAfterRestart.Close()
 
@@ -142,11 +142,11 @@ func TestRunPodSandboxUsesPersistedConfigAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newBoltCheckpointer() error: %v", err)
 	}
-	store1, err := newPodConfigStoreWithCheckpointer(cp1)
+	store1, err := newPodConfigStoreWithCheckpointer(context.Background(), cp1)
 	if err != nil {
-		t.Fatalf("NewPodConfigStore() error: %v", err)
+		t.Fatalf("NewPodConfigStore(context.Background()) error: %v", err)
 	}
-	if err := store1.SetDeviceConfig(podUID, "eth0", deviceCfg); err != nil {
+	if err := store1.SetDeviceConfig(context.Background(), podUID, "eth0", deviceCfg); err != nil {
 		t.Fatalf("SetDeviceConfig() error: %v", err)
 	}
 	if err := store1.Close(); err != nil {
@@ -158,9 +158,9 @@ func TestRunPodSandboxUsesPersistedConfigAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newBoltCheckpointer() after restart error: %v", err)
 	}
-	storeAfterRestart, err := newPodConfigStoreWithCheckpointer(cp2)
+	storeAfterRestart, err := newPodConfigStoreWithCheckpointer(context.Background(), cp2)
 	if err != nil {
-		t.Fatalf("NewPodConfigStore() after restart error: %v", err)
+		t.Fatalf("NewPodConfigStore(context.Background()) after restart error: %v", err)
 	}
 	defer storeAfterRestart.Close()
 
@@ -210,7 +210,7 @@ func TestRunPodSandboxSubinterfaceCreation(t *testing.T) {
 		},
 	}
 
-	if err := store.SetDeviceConfig(podUID, "eth0", deviceCfg); err != nil {
+	if err := store.SetDeviceConfig(context.Background(), podUID, "eth0", deviceCfg); err != nil {
 		t.Fatalf("SetDeviceConfig() error: %v", err)
 	}
 
@@ -246,7 +246,7 @@ func TestSynchronizeStoresNetNSOnlyForConfiguredPods(t *testing.T) {
 	store := mustNewPodConfigStore()
 
 	// Pod 1: Has device config (configured)
-	store.SetDeviceConfig("configured-pod", "eth0", DeviceConfig{}) //nolint:errcheck
+	store.SetDeviceConfig(context.Background(), "configured-pod", "eth0", DeviceConfig{}) //nolint:errcheck
 
 	// Pod 2: Does not have device config (unconfigured)
 
@@ -427,7 +427,7 @@ func TestRunPodSandboxMetrics(t *testing.T) {
 				eventRecorder:  record.NewFakeRecorder(100),
 			}
 			if !tc.expectSuccess {
-				tc.podConfigStore.SetDeviceConfig(podUIDHostNetwork, "eth0", DeviceConfig{})
+				tc.podConfigStore.SetDeviceConfig(context.Background(), podUIDHostNetwork, "eth0", DeviceConfig{})
 			}
 
 			np.RunPodSandbox(context.Background(), tc.pod)
@@ -655,10 +655,10 @@ func TestStopPodSandboxRescanGating(t *testing.T) {
 				Namespace: "test-ns",
 			}
 			if tc.setupDeviceConfig {
-				np.podConfigStore.SetDeviceConfig(podUID, "eth0", tc.deviceConfig)
+				np.podConfigStore.SetDeviceConfig(context.Background(), podUID, "eth0", tc.deviceConfig)
 			}
 			if tc.setupDeviceConfig && tc.setupNetNs {
-				np.podConfigStore.SetPodNetNs(podUID, "/dummy/netns")
+				np.podConfigStore.SetPodNetNs(context.Background(), podUID, "/dummy/netns")
 			}
 
 			if err := np.StopPodSandbox(context.Background(), pod); err != nil {
@@ -760,7 +760,7 @@ func TestCreateContainerSubinterfaceRDMAInjection(t *testing.T) {
 	}
 
 	store := mustNewPodConfigStore()
-	if err := store.SetDeviceConfig(podUID, "eth0", deviceCfg); err != nil {
+	if err := store.SetDeviceConfig(context.Background(), podUID, "eth0", deviceCfg); err != nil {
 		t.Fatalf("SetDeviceConfig() error: %v", err)
 	}
 

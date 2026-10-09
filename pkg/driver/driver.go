@@ -121,14 +121,15 @@ type NetworkDriver struct {
 type Option func(*NetworkDriver)
 
 func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interface, nodeName string, podConfigStore *PodConfigStore, opts ...Option) (*NetworkDriver, error) {
+	logger := klog.FromContext(ctx)
 	registerMetrics()
 
 	rdmaNetnsMode, err := nlwrap.RdmaSystemGetNetnsMode()
 	if err != nil {
-		klog.Infof("failed to determine the RDMA subsystem's network namespace mode, assume shared mode: %v", err)
+		logger.Info("Failed to determine the RDMA subsystem's network namespace mode, assuming shared mode", "err", err)
 		rdmaNetnsMode = apis.RdmaNetnsModeShared
 	} else {
-		klog.Infof("RDMA subsystem in mode: %s", rdmaNetnsMode)
+		logger.Info("RDMA subsystem mode", "mode", rdmaNetnsMode)
 	}
 
 	eventBroadcaster := record.NewBroadcaster()
@@ -191,7 +192,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		// https://github.com/containerd/nri/pull/173
 		// Otherwise it silently exits the program
 		stub.WithOnClose(func() {
-			klog.Infof("%s NRI plugin closed", driverName)
+			logger.Info("NRI plugin closed", "driver", driverName)
 		}),
 	}
 	stub, err := stub.New(plugin, nriOpts...)
@@ -204,16 +205,17 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		for i := 0; i < maxAttempts; i++ {
 			err = plugin.nriPlugin.Run(ctx)
 			if err != nil {
-				klog.Infof("NRI plugin failed with error %v", err)
+				logger.Error(err, "NRI plugin failed")
 			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				klog.Infof("Restarting NRI plugin %d out of %d", i, maxAttempts)
+				logger.Info("Restarting NRI plugin", "attempt", i, "maxAttempts", maxAttempts)
 			}
 		}
-		klog.Fatalf("NRI plugin failed for %d times to be restarted", maxAttempts)
+		logger.Error(nil, "NRI plugin exhausted restart attempts", "maxAttempts", maxAttempts)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}()
 
 	// register the host network interfaces
@@ -224,16 +226,17 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		for i := 0; i < maxAttempts; i++ {
 			err = plugin.netdb.Run(ctx)
 			if err != nil {
-				klog.Infof("Network Device DB failed with error %v", err)
+				logger.Error(err, "Network Device DB failed")
 			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				klog.Infof("Restarting Network Device DB %d out of %d", i, maxAttempts)
+				logger.Info("Restarting Network Device DB", "attempt", i, "maxAttempts", maxAttempts)
 			}
 		}
-		klog.Fatalf("Network Device DB failed for %d times to be restarted", maxAttempts)
+		logger.Error(nil, "Network Device DB exhausted restart attempts", "maxAttempts", maxAttempts)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}()
 
 	// publish available resources
@@ -263,8 +266,12 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 //     30s) will likely kill the driver before this fallback timeout is
 //     reached.
 //  3. Finally, it cancels the top-level context and stops the NRI plugin stub.
-func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
-	klog.Info("Stopping driver...")
+//
+// ctx is only used to derive the logger; it is expected to be the context that
+// ctxCancel cancels.
+func (np *NetworkDriver) Stop(ctx context.Context, ctxCancel context.CancelFunc) {
+	logger := klog.FromContext(ctx)
+	logger.Info("Stopping driver...")
 
 	// Step 1: Halt the DRA plugin.
 	// This stops the driver from handling new NodePrepareResources requests,
@@ -286,7 +293,7 @@ func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
 		done := func() bool {
 			// Check if we've exceeded the absolute maximum time we're willing to wait.
 			if np.clock.Since(defaultPreviousActivity) >= fallbackTimeout {
-				klog.Warningf("Fallback timeout of %v reached. Proceeding with shutdown despite pending pods.", fallbackTimeout)
+				logger.Info("Fallback timeout reached. Proceeding with shutdown despite pending pods.", "timeout", fallbackTimeout)
 				return true
 			}
 
@@ -294,7 +301,7 @@ func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
 			activities := np.podConfigStore.GetPodNRIActivities()
 			pendingCount := len(activities)
 			if pendingCount == 0 {
-				klog.Info("No pods with allocated devices found on this node. Proceeding with shutdown.")
+				logger.Info("No pods with allocated devices found on this node. Proceeding with shutdown.")
 				return true
 			}
 
@@ -320,11 +327,11 @@ func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
 			// If no pods have had recent activity (or are still waiting for their first hook),
 			// we assume all in-flight pod initializations are complete.
 			if waitingForGrace == 0 {
-				klog.Info("All prepared pods have passed the grace period. Proceeding with shutdown.")
+				logger.Info("All prepared pods have passed the grace period. Proceeding with shutdown.")
 				return true
 			}
 
-			klog.Infof("Waiting for %d prepared pods to finish NRI initialization: %d still in grace period...", pendingCount, waitingForGrace)
+			logger.Info("Waiting for prepared pods to finish NRI initialization", "pending", pendingCount, "inGracePeriod", waitingForGrace)
 			return false
 		}()
 
@@ -342,5 +349,5 @@ func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
 
 	np.nriPlugin.Stop()
 
-	klog.Info("Driver stopped.")
+	logger.Info("Driver stopped.")
 }

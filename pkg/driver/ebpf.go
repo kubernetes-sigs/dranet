@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -32,14 +33,15 @@ import (
 )
 
 // unpinBPFPrograms runs in the host namespace to delete all the pinned bpf programs
-func unpinBPFPrograms(ifName string) error {
+func unpinBPFPrograms(ctx context.Context, ifName string) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "interface", ifName)
 	device, err := nlwrap.LinkByName(ifName)
 	if err != nil {
 		return err
 	}
 	ifIndex := uint32(device.Attrs().Index)
 
-	klog.V(2).Infof("Attempting to unpin eBPF programs from interface %s", ifName)
+	logger.V(2).Info("Attempting to unpin eBPF programs from interface")
 	return filepath.Walk("/sys/fs/bpf", func(pinPath string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -51,13 +53,13 @@ func unpinBPFPrograms(ifName string) error {
 
 		l, err := link.LoadPinnedLink(pinPath, &ebpf.LoadPinOptions{})
 		if err != nil {
-			klog.V(4).Infof("error getting link %s: %v", pinPath, err)
+			logger.V(4).Info("Error getting pinned link", "path", pinPath, "err", err)
 			return nil
 		}
 
 		linkInfo, err := l.Info()
 		if err != nil {
-			klog.Infof("error link info: %v", err)
+			logger.Error(err, "Error getting link info", "path", pinPath)
 			return nil
 		}
 
@@ -86,9 +88,9 @@ func unpinBPFPrograms(ifName string) error {
 		}
 		err = l.Unpin()
 		if err != nil {
-			klog.Infof("fail to unpin bpf link %v", err)
+			logger.Error(err, "Failed to unpin bpf link", "path", pinPath, "linkID", linkInfo.ID)
 		} else {
-			klog.V(2).Infof("successfully unpin bpf from link %d", linkInfo.ID)
+			logger.V(2).Info("Successfully unpinned bpf link", "path", pinPath, "linkID", linkInfo.ID)
 		}
 		return nil
 	})
@@ -99,7 +101,8 @@ func unpinBPFPrograms(ifName string) error {
 // It attempts to remove both classic TC filters and newer TCX programs.
 // It runs inside the network namespace to avoid programs on the root namespace
 // to cause issues detaching the programs.
-func detachEBPFPrograms(containerNsPAth string, ifName string) error {
+func detachEBPFPrograms(ctx context.Context, containerNsPAth string, ifName string) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "interface", ifName, "netns", containerNsPAth)
 	origns, err := netns.Get()
 	if err != nil {
 		return fmt.Errorf("unexpected error trying to get namespace: %v", err)
@@ -127,27 +130,27 @@ func detachEBPFPrograms(containerNsPAth string, ifName string) error {
 	}
 
 	// Detach TC filters (legacy)
-	klog.V(2).Infof("Attempting to detach TC filters from interface %s", device.Attrs().Name)
+	logger.V(2).Info("Attempting to detach TC filters from interface")
 	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
 		filters, err := nlwrap.FilterList(device, parent)
 		if err != nil {
-			klog.V(4).Infof("Could not list TC filters for interface %s (parent %d): %v", device.Attrs().Name, parent, err)
+			logger.V(4).Info("Could not list TC filters for interface", "parent", parent, "err", err)
 			continue
 		}
 		for _, f := range filters {
 			if bpfFilter, ok := f.(*netlink.BpfFilter); ok {
-				klog.V(4).Infof("Deleting TC filter %s from interface %s (parent %d)", bpfFilter.Name, device.Attrs().Name, parent)
+				logger.V(4).Info("Deleting TC filter from interface", "filter", bpfFilter.Name, "parent", parent)
 				if err := netlink.FilterDel(f); err != nil {
-					klog.V(2).Infof("failed to delete TC filter %s on %s: %v", bpfFilter.Name, device.Attrs().Name, err)
+					logger.V(2).Info("Failed to delete TC filter", "filter", bpfFilter.Name, "parent", parent, "err", err)
 				}
 			}
 		}
 	}
 
 	// Detach TCX programs
-	klog.V(2).Infof("Attempting to detach TCX programs from interface %s", device.Attrs().Name)
+	logger.V(2).Info("Attempting to detach TCX programs from interface")
 	for _, attach := range []ebpf.AttachType{ebpf.AttachTCXIngress, ebpf.AttachTCXEgress} {
-		klog.V(2).Infof("Attempting to detach programs from attachment %s interface %s", attach.String(), device.Attrs().Name)
+		logger.V(2).Info("Attempting to detach programs from attachment", "attachType", attach.String())
 		result, err := link.QueryPrograms(link.QueryOptions{
 			Target: int(device.Attrs().Index),
 			Attach: attach,
@@ -157,10 +160,10 @@ func detachEBPFPrograms(containerNsPAth string, ifName string) error {
 			continue
 		}
 		for _, p := range result.Programs {
-			klog.V(2).Infof("Attempting to detach program %d from interface %s", p.ID, device.Attrs().Name)
-			err = tryDetach(p.ID, device.Attrs().Index, attach)
+			logger.V(2).Info("Attempting to detach program from interface", "programID", p.ID, "attachType", attach.String())
+			err = tryDetach(klog.NewContext(ctx, logger), p.ID, device.Attrs().Index, attach)
 			if err != nil {
-				klog.V(2).Infof("Failed to detach program %d from interface %s", p.ID, device.Attrs().Name)
+				logger.V(2).Info("Failed to detach program from interface", "programID", p.ID, "attachType", attach.String(), "err", err)
 				errs = append(errs, err)
 			}
 		}
@@ -169,15 +172,16 @@ func detachEBPFPrograms(containerNsPAth string, ifName string) error {
 	return errors.Join(errs...)
 }
 
-func tryDetach(id ebpf.ProgramID, deviceIdx int, attach ebpf.AttachType) error {
+func tryDetach(ctx context.Context, id ebpf.ProgramID, deviceIdx int, attach ebpf.AttachType) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "programID", id)
 	prog, err := ebpf.NewProgramFromID(id)
 	if err != nil {
-		klog.V(2).Infof("failed to get eBPF program with ID %d: %v", id, err)
+		logger.V(2).Info("Failed to get eBPF program", "err", err)
 		return err
 	}
 
 	if err := prog.Unpin(); err != nil {
-		klog.Infof("failed to unpin eBPF program %s: %v", prog.String(), err)
+		logger.Error(err, "Failed to unpin eBPF program", "program", prog.String())
 		return err
 	}
 
@@ -187,12 +191,12 @@ func tryDetach(id ebpf.ProgramID, deviceIdx int, attach ebpf.AttachType) error {
 		Attach:  attach,
 	})
 	if err != nil {
-		klog.V(2).Infof("failed to detach eBPF program with ID %d: %v", id, err)
+		logger.V(2).Info("Failed to detach eBPF program", "err", err)
 	}
 
 	err = prog.Close()
 	if err != nil {
-		klog.Infof("failed to close eBPF program %s: %v", prog.String(), err)
+		logger.Error(err, "Failed to close eBPF program", "program", prog.String())
 		return err
 	}
 	return nil

@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,9 +44,9 @@ func newTestBoltCheckpointer(t *testing.T) *boltCheckpointer {
 func newTestStoreWithBolt(t *testing.T) (*PodConfigStore, *boltCheckpointer) {
 	t.Helper()
 	cp := newTestBoltCheckpointer(t)
-	store, err := newPodConfigStoreWithCheckpointer(cp)
+	store, err := newPodConfigStoreWithCheckpointer(context.Background(), cp)
 	if err != nil {
-		t.Fatalf("NewPodConfigStore() error: %v", err)
+		t.Fatalf("NewPodConfigStore(context.Background()) error: %v", err)
 	}
 	return store, cp
 }
@@ -171,12 +172,12 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newBoltCheckpointer() error: %v", err)
 	}
-	store1, err := newPodConfigStoreWithCheckpointer(cp1)
+	store1, err := newPodConfigStoreWithCheckpointer(context.Background(), cp1)
 	if err != nil {
-		t.Fatalf("NewPodConfigStore() error: %v", err)
+		t.Fatalf("NewPodConfigStore(context.Background()) error: %v", err)
 	}
-	store1.SetDeviceConfig("pod-1", "eth0", config)
-	store1.SetPodNetNs("pod-1", "/var/run/netns/test-ns")
+	store1.SetDeviceConfig(context.Background(), "pod-1", "eth0", config)
+	store1.SetPodNetNs(context.Background(), "pod-1", "/var/run/netns/test-ns")
 	store1.Close()
 
 	// Reopen and verify data was restored from checkpoint.
@@ -184,9 +185,9 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newBoltCheckpointer() reopen error: %v", err)
 	}
-	store2, err := newPodConfigStoreWithCheckpointer(cp2)
+	store2, err := newPodConfigStoreWithCheckpointer(context.Background(), cp2)
 	if err != nil {
-		t.Fatalf("NewPodConfigStore() reopen error: %v", err)
+		t.Fatalf("NewPodConfigStore(context.Background()) reopen error: %v", err)
 	}
 	defer store2.Close()
 
@@ -217,11 +218,11 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 func TestPodConfigStore_DeletePodCheckpoints(t *testing.T) {
 	store, cp := newTestStoreWithBolt(t)
 
-	store.SetDeviceConfig("pod-1", "eth0", DeviceConfig{Claim: types.NamespacedName{Namespace: "ns", Name: "c1"}})
-	store.SetDeviceConfig("pod-2", "eth0", DeviceConfig{Claim: types.NamespacedName{Namespace: "ns", Name: "c1"}})
-	store.SetDeviceConfig("pod-3", "eth0", DeviceConfig{Claim: types.NamespacedName{Namespace: "ns", Name: "c2"}})
+	store.SetDeviceConfig(context.Background(), "pod-1", "eth0", DeviceConfig{Claim: types.NamespacedName{Namespace: "ns", Name: "c1"}})
+	store.SetDeviceConfig(context.Background(), "pod-2", "eth0", DeviceConfig{Claim: types.NamespacedName{Namespace: "ns", Name: "c1"}})
+	store.SetDeviceConfig(context.Background(), "pod-3", "eth0", DeviceConfig{Claim: types.NamespacedName{Namespace: "ns", Name: "c2"}})
 
-	store.DeletePod("pod-1")
+	store.DeletePod(context.Background(), "pod-1")
 
 	// Verify deleted from bolt.
 	data, _ := cp.GetOrCreate()
@@ -233,7 +234,7 @@ func TestPodConfigStore_DeletePodCheckpoints(t *testing.T) {
 	}
 
 	// DeleteClaim should propagate.
-	store.DeleteClaim(types.NamespacedName{Namespace: "ns", Name: "c1"})
+	store.DeleteClaim(context.Background(), types.NamespacedName{Namespace: "ns", Name: "c1"})
 	data, _ = cp.GetOrCreate()
 	if _, ok := data["pod-2"]; ok {
 		t.Error("pod-2 should have been deleted from checkpoint via DeleteClaim")
@@ -259,13 +260,13 @@ func TestPodConfigStore_ThreadSafetyWithBolt(t *testing.T) {
 					Interface: apis.InterfaceConfig{Name: fmt.Sprintf("dev-%d", i)},
 				},
 			}
-			store.SetDeviceConfig(podUID, deviceName, config)
+			store.SetDeviceConfig(context.Background(), podUID, deviceName, config)
 			retrieved, _ := store.GetDeviceConfig(podUID, deviceName)
 			if diff := cmp.Diff(config, retrieved); diff != "" {
 				t.Errorf("goroutine %d: Get() mismatch (-want +got):\n%s", i, diff)
 			}
 			if i%10 == 0 {
-				store.DeletePod(podUID)
+				store.DeletePod(context.Background(), podUID)
 				_, found := store.GetDeviceConfig(podUID, deviceName)
 				if found {
 					t.Errorf("goroutine %d: Get() found config after DeletePod()", i)
@@ -363,12 +364,12 @@ func TestBoltCheckpointer_Errors(t *testing.T) {
 // TestPodConfigStore_NoCheckpointer verifies that PodConfigStore works
 // correctly without a checkpointer (pure in-memory).
 func TestPodConfigStore_NoCheckpointer(t *testing.T) {
-	store, err := newPodConfigStoreWithCheckpointer(nil)
+	store, err := newPodConfigStoreWithCheckpointer(context.Background(), nil)
 	if err != nil {
-		t.Fatalf("newPodConfigStoreWithCheckpointer(nil) error: %v", err)
+		t.Fatalf("newPodConfigStoreWithCheckpointer(context.Background(), nil) error: %v", err)
 	}
 
-	store.SetDeviceConfig("pod-1", "eth0", DeviceConfig{
+	store.SetDeviceConfig(context.Background(), "pod-1", "eth0", DeviceConfig{
 		NetworkInterfaceConfigInPod: apis.NetworkConfig{
 			Interface: apis.InterfaceConfig{Name: "eth0"},
 		},
@@ -382,7 +383,7 @@ func TestPodConfigStore_NoCheckpointer(t *testing.T) {
 		t.Errorf("unexpected name: %s", config.NetworkInterfaceConfigInPod.Interface.Name)
 	}
 
-	store.DeletePod("pod-1")
+	store.DeletePod(context.Background(), "pod-1")
 	if _, found := store.GetDeviceConfig("pod-1", "eth0"); found {
 		t.Error("expected not found after delete")
 	}

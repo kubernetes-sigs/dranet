@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -159,7 +160,7 @@ type PodConfigStore struct {
 // NewPodConfigStore creates a new PodConfigStore. If dbPath is non-empty, it
 // initializes a bbolt checkpoint backend at that path; otherwise the store is
 // in-memory only.
-func NewPodConfigStore(dbPath string) (*PodConfigStore, error) {
+func NewPodConfigStore(ctx context.Context, dbPath string) (*PodConfigStore, error) {
 	var checkpointer Checkpointer
 	if dbPath != "" {
 		cp, err := newBoltCheckpointer(dbPath)
@@ -169,7 +170,7 @@ func NewPodConfigStore(dbPath string) (*PodConfigStore, error) {
 		checkpointer = cp
 	}
 
-	s, err := newPodConfigStoreWithCheckpointer(checkpointer)
+	s, err := newPodConfigStoreWithCheckpointer(ctx, checkpointer)
 	if err != nil {
 		if checkpointer != nil {
 			checkpointer.Close()
@@ -184,7 +185,8 @@ func NewPodConfigStore(dbPath string) (*PodConfigStore, error) {
 // existing device configs are loaded from the checkpoint into memory. Pod-level state
 // is not persisted; NetNS is rebuilt through Synchronize() on driver startup, while
 // LastNRIActivity resets to its zero value.
-func newPodConfigStoreWithCheckpointer(checkpointer Checkpointer) (*PodConfigStore, error) {
+func newPodConfigStoreWithCheckpointer(ctx context.Context, checkpointer Checkpointer) (*PodConfigStore, error) {
+	logger := klog.FromContext(ctx)
 	s := &PodConfigStore{
 		configs:      make(map[types.UID]PodConfig),
 		checkpointer: checkpointer,
@@ -196,7 +198,7 @@ func newPodConfigStoreWithCheckpointer(checkpointer Checkpointer) (*PodConfigSto
 			return nil, err
 		}
 		for podUID, devices := range saved {
-			klog.Infof("PodConfigStore: loaded checkpoint for pod %s (%d devices)", podUID, len(devices))
+			logger.Info("PodConfigStore: loaded checkpoint for pod", "podUID", podUID, "devices", len(devices))
 			s.configs[podUID] = PodConfig{
 				DeviceConfigs: devices,
 			}
@@ -241,13 +243,13 @@ func (s *PodConfigStore) GetPodNRIActivities() map[types.UID]time.Time {
 // The write is persisted through the checkpointer if one is configured.
 // Persistence is attempted before updating in-memory state to ensure RAM and
 // disk don't diverge if the checkpoint write fails.
-func (s *PodConfigStore) SetDeviceConfig(podUID types.UID, deviceName string, config DeviceConfig) error {
+func (s *PodConfigStore) SetDeviceConfig(ctx context.Context, podUID types.UID, deviceName string, config DeviceConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.checkpointer != nil {
 		if err := s.checkpointer.Store(podUID, deviceName, config); err != nil {
-			klog.Errorf("failed to checkpoint device config for pod %s device %s: %v", podUID, deviceName, err)
+			klog.FromContext(ctx).Error(err, "Failed to checkpoint device config", "podUID", podUID, "device", deviceName)
 			return err
 		}
 	}
@@ -286,13 +288,13 @@ func (s *PodConfigStore) GetDeviceConfig(podUID types.UID, deviceName string) (D
 //
 // Skipping the RAM delete would be worse — the driver would keep processing
 // a pod that the runtime has already removed.
-func (s *PodConfigStore) DeletePod(podUID types.UID) {
+func (s *PodConfigStore) DeletePod(ctx context.Context, podUID types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.checkpointer != nil {
 		if err := s.checkpointer.DeletePod(podUID); err != nil {
-			klog.Errorf("failed to delete checkpoint for pod %s: %v", podUID, err)
+			klog.FromContext(ctx).Error(err, "Failed to delete checkpoint for pod", "podUID", podUID)
 		}
 	}
 	delete(s.configs, podUID)
@@ -333,16 +335,17 @@ func (s *PodConfigStore) GetPodConfig(podUID types.UID) (PodConfig, bool) {
 // SetPodNetNs stores the Pod's network namespace path in the pod-level config.
 // This is in-memory only; pod NetNS is rebuilt from the container runtime on
 // driver restart via Synchronize().
-func (s *PodConfigStore) SetPodNetNs(podUID types.UID, netns string) {
+func (s *PodConfigStore) SetPodNetNs(ctx context.Context, podUID types.UID, netns string) {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "podUID", podUID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	podCfg, ok := s.configs[podUID]
 	if !ok {
-		klog.Errorf("SetPodNetNs: pod UID %s not found in store; skipping NetNS update", podUID)
+		logger.Error(nil, "SetPodNetNs: pod UID not found in store; skipping NetNS update")
 		return
 	}
-	klog.V(3).Infof("SetPodNetNs: setting NetNS for pod %s to %q", podUID, netns)
+	logger.V(3).Info("SetPodNetNs: setting NetNS for pod", "netns", netns)
 	podCfg.NetNS = netns
 	s.configs[podUID] = podCfg
 }
@@ -351,7 +354,7 @@ func (s *PodConfigStore) SetPodNetNs(podUID types.UID, netns string) {
 // claim and returns the list of Pod UIDs that were associated with it.
 // Like DeletePod, checkpoint failures do not prevent in-memory cleanup.
 // See DeletePod for rationale on this intentional asymmetry with SetDeviceConfig.
-func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
+func (s *PodConfigStore) DeleteClaim(ctx context.Context, claim types.NamespacedName) []types.UID {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	podsToDelete := []types.UID{}
@@ -367,7 +370,7 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
 	for _, uid := range podsToDelete {
 		if s.checkpointer != nil {
 			if err := s.checkpointer.DeletePod(uid); err != nil {
-				klog.Errorf("failed to delete checkpoint for pod %s: %v", uid, err)
+				klog.FromContext(ctx).Error(err, "Failed to delete checkpoint for pod", "claim", klog.KRef(claim.Namespace, claim.Name), "podUID", uid)
 			}
 		}
 		delete(s.configs, uid)

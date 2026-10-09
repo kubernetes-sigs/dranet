@@ -196,7 +196,7 @@ func testSubinterface_IPVlan_Namespaced(t *testing.T) {
 		AcceptRA:       ptr.To[int32](0),
 	}
 
-	deviceData, err := nsCreateSubinterface(env.parent, env.nsPath, config)
+	deviceData, err := nsCreateSubinterface(context.Background(), env.parent, env.nsPath, config)
 	if err != nil {
 		t.Fatalf("fail to create subinterface: %v", err)
 	}
@@ -290,7 +290,7 @@ func testSubinterface_IPVlan_Namespaced(t *testing.T) {
 		}
 	})
 
-	if err := nsDeleteSubinterface(env.nsPath, config.Name); err != nil {
+	if err := nsDeleteSubinterface(context.Background(), env.nsPath, config.Name); err != nil {
 		t.Fatalf("fail to delete subinterface: %v", err)
 	}
 	assertOnlyLoopback(t, env)
@@ -318,7 +318,7 @@ func testSubinterface_IPVlanMTU_Namespaced(t *testing.T) {
 				Addresses: []string{"2001:db8::3/128"},
 				MTU:       tc.mtu,
 			}
-			if _, err := nsCreateSubinterface(env.parent, env.nsPath, config); err != nil {
+			if _, err := nsCreateSubinterface(context.Background(), env.parent, env.nsPath, config); err != nil {
 				t.Fatalf("fail to create subinterface: %v", err)
 			}
 			if got := env.linkAttrs(t, config.Name).MTU; got != tc.want {
@@ -341,9 +341,9 @@ func testSubinterface_IPVlanRejectsMTUAboveParent_Namespaced(t *testing.T) {
 		MTU:       ptr.To[int32](1500),
 	}
 
-	_, err := nsCreateSubinterface(env.parent, env.nsPath, config)
+	_, err := nsCreateSubinterface(context.Background(), env.parent, env.nsPath, config)
 	if err == nil || !strings.Contains(err.Error(), "exceeds parent interface") {
-		t.Fatalf("nsCreateSubinterface() error = %v, want a parent MTU error", err)
+		t.Fatalf("nsCreateSubinterface(context.Background()) error = %v, want a parent MTU error", err)
 	}
 	assertOnlyLoopback(t, env)
 }
@@ -370,9 +370,9 @@ func testSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T)
 		t.Fatalf("failed to set the parent down: %v", err)
 	}
 
-	_, err = nsCreateSubinterface(env.parent, env.nsPath, config)
+	_, err = nsCreateSubinterface(context.Background(), env.parent, env.nsPath, config)
 	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
-		t.Fatalf("nsCreateSubinterface() error = %v, want an MTU error", err)
+		t.Fatalf("nsCreateSubinterface(context.Background()) error = %v, want an MTU error", err)
 	}
 	assertOnlyLoopback(t, env)
 	parent, err = nlwrap.LinkByName(env.parent)
@@ -406,9 +406,9 @@ func testSubinterface_IPVlanRollsBackOnSysctlFailure_Namespaced(t *testing.T) {
 	}
 	t.Cleanup(func() { sysctlProvider = original })
 
-	_, err := nsCreateSubinterface(env.parent, env.nsPath, config)
+	_, err := nsCreateSubinterface(context.Background(), env.parent, env.nsPath, config)
 	if err == nil || !strings.Contains(err.Error(), "arp_ignore") {
-		t.Fatalf("nsCreateSubinterface() error = %v, want an arp_ignore apply error", err)
+		t.Fatalf("nsCreateSubinterface(context.Background()) error = %v, want an arp_ignore apply error", err)
 	}
 	assertOnlyLoopback(t, env)
 }
@@ -437,9 +437,9 @@ func testSubinterface_IPVlanRollsBackOnNameCollision_Namespaced(t *testing.T) {
 		t.Fatalf("failed to add colliding dummy link: %v", err)
 	}
 
-	_, err = nsCreateSubinterface(env.parent, env.nsPath, config)
+	_, err = nsCreateSubinterface(context.Background(), env.parent, env.nsPath, config)
 	if err == nil || !strings.Contains(err.Error(), "failed to rename interface") {
-		t.Fatalf("nsCreateSubinterface() error = %v, want a rename error", err)
+		t.Fatalf("nsCreateSubinterface(context.Background()) error = %v, want a rename error", err)
 	}
 	// Only lo and the pre-existing dummy remain, and the dummy is untouched.
 	names := env.linkNames(t)
@@ -549,7 +549,7 @@ func testCreateSubinterfaceInNS_ReportsStatusOnSuccess_Namespaced(t *testing.T) 
 func TestNsDeleteSubinterfaceMissingNamespace(t *testing.T) {
 	// A nonexistent namespace path counts as cleaned up and returns nil.
 	nsPath := path.Join(t.TempDir(), "netns-gone")
-	if err := nsDeleteSubinterface(nsPath, "rdma15"); err != nil {
-		t.Fatalf("nsDeleteSubinterface() returned error for a missing namespace: %v", err)
+	if err := nsDeleteSubinterface(context.Background(), nsPath, "rdma15"); err != nil {
+		t.Fatalf("nsDeleteSubinterface(context.Background()) returned error for a missing namespace: %v", err)
 	}
 }

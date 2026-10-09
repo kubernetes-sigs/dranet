@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -37,7 +38,7 @@ func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
 	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil
 }
 
-func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
+func applyInterfaceSysctlsWithSysctl(ctx context.Context, sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
 	var errorList []error
 	set := func(family, setting string, value int32) {
 		name := fmt.Sprintf("net/%s/conf/%s/%s", family, ifName, setting)
@@ -60,7 +61,7 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 		case errors.Is(err, os.ErrNotExist) && *interfaceConfig.AcceptRA == 0:
 			// The interface has no IPv6 sysctls, so it accepts no router
 			// advertisements and zero is already satisfied.
-			klog.V(4).Infof("%s not found; IPv6 is not enabled on %s and acceptRA: 0 is already satisfied", name, ifName)
+			klog.FromContext(ctx).V(4).Info("Sysctl not found; IPv6 is not enabled on the interface and acceptRA: 0 is already satisfied", "sysctl", name, "interface", ifName)
 		case errors.Is(err, os.ErrNotExist):
 			errorList = append(errorList, fmt.Errorf("failed to set %s: IPv6 is not enabled on the interface: %w", name, err))
 		default:
@@ -74,7 +75,7 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 // Pod network namespace. These live under /proc/sys, so unlike the rest of the
 // interface configuration they cannot be set through a netlink handle and
 // require joining the namespace.
-func applyInterfaceSysctlConfig(containerNs netns.NsHandle, ifName string, interfaceConfig apis.InterfaceConfig) error {
+func applyInterfaceSysctlConfig(ctx context.Context, containerNs netns.NsHandle, ifName string, interfaceConfig apis.InterfaceConfig) error {
 	if !hasInterfaceSysctlConfig(interfaceConfig) {
 		return nil
 	}
@@ -101,7 +102,7 @@ func applyInterfaceSysctlConfig(containerNs netns.NsHandle, ifName string, inter
 			return
 		}
 
-		applyErr := applyInterfaceSysctlsWithSysctl(sysctlProvider(), ifName, interfaceConfig)
+		applyErr := applyInterfaceSysctlsWithSysctl(ctx, sysctlProvider(), ifName, interfaceConfig)
 		if err := netns.Set(originalNs); err != nil {
 			// Keep this thread locked so the runtime destroys it instead of
 			// reusing it in the wrong network namespace.

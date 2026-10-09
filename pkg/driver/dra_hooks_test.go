@@ -212,7 +212,7 @@ func TestUnprepareResourceClaimsMetrics(t *testing.T) {
 			podConfigStore: mustNewPodConfigStore(),
 		}
 		claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
-		np.podConfigStore.SetDeviceConfig("pod-uid-1", "device-a", DeviceConfig{Claim: claimName})
+		np.podConfigStore.SetDeviceConfig(context.Background(), "pod-uid-1", "device-a", DeviceConfig{Claim: claimName})
 
 		claims := []kubeletplugin.NamespacedObject{
 			{NamespacedName: claimName, UID: "claim-uid-1"},
@@ -569,7 +569,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 		claimName := types.NamespacedName{Namespace: "default", Name: "claim-td"}
 		// Inject a profile in pod config store
-		np.podConfigStore.SetDeviceConfig("pod-uid-td", "device-1", DeviceConfig{
+		np.podConfigStore.SetDeviceConfig(context.Background(), "pod-uid-td", "device-1", DeviceConfig{
 			Claim:                       claimName,
 			NetworkInterfaceConfigInPod: apis.NetworkConfig{Profile: "my-profile"},
 		})
@@ -970,7 +970,7 @@ func TestGetDeviceNetworkConfigWithWebhook(t *testing.T) {
 			}
 
 			claim := &resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-1"}}
-			mergedConf, err := np.getDeviceNetworkConfig("device-1", claim, tc.userConf)
+			mergedConf, err := np.getDeviceNetworkConfig(context.Background(), "device-1", claim, tc.userConf)
 
 			if tc.expectedError {
 				if err == nil {
@@ -1956,7 +1956,7 @@ func TestClearStaleRouteSources(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			clearStaleRouteSources(tc.routes, tc.addresses)
+			clearStaleRouteSources(context.Background(), tc.routes, tc.addresses)
 			for i, want := range tc.wantSources {
 				if tc.routes[i].Source != want {
 					t.Errorf("route %d source = %q, want %q", i, tc.routes[i].Source, want)

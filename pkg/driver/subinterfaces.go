@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -44,7 +45,7 @@ var ipvlanFlagToNetlink = map[apis.IPVlanFlag]netlink.IPVlanFlag{
 
 // addIPVlan creates an IPVLAN child of parentLink inside containerNs, applies
 // the interface settings, and deletes the child again if any later step fails.
-func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandle, config apis.InterfaceConfig) (networkData *resourceapi.NetworkDeviceData, err error) {
+func addIPVlan(ctx context.Context, ifName string, parentLink netlink.Link, containerNs netns.NsHandle, config apis.InterfaceConfig) (networkData *resourceapi.NetworkDeviceData, err error) {
 	mode := netlink.IPVLAN_MODE_L2
 	flag := netlink.IPVLAN_FLAG_BRIDGE
 	if config.IPVlan != nil {
@@ -120,7 +121,7 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 
 	// Apply before the link comes up so it never answers ARP or accepts router
 	// advertisements with the wrong policy.
-	if err := applyInterfaceSysctlConfig(containerNs, ifName, config); err != nil {
+	if err := applyInterfaceSysctlConfig(ctx, containerNs, ifName, config); err != nil {
 		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s: %w", ifName, err)
 	}
 
@@ -132,7 +133,7 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 	for _, address := range config.Addresses {
 		ip, ipnet, err := net.ParseCIDR(address)
 		if err != nil {
-			klog.Infof("failed to parse address %s : %v", address, err)
+			klog.FromContext(ctx).Error(err, "Failed to parse address", "address", address)
 			continue
 		}
 		err = nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}})
@@ -177,7 +178,7 @@ func applyOffloadSizes(nhNs nlwrap.Handle, link netlink.Link, ifName string, con
 
 // nsCreateSubinterface creates a subinterface (currently supports IPVLAN) of hostIfName
 // directly in the container network namespace and configures it with the specified addresses.
-func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
+func nsCreateSubinterface(ctx context.Context, hostIfName string, containerNsPath string, config apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
 	containerNs, err := netns.GetFromPath(containerNsPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container network namespace %s: %w", containerNsPath, err)
@@ -207,7 +208,7 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis
 	var networkData *resourceapi.NetworkDeviceData
 	// We only support creating IPVLAN subinterface right now.
 	if config.Type == apis.InterfaceTypeIPVLAN {
-		networkData, err = addIPVlan(config.Name, parentLink, containerNs, config)
+		networkData, err = addIPVlan(ctx, config.Name, parentLink, containerNs, config)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create the %s ipvlan interface on namespace %s: %w", config.Name, containerNsPath, err)
 		}
@@ -222,10 +223,10 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis
 // A namespace path that no longer exists counts as cleaned up. The kernel
 // deletes any IPvlan child still in the namespace when the namespace is
 // destroyed.
-func nsDeleteSubinterface(containerNsPath string, devName string) error {
+func nsDeleteSubinterface(ctx context.Context, containerNsPath string, devName string) error {
 	containerNs, err := netns.GetFromPath(containerNsPath)
 	if errors.Is(err, os.ErrNotExist) {
-		klog.V(2).Infof("Network namespace path %s is gone; relying on the kernel to delete subinterface %s when the namespace is destroyed", containerNsPath, devName)
+		klog.FromContext(ctx).V(2).Info("Network namespace path is gone; relying on the kernel to delete subinterface when the namespace is destroyed", "netns", containerNsPath, "interface", devName)
 		return nil
 	}
 	if err != nil {

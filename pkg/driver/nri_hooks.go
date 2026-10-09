@@ -56,7 +56,7 @@ func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox
 	// Process stored pods: update NetNS for live pods.
 	for _, storedUID := range np.podConfigStore.ListPods() {
 		if ns, isLive := livePodNetNs[storedUID]; isLive {
-			np.podConfigStore.SetPodNetNs(storedUID, ns)
+			np.podConfigStore.SetPodNetNs(ctx, storedUID, ns)
 		}
 	}
 
@@ -153,7 +153,7 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 		return fmt.Errorf("RunPodSandbox pod %s/%s using host network can not claim host devices", pod.Namespace, pod.Name)
 	}
 	// store the Pod network namespace in the pod config store
-	np.podConfigStore.SetPodNetNs(types.UID(pod.GetUid()), ns)
+	np.podConfigStore.SetPodNetNs(ctx, types.UID(pod.GetUid()), ns)
 
 	// Track all the status updates needed for the resource claims of the pod.
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
@@ -267,7 +267,7 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 	logger.V(2).Info("RunPodSandbox processing Network device")
 	// TODO config options to rename the device and pass parameters
 	// use https://github.com/opencontainers/runtime-spec/pull/1271
-	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
+	networkData, err := nsAttachNetdev(ctx, ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
@@ -296,7 +296,7 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 	hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger.V(2).Info("RunPodSandbox creating subinterface on parent device", "parentDevice", hostIfName)
 
-	networkData, err := nsCreateSubinterface(hostIfName, ns, config.NetworkInterfaceConfigInPod.Interface)
+	networkData, err := nsCreateSubinterface(ctx, hostIfName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error creating subinterface", "parentDevice", hostIfName, "netns", ns)
 		return fmt.Errorf("error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)
@@ -305,7 +305,7 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 	// Configure the subinterface (ethtool, vrf, routes, neighbors, rules)
 	if err := configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice); err != nil {
 		// Delete the child now rather than leaving it half configured until pod teardown.
-		if delErr := nsDeleteSubinterface(ns, networkData.InterfaceName); delErr != nil {
+		if delErr := nsDeleteSubinterface(ctx, ns, networkData.InterfaceName); delErr != nil {
 			return errors.Join(err, fmt.Errorf("failed to delete subinterface %s after a configuration failure: %w", networkData.InterfaceName, delErr))
 		}
 		return err
@@ -335,7 +335,7 @@ func configureNetdevInNS(ctx context.Context, ns, deviceName string, config Devi
 
 	// Apply Ethtool configurations
 	if config.NetworkInterfaceConfigInPod.Ethtool != nil {
-		err = applyEthtoolConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Ethtool)
+		err = applyEthtoolConfig(ctx, ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Ethtool)
 		if err != nil {
 			logger.Error(err, "RunPodSandbox error applying ethtool config", "podInterface", ifNameInNs)
 			return fmt.Errorf("error applying ethtool config for %s in ns %s: %v", ifNameInNs, ns, err)
@@ -345,7 +345,7 @@ func configureNetdevInNS(ctx context.Context, ns, deviceName string, config Devi
 	// Check if the ebpf programs should be disabled
 	if config.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms != nil &&
 		*config.NetworkInterfaceConfigInPod.Interface.DisableEBPFPrograms {
-		err = detachEBPFPrograms(ns, ifNameInNs)
+		err = detachEBPFPrograms(ctx, ns, ifNameInNs)
 		if err != nil {
 			logger.Error(err, "Error disabling ebpf programs", "podInterface", ifNameInNs)
 			return fmt.Errorf("error disabling ebpf programs for %s in ns %s: %v", ifNameInNs, ns, err)
@@ -457,7 +457,7 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		if ifName != "" {
 			if config.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
 				subIfName := config.NetworkInterfaceConfigInPod.Interface.Name
-				if err := nsDeleteSubinterface(ns, subIfName); err != nil {
+				if err := nsDeleteSubinterface(ctx, ns, subIfName); err != nil {
 					logger.Error(err, "Failed to delete subinterface", "subInterface", subIfName, "device", deviceName)
 				}
 			} else {
