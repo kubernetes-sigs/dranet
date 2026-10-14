@@ -48,6 +48,7 @@ func registerMetrics() {
 		prometheus.MustRegister(publishedDevicesTotal)
 		prometheus.MustRegister(lastPublishedTime)
 		prometheus.MustRegister(nriPluginDisconnectsTotal)
+		prometheus.MustRegister(nriPluginReconnectAttemptsTotal)
 		prometheus.MustRegister(netdbReconnectAttemptsTotal)
 	})
 }
@@ -95,23 +96,36 @@ var (
 	// nri_plugin_requests_total{status="failed"}: a disconnect can happen after
 	// the local handler already returned success, since containerd gives up and
 	// tears down the connection independently of whether/how the handler finishes.
+	// Also narrower than nriPluginReconnectAttemptsTotal below: stub.WithOnClose
+	// is only wired once the ttrpc client exists, so this only fires for a
+	// connection that was established and later torn down. It does not fire for
+	// a retry caused by stub.connect() or stub.register() failing before that
+	// point (e.g. containerd's NRI socket not up yet, or registration timing
+	// out) -- see (*stub).Start() in github.com/containerd/nri/pkg/stub.
 	nriPluginDisconnectsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",
 		Name:      "nri_plugin_disconnects_total",
 		Help:      "Total number of times containerd closed its NRI plugin connection to dranet (e.g. on plugin_request_timeout).",
 	})
-	// netdbReconnectAttemptsTotal counts restarts of the host network device
-	// database's Run loop in Start(). The loop is capped at maxAttempts before
-	// the process exits via klog.Fatalf, so this value approaching maxAttempts
-	// is an early warning ahead of that exit, whereas the container restart
-	// itself only becomes visible afterwards, via
-	// kube_pod_container_status_restarts_total. A Counter, not a Gauge: within
-	// a process's life this only ever increases, and it resets the same way a
-	// Gauge would anyway -- on process restart. There is no equivalent counter
-	// for the NRI plugin side; nriPluginDisconnectsTotal above already serves
-	// that purpose for the NRI connection, so no separate attempt counter is
-	// needed there.
+	// nriPluginReconnectAttemptsTotal and netdbReconnectAttemptsTotal count
+	// restarts of each subsystem's loop in Start() (the NRI plugin connection,
+	// and the host network device database, respectively), incremented
+	// directly in the retry loop so every retry is counted regardless of why
+	// Run() failed -- unlike nriPluginDisconnectsTotal above, which only
+	// covers one specific failure mode on the NRI side. Both loops are capped
+	// at maxAttempts before the process exits via klog.Fatalf, so either
+	// value approaching maxAttempts is an early warning ahead of that exit,
+	// whereas the container restart itself only becomes visible afterwards,
+	// via kube_pod_container_status_restarts_total. Counters, not Gauges:
+	// within a process's life these only ever increase, and they reset the
+	// same way a Gauge would anyway -- on process restart.
+	nriPluginReconnectAttemptsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "nri_plugin_reconnect_attempts_total",
+		Help:      "Total number of times the NRI plugin connection loop has been restarted. Resets on process restart; approaches maxAttempts before the process exits.",
+	})
 	netdbReconnectAttemptsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",

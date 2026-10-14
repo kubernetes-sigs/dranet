@@ -33,6 +33,17 @@ func TestOnNRIPluginClose(t *testing.T) {
 	}
 }
 
+func TestNRIPluginReconnectAttemptsTotal(t *testing.T) {
+	before := testutil.ToFloat64(nriPluginReconnectAttemptsTotal)
+
+	nriPluginReconnectAttemptsTotal.Inc()
+	nriPluginReconnectAttemptsTotal.Inc()
+
+	if got := testutil.ToFloat64(nriPluginReconnectAttemptsTotal) - before; got != 2 {
+		t.Errorf("expected nriPluginReconnectAttemptsTotal to increase by 2, got %v", got)
+	}
+}
+
 func TestNetdbReconnectAttemptsTotal(t *testing.T) {
 	before := testutil.ToFloat64(netdbReconnectAttemptsTotal)
 
