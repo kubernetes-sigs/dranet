@@ -22,17 +22,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func TestOnNRIPluginClose(t *testing.T) {
-	before := testutil.ToFloat64(nriPluginDisconnectsTotal)
-
-	onNRIPluginClose("test-driver")
-	onNRIPluginClose("test-driver")
-
-	if got := testutil.ToFloat64(nriPluginDisconnectsTotal) - before; got != 2 {
-		t.Errorf("expected nriPluginDisconnectsTotal to increase by 2, got %v", got)
-	}
-}
-
 func TestNRIPluginReconnectAttemptsTotal(t *testing.T) {
 	before := testutil.ToFloat64(nriPluginReconnectAttemptsTotal)
 

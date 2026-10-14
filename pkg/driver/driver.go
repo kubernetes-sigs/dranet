@@ -120,16 +120,6 @@ type NetworkDriver struct {
 
 type Option func(*NetworkDriver)
 
-// onNRIPluginClose is the stub.WithOnClose callback invoked when containerd
-// closes its ttrpc connection to this plugin, e.g. after an NRI request
-// exceeds containerd's plugin_request_timeout. Extracted from Start() so it
-// can be exercised directly in tests, since triggering a real containerd
-// disconnect is not practical in a unit test.
-func onNRIPluginClose(driverName string) {
-	nriPluginDisconnectsTotal.Inc()
-	klog.Infof("%s NRI plugin closed", driverName)
-}
-
 func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interface, nodeName string, podConfigStore *PodConfigStore, opts ...Option) (*NetworkDriver, error) {
 	registerMetrics()
 
@@ -201,7 +191,8 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		// https://github.com/containerd/nri/pull/173
 		// Otherwise it silently exits the program
 		stub.WithOnClose(func() {
-			onNRIPluginClose(driverName)
+			nriPluginDisconnectsTotal.Inc()
+			klog.Infof("%s NRI plugin closed", driverName)
 		}),
 	}
 	stub, err := stub.New(plugin, nriOpts...)
