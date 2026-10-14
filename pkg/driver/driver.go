@@ -211,7 +211,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				nriPluginReconnectAttempt.Set(float64(i))
+				nriPluginReconnectAttempt.Set(float64(i+1))
 				klog.Infof("Restarting NRI plugin %d out of %d", i, maxAttempts)
 			}
 		}
