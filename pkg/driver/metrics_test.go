@@ -17,49 +17,30 @@ limitations under the License.
 package driver
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func TestNRIPluginDisconnectsTotal(t *testing.T) {
+func TestOnNRIPluginClose(t *testing.T) {
 	before := testutil.ToFloat64(nriPluginDisconnectsTotal)
 
-	nriPluginDisconnectsTotal.Inc()
-	nriPluginDisconnectsTotal.Inc()
+	onNRIPluginClose("test-driver")
+	onNRIPluginClose("test-driver")
 
 	if got := testutil.ToFloat64(nriPluginDisconnectsTotal) - before; got != 2 {
 		t.Errorf("expected nriPluginDisconnectsTotal to increase by 2, got %v", got)
 	}
 }
 
-func TestReconnectAttemptGauges(t *testing.T) {
-	nriPluginReconnectAttempt.Set(3)
-	netdbReconnectAttempt.Set(1)
+func TestNetdbReconnectAttemptsTotal(t *testing.T) {
+	before := testutil.ToFloat64(netdbReconnectAttemptsTotal)
 
-	if got := testutil.ToFloat64(nriPluginReconnectAttempt); got != 3 {
-		t.Errorf("expected nri_plugin reconnect attempt to be 3, got %v", got)
-	}
-	if got := testutil.ToFloat64(netdbReconnectAttempt); got != 1 {
-		t.Errorf("expected netdb reconnect attempt to be 1, got %v", got)
-	}
+	netdbReconnectAttemptsTotal.Inc()
+	netdbReconnectAttemptsTotal.Inc()
+	netdbReconnectAttemptsTotal.Inc()
 
-	expectedNRI := `
-		# HELP dranet_driver_nri_plugin_reconnect_attempt Current attempt number (0-indexed) in the restart loop for the NRI plugin connection. Resets to 0 on process restart; approaches maxAttempts before the process exits.
-		# TYPE dranet_driver_nri_plugin_reconnect_attempt gauge
-		dranet_driver_nri_plugin_reconnect_attempt 3
-		`
-	if err := testutil.CollectAndCompare(nriPluginReconnectAttempt, strings.NewReader(expectedNRI), "dranet_driver_nri_plugin_reconnect_attempt"); err != nil {
-		t.Fatalf("CollectAndCompare failed for nriPluginReconnectAttempt: %v", err)
-	}
-
-	expectedNetdb := `
-		# HELP dranet_driver_netdb_reconnect_attempt Current attempt number (0-indexed) in the restart loop for the host network device database. Resets to 0 on process restart; approaches maxAttempts before the process exits.
-		# TYPE dranet_driver_netdb_reconnect_attempt gauge
-		dranet_driver_netdb_reconnect_attempt 1
-		`
-	if err := testutil.CollectAndCompare(netdbReconnectAttempt, strings.NewReader(expectedNetdb), "dranet_driver_netdb_reconnect_attempt"); err != nil {
-		t.Fatalf("CollectAndCompare failed for netdbReconnectAttempt: %v", err)
+	if got := testutil.ToFloat64(netdbReconnectAttemptsTotal) - before; got != 3 {
+		t.Errorf("expected netdbReconnectAttemptsTotal to increase by 3, got %v", got)
 	}
 }

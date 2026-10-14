@@ -120,6 +120,16 @@ type NetworkDriver struct {
 
 type Option func(*NetworkDriver)
 
+// onNRIPluginClose is the stub.WithOnClose callback invoked when containerd
+// closes its ttrpc connection to this plugin, e.g. after an NRI request
+// exceeds containerd's plugin_request_timeout. Extracted from Start() so it
+// can be exercised directly in tests, since triggering a real containerd
+// disconnect is not practical in a unit test.
+func onNRIPluginClose(driverName string) {
+	nriPluginDisconnectsTotal.Inc()
+	klog.Infof("%s NRI plugin closed", driverName)
+}
+
 func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interface, nodeName string, podConfigStore *PodConfigStore, opts ...Option) (*NetworkDriver, error) {
 	registerMetrics()
 
@@ -191,8 +201,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		// https://github.com/containerd/nri/pull/173
 		// Otherwise it silently exits the program
 		stub.WithOnClose(func() {
-			nriPluginDisconnectsTotal.Inc()
-			klog.Infof("%s NRI plugin closed", driverName)
+			onNRIPluginClose(driverName)
 		}),
 	}
 	stub, err := stub.New(plugin, nriOpts...)
@@ -211,8 +220,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				nriPluginReconnectAttempt.Set(float64(i+1))
-				klog.Infof("Restarting NRI plugin %d out of %d", i, maxAttempts)
+				klog.Infof("Restarting NRI plugin %d out of %d", i+1, maxAttempts)
 			}
 		}
 		klog.Fatalf("NRI plugin failed for %d times to be restarted", maxAttempts)
@@ -232,8 +240,8 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				netdbReconnectAttempt.Set(float64(i))
-				klog.Infof("Restarting Network Device DB %d out of %d", i, maxAttempts)
+				netdbReconnectAttemptsTotal.Inc()
+				klog.Infof("Restarting Network Device DB %d out of %d", i+1, maxAttempts)
 			}
 		}
 		klog.Fatalf("Network Device DB failed for %d times to be restarted", maxAttempts)
