@@ -46,17 +46,19 @@ func (m *fakePluginHelper) RegistrationStatus() *registerapi.RegistrationStatus 
 
 // mockNetDB is a mock implementation of the inventoryDB interface for testing.
 type fakeInventoryDB struct {
-	resources                chan []resourcev1.Device
-	rescanCalls              atomic.Int32
-	GetDeviceFunc            func(deviceName string) (resourcev1.Device, bool)
-	GetDeviceConfigFunc      func(deviceName string) (*apis.NetworkConfig, bool)
-	GetNetInterfaceNameFunc  func(deviceName string) (string, error)
-	IsIBOnlyDeviceFunc       func(deviceName string) bool
-	GetRDMADeviceNameFunc    func(deviceName string) (string, error)
-	GetProfileConfigFunc     func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
-	ReleaseProfileConfigFunc func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
-	profileCalls             atomic.Int32
-	releaseProfileCalls      atomic.Int32
+	resources                      chan []resourcev1.Device
+	rescanCalls                    atomic.Int32
+	GetDeviceFunc                  func(deviceName string) (resourcev1.Device, bool)
+	GetDeviceConfigFunc            func(deviceName string) (*apis.NetworkConfig, bool)
+	GetNetInterfaceNameFunc        func(deviceName string) (string, error)
+	IsIBOnlyDeviceFunc             func(deviceName string) bool
+	GetRDMADeviceNameFunc          func(deviceName string) (string, error)
+	GetProfileConfigFunc           func(deviceName string, claim *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
+	ReleaseProfileConfigFunc       func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
+	ValidateHostNetworkConfigFunc  func(deviceName string, config *apis.NetworkConfig) error
+	profileCalls                   atomic.Int32
+	releaseProfileCalls            atomic.Int32
+	validateHostNetworkConfigCalls atomic.Int32
 }
 
 func newFakeInventoryDB() *fakeInventoryDB {
@@ -122,6 +124,14 @@ func (m *fakeInventoryDB) ReleaseProfileConfig(deviceName string, claimUID types
 	m.releaseProfileCalls.Add(1)
 	if m.ReleaseProfileConfigFunc != nil {
 		return m.ReleaseProfileConfigFunc(deviceName, claimUID, config)
+	}
+	return nil
+}
+
+func (m *fakeInventoryDB) ValidateHostNetworkConfig(deviceName string, config *apis.NetworkConfig) error {
+	m.validateHostNetworkConfigCalls.Add(1)
+	if m.ValidateHostNetworkConfigFunc != nil {
+		return m.ValidateHostNetworkConfigFunc(deviceName, config)
 	}
 	return nil
 }

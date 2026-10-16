@@ -1860,6 +1860,164 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "nil host-network validator is a no-op and still checkpoints",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-val-noop", Namespace: "default", Name: "claim-val-noop"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-val-noop"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-val-noop", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) {
+					return "dummy0", nil
+				}
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				// ValidateHostNetworkConfigFunc left nil: fake returns nil (no-op).
+			},
+			wantPodConfig: &PodConfig{
+				DeviceConfigs: map[string]DeviceConfig{
+					"net-dev-val-noop": {
+						Claim: types.NamespacedName{
+							Namespace: "default",
+							Name:      "claim-val-noop",
+						},
+						DeviceSnapshot: &resourcev1.Device{Name: "net-dev-val-noop"},
+						NetworkInterfaceConfigInHost: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{Name: "dummy0"},
+						},
+						NetworkInterfaceConfigInPod: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{Name: "dummy0"},
+						},
+					},
+				},
+			},
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.validateHostNetworkConfigCalls.Load(); got != 1 {
+					t.Errorf("ValidateHostNetworkConfig calls = %d, want 1", got)
+				}
+				// Interface remains on the host (prepare never moves it).
+				if _, err := netlink.LinkByName("dummy0"); err != nil {
+					t.Errorf("dummy0 should remain on host after successful prepare: %v", err)
+				}
+			},
+		},
+		{
+			name: "host-network validation success checkpoints config",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-val-ok", Namespace: "default", Name: "claim-val-ok"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-val-ok"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-val-ok", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) {
+					return "dummy0", nil
+				}
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.ValidateHostNetworkConfigFunc = func(deviceName string, config *apis.NetworkConfig) error {
+					if deviceName != "net-dev-val-ok" {
+						return fmt.Errorf("unexpected device %s", deviceName)
+					}
+					if config == nil {
+						return fmt.Errorf("expected non-nil config")
+					}
+					if config.Interface.Name != "dummy0" {
+						return fmt.Errorf("expected interface name dummy0, got %q", config.Interface.Name)
+					}
+					return nil
+				}
+			},
+			wantPodConfig: &PodConfig{
+				DeviceConfigs: map[string]DeviceConfig{
+					"net-dev-val-ok": {
+						Claim: types.NamespacedName{
+							Namespace: "default",
+							Name:      "claim-val-ok",
+						},
+						DeviceSnapshot: &resourcev1.Device{Name: "net-dev-val-ok"},
+						NetworkInterfaceConfigInHost: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{Name: "dummy0"},
+						},
+						NetworkInterfaceConfigInPod: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{Name: "dummy0"},
+						},
+					},
+				},
+			},
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.validateHostNetworkConfigCalls.Load(); got != 1 {
+					t.Errorf("ValidateHostNetworkConfig calls = %d, want 1", got)
+				}
+			},
+		},
+		{
+			name: "host-network validation failure returns PrepareResult.Err and does not checkpoint",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-val-fail", Namespace: "default", Name: "claim-val-fail"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-val-fail"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-val-fail", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) {
+					return "dummy0", nil
+				}
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.ValidateHostNetworkConfigFunc = func(deviceName string, config *apis.NetworkConfig) error {
+					return fmt.Errorf("incomplete host routes for table 100")
+				}
+			},
+			wantErr:     "host network config validation failed",
+			wantErrAlso: "incomplete host routes for table 100",
+			// wantPodConfig nil: SetDeviceConfig must not have been called.
+			check: func(t *testing.T, db *fakeInventoryDB) {
+				if got := db.validateHostNetworkConfigCalls.Load(); got != 1 {
+					t.Errorf("ValidateHostNetworkConfig calls = %d, want 1", got)
+				}
+				// Interface left on the host — prepare never moves it, and we
+				// did not checkpoint so NRI will not move it either.
+				if _, err := netlink.LinkByName("dummy0"); err != nil {
+					t.Errorf("dummy0 should remain on host after validation failure: %v", err)
+				}
+			},
+		},
 	}
 
 	for _, tc := range testCases {

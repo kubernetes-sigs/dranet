@@ -981,3 +981,69 @@ func TestAddRDMAAttributesStandalone(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateHostNetworkConfig(t *testing.T) {
+	device := resourceapi.Device{
+		Name: "eth0",
+		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			apis.AttrInterfaceName: {StringValue: ptr.To("eth0")},
+			apis.AttrMac:           {StringValue: ptr.To("aa:bb:cc:dd:ee:ff")},
+		},
+	}
+
+	t.Run("nil validator is no-op", func(t *testing.T) {
+		db := New()
+		db.deviceStore["eth0"] = device
+		if err := db.ValidateHostNetworkConfig("eth0", &apis.NetworkConfig{}); err != nil {
+			t.Fatalf("ValidateHostNetworkConfig() = %v, want nil", err)
+		}
+	})
+
+	t.Run("validator success", func(t *testing.T) {
+		called := false
+		db := New(WithHostNetworkConfigValidator(&fakeHostNetValidator{
+			fn: func(id cloudprovider.DeviceIdentifiers, config *apis.NetworkConfig) error {
+				called = true
+				if id.Name != "eth0" || id.MAC != "aa:bb:cc:dd:ee:ff" {
+					t.Errorf("unexpected identifiers: %+v", id)
+				}
+				if config == nil || len(config.Routes) != 1 {
+					t.Errorf("unexpected config: %+v", config)
+				}
+				return nil
+			},
+		}))
+		db.deviceStore["eth0"] = device
+		cfg := &apis.NetworkConfig{Routes: []apis.RouteConfig{{Destination: "10.0.0.0/8"}}}
+		if err := db.ValidateHostNetworkConfig("eth0", cfg); err != nil {
+			t.Fatalf("ValidateHostNetworkConfig() = %v, want nil", err)
+		}
+		if !called {
+			t.Fatal("expected validator to be called")
+		}
+	})
+
+	t.Run("validator failure", func(t *testing.T) {
+		db := New(WithHostNetworkConfigValidator(&fakeHostNetValidator{
+			fn: func(id cloudprovider.DeviceIdentifiers, config *apis.NetworkConfig) error {
+				return fmt.Errorf("incomplete routes")
+			},
+		}))
+		db.deviceStore["eth0"] = device
+		err := db.ValidateHostNetworkConfig("eth0", &apis.NetworkConfig{})
+		if err == nil || !strings.Contains(err.Error(), "incomplete routes") {
+			t.Fatalf("ValidateHostNetworkConfig() = %v, want incomplete routes", err)
+		}
+	})
+}
+
+type fakeHostNetValidator struct {
+	fn func(id cloudprovider.DeviceIdentifiers, config *apis.NetworkConfig) error
+}
+
+func (f *fakeHostNetValidator) ValidateHostNetworkConfig(id cloudprovider.DeviceIdentifiers, config *apis.NetworkConfig) error {
+	if f.fn != nil {
+		return f.fn(id, config)
+	}
+	return nil
+}
