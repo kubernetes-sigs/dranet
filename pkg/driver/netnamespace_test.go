@@ -224,6 +224,48 @@ func test_applyVRFConfigKeepsIPv6Addresses(t *testing.T) {
 	}
 }
 
+func Test_validateVRFLink(t *testing.T) {
+	tests := []struct {
+		name    string
+		link    netlink.Link
+		wantErr []string
+	}{
+		{
+			name: "vrf with matching table",
+			link: &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: "vrf-blue"}, Table: 100},
+		},
+		{
+			name:    "vrf with different table",
+			link:    &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: "vrf-blue"}, Table: 200},
+			wantErr: []string{"vrf-blue", "100", "200"},
+		},
+		{
+			name:    "non-vrf link",
+			link:    &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "vrf-blue"}},
+			wantErr: []string{"vrf-blue", "not a vrf", "dummy"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateVRFLink(tt.link, "vrf-blue", 100)
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("validateVRFLink() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("validateVRFLink() succeeded, want error")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("validateVRFLink() error = %q, want it to mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func Test_applyVRFConfig(t *testing.T) {
 	userns.Run(t, test_applyVRFConfig_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
 }
@@ -269,29 +311,50 @@ func newVRFTestNamespace(t *testing.T) (string, nlwrap.Handle) {
 	return path.Join("/run/netns", nsName), nhNs
 }
 
+// vrfSupported probes, in its own namespace, whether VRF devices can be
+// created. Only EOPNOTSUPP, returned when the kernel has no vrf link type,
+// counts as unsupported; any other failure fails the test.
+func vrfSupported(t *testing.T) bool {
+	t.Helper()
+	_, nhNs := newVRFTestNamespace(t)
+	err := nhNs.LinkAdd(&netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: "vrf-probe"}, Table: 1000})
+	if errors.Is(err, syscall.EOPNOTSUPP) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("failed to probe vrf support: %v", err)
+	}
+	return true
+}
+
 func test_applyVRFConfig_Namespaced(t *testing.T) {
 	const (
 		ifName  = "dummy0"
 		vrfName = "vrf-blue"
 	)
 	table := 100
+	haveVRF := vrfSupported(t)
 
 	tests := []struct {
 		name string
 		// existing is created in the namespace before applyVRFConfig runs.
 		existing netlink.Link
+		needsVRF bool
 		wantErr  []string
 	}{
 		{
-			name: "creates missing vrf",
+			name:     "creates missing vrf",
+			needsVRF: true,
 		},
 		{
 			name:     "reuses vrf with matching table",
 			existing: &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: vrfName}, Table: 100},
+			needsVRF: true,
 		},
 		{
 			name:     "rejects vrf with different table",
 			existing: &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: vrfName}, Table: 200},
+			needsVRF: true,
 			wantErr:  []string{vrfName, "100", "200"},
 		},
 		{
@@ -303,6 +366,9 @@ func test_applyVRFConfig_Namespaced(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.needsVRF && !haveVRF {
+				t.Skip("kernel does not support vrf devices (EOPNOTSUPP)")
+			}
 			nsPath, nhNs := newVRFTestNamespace(t)
 			if tt.existing != nil {
 				if err := nhNs.LinkAdd(tt.existing); err != nil {
@@ -311,6 +377,12 @@ func test_applyVRFConfig_Namespaced(t *testing.T) {
 			}
 
 			got, err := applyVRFConfig(nsPath, ifName, &apis.VRFConfig{Name: vrfName, Table: &table})
+			if len(tt.wantErr) == 0 && err != nil {
+				t.Fatalf("applyVRFConfig() unexpected error: %v", err)
+			}
+			if len(tt.wantErr) > 0 && err == nil {
+				t.Fatalf("applyVRFConfig() succeeded with table %d, want error", got)
+			}
 
 			nsLink, lerr := nhNs.LinkByName(ifName)
 			if lerr != nil {
@@ -322,9 +394,6 @@ func test_applyVRFConfig_Namespaced(t *testing.T) {
 			}
 
 			if len(tt.wantErr) > 0 {
-				if err == nil {
-					t.Fatalf("applyVRFConfig() succeeded with table %d, want error", got)
-				}
 				for _, want := range tt.wantErr {
 					if !strings.Contains(err.Error(), want) {
 						t.Errorf("applyVRFConfig() error = %q, want it to mention %q", err, want)
@@ -341,9 +410,6 @@ func test_applyVRFConfig_Namespaced(t *testing.T) {
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("applyVRFConfig() unexpected error: %v", err)
-			}
 			if got != table {
 				t.Errorf("applyVRFConfig() = %d, want %d", got, table)
 			}

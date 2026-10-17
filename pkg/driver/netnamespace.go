@@ -288,14 +288,8 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 		}
 	}
 
-	// Routes are installed into the requested table, so an existing device
-	// is only reused if it is a VRF bound to that same table.
-	vrf, ok := vrfLink.(*netlink.Vrf)
-	if !ok {
-		return 0, fmt.Errorf("link %s exists but is not a vrf (type %s)", vrfName, vrfLink.Type())
-	}
-	if vrf.Table != vrfTable {
-		return 0, fmt.Errorf("vrf %s uses table %d, requested table %d", vrfName, vrf.Table, vrfTable)
+	if err := validateVRFLink(vrfLink, vrfName, vrfTable); err != nil {
+		return 0, err
 	}
 
 	if err := nhNs.LinkSetUp(vrfLink); err != nil {
@@ -311,6 +305,20 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 	}
 
 	return int(vrfTable), nil
+}
+
+// validateVRFLink checks that link is a VRF bound to table. Routes are
+// installed into the requested table, so an existing device is only reused
+// if it is a VRF using that same table.
+func validateVRFLink(link netlink.Link, name string, table uint32) error {
+	vrf, ok := link.(*netlink.Vrf)
+	if !ok {
+		return fmt.Errorf("link %s exists but is not a vrf (type %s)", name, link.Type())
+	}
+	if vrf.Table != table {
+		return fmt.Errorf("vrf %s uses table %d, requested table %d", name, vrf.Table, table)
+	}
+	return nil
 }
 
 func enableVRFSysctls(containerNsFd int) error {
