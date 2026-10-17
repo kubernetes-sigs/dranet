@@ -152,8 +152,9 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 	if ns == "" {
 		return fmt.Errorf("RunPodSandbox pod %s/%s using host network can not claim host devices", pod.Namespace, pod.Name)
 	}
+	podUID := types.UID(pod.GetUid())
 	// store the Pod network namespace in the pod config store
-	np.podConfigStore.SetPodNetNs(types.UID(pod.GetUid()), ns)
+	np.podConfigStore.SetPodNetNs(podUID, ns)
 
 	// Track all the status updates needed for the resource claims of the pod.
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
@@ -214,6 +215,15 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 					WithLastTransitionTime(metav1.Now()),
 			)
 		}
+
+		// Reached only if every block above succeeded for this device (an
+		// earlier error returns immediately). Marked inline, per device, not
+		// deferred to after this loop, so a hang on a later device doesn't
+		// hide that this one is genuinely attached — see updateClaimDeviceMetrics.
+		if err := np.podConfigStore.SetDeviceReady(podUID, deviceName, true); err != nil {
+			logger.Error(err, "RunPodSandbox failed to persist ready state", "device", deviceName)
+		}
+		np.updateClaimDeviceMetrics()
 
 		resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
 	}
@@ -436,6 +446,7 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		}
 		ns = podConfig.NetNS
 	}
+	podUID := types.UID(pod.GetUid())
 	needsRescan := false
 	for deviceName, config := range podConfig.DeviceConfigs {
 		// Move the RDMA device back to the host namespace BEFORE the netdev.
@@ -472,6 +483,15 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		if needsRescanAfterDetach(rdmaDetached, netdevDetached) {
 			needsRescan = true
 		}
+
+		// Marked inline per device, same reasoning as runPodSandbox: this
+		// device is leaving the pod either way (detached, or a failed detach
+		// that's no longer under dranet's management either), so it is no
+		// longer "ready" from a claim-attachment standpoint.
+		if err := np.podConfigStore.SetDeviceReady(podUID, deviceName, false); err != nil {
+			logger.Error(err, "StopPodSandbox failed to persist ready state", "device", deviceName)
+		}
+		np.updateClaimDeviceMetrics()
 	}
 	if needsRescan {
 		np.netdb.RequestRescan()

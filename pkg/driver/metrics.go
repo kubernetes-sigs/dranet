@@ -47,6 +47,8 @@ func registerMetrics() {
 		prometheus.MustRegister(nriPluginRequestsLatencySeconds)
 		prometheus.MustRegister(publishedDevicesTotal)
 		prometheus.MustRegister(lastPublishedTime)
+		prometheus.MustRegister(claimDevicesAllocated)
+		prometheus.MustRegister(claimDevicesReady)
 	})
 }
 
@@ -86,5 +88,19 @@ var (
 		Subsystem: "driver",
 		Name:      "last_published_time_seconds",
 		Help:      "The timestamp of the last successful resource publication.",
+	})
+	// claimDevicesAllocated and claimDevicesReady are derived from
+	// PodConfigStore.CountDevices().
+	claimDevicesAllocated = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "claim_devices_allocated",
+		Help:      "Number of devices currently allocated to a pod on this node (PrepareResourceClaim has stored a config for them), regardless of whether the NRI hook has attached them yet.",
+	})
+	claimDevicesReady = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "claim_devices_ready",
+		Help:      "Number of allocated devices on this node the NRI hook has confirmed as attached. claim_devices_allocated - claim_devices_ready is the number of devices stuck mid-attachment.",
 	})
 )

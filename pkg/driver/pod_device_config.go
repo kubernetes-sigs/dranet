@@ -72,6 +72,10 @@ type DeviceConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+
+	// Ready records whether the NRI hook has confirmed this device is attached
+	// in the Pod's network namespace.
+	Ready bool `json:"ready,omitempty"`
 }
 
 // NetworkInterfaceState is the driver-recorded runtime counterpart of an
@@ -261,6 +265,45 @@ func (s *PodConfigStore) SetDeviceConfig(podUID types.UID, deviceName string, co
 	}
 	podConfig.DeviceConfigs[deviceName] = config
 	return nil
+}
+
+// SetDeviceReady updates the Ready flag for a specific device under a given Pod
+// UID and persists the change through the checkpointer if one is configured.
+func (s *PodConfigStore) SetDeviceReady(podUID types.UID, deviceName string, ready bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if podConfig, ok := s.configs[podUID]; ok {
+		if config, ok := podConfig.DeviceConfigs[deviceName]; ok {
+			config.Ready = ready
+			if s.checkpointer != nil {
+				if err := s.checkpointer.Store(podUID, deviceName, config); err != nil {
+					klog.Errorf("failed to checkpoint ready state for pod %s device %s: %v", podUID, deviceName, err)
+					return err
+				}
+			}
+			podConfig.DeviceConfigs[deviceName] = config
+			return nil
+		}
+	}
+	return fmt.Errorf("device config for pod %s device %s not found", podUID, deviceName)
+}
+
+// CountDevices returns the total number of allocated devices across all pods,
+// and how many of those have been confirmed ready (Ready == true).
+func (s *PodConfigStore) CountDevices() (allocated, ready int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, podConfig := range s.configs {
+		for _, config := range podConfig.DeviceConfigs {
+			allocated++
+			if config.Ready {
+				ready++
+			}
+		}
+	}
+	return allocated, ready
 }
 
 // GetDeviceConfig retrieves the configuration for a specific device under a given Pod UID.

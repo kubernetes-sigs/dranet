@@ -108,6 +108,15 @@ func (np *NetworkDriver) publishResourcesPrometheusMetrics(devices []resourceapi
 	publishedDevicesTotal.WithLabelValues("total").Set(float64(len(devices)))
 }
 
+// updateClaimDeviceMetrics recomputes claim_devices_allocated/claim_devices_ready
+// from the current PodConfigStore state. Called inline, per device, at every
+// point a device's allocated or ready state changes.
+func (np *NetworkDriver) updateClaimDeviceMetrics() {
+	allocated, ready := np.podConfigStore.CountDevices()
+	claimDevicesAllocated.Set(float64(allocated))
+	claimDevicesReady.Set(float64(ready))
+}
+
 func (np *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
 	klog.V(2).Infof("PrepareResourceClaims is called: number of claims: %d", len(claims))
 	start := time.Now()
@@ -324,6 +333,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 			return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 		}
 		deviceCommitted = true
+		np.updateClaimDeviceMetrics()
 		klog.V(4).Infof("IB-only claim resources for pod %s : %#v", podUID, deviceCfg)
 		return nil
 	}
@@ -510,6 +520,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 	}
 	deviceCommitted = true
+	np.updateClaimDeviceMetrics()
 	klog.V(4).Infof("Claim Resources for pod %s : %#v", podUID, deviceCfg)
 	return nil
 }
@@ -589,6 +600,7 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 	}
 
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+	np.updateClaimDeviceMetrics()
 	return nil
 }
 
