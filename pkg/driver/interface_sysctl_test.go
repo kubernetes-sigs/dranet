@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -147,11 +148,11 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sysctls := sysctltesting.NewFake()
-			if err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", tt.interfaceConfig); err != nil {
-				t.Fatalf("applyInterfaceSysctlsWithSysctl() error: %v", err)
+			if err := applyInterfaceSysctlsWithSysctl(context.Background(), sysctls, "rdma0", tt.interfaceConfig); err != nil {
+				t.Fatalf("applyInterfaceSysctlsWithSysctl(context.Background()) error: %v", err)
 			}
 			if diff := cmp.Diff(tt.want, sysctls.Settings); diff != "" {
-				t.Errorf("applyInterfaceSysctlsWithSysctl() settings mismatch (-want +got):\n%s", diff)
+				t.Errorf("applyInterfaceSysctlsWithSysctl(context.Background()) settings mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -167,13 +168,13 @@ func TestApplyInterfaceSysctlsWithSysctlReturnsSetErrors(t *testing.T) {
 		ARPAnnounce: ptr.To[int32](2),
 	}
 
-	err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", interfaceConfig)
+	err := applyInterfaceSysctlsWithSysctl(context.Background(), sysctls, "rdma0", interfaceConfig)
 	if err == nil || !strings.Contains(err.Error(), sysctls.setting) {
-		t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want error naming %s", err, sysctls.setting)
+		t.Fatalf("applyInterfaceSysctlsWithSysctl(context.Background()) error = %v, want error naming %s", err, sysctls.setting)
 	}
 	// A failed setting must not stop the remaining ones from being applied.
 	if len(sysctls.Settings) != 1 {
-		t.Errorf("applyInterfaceSysctlsWithSysctl() applied %d settings, want 1", len(sysctls.Settings))
+		t.Errorf("applyInterfaceSysctlsWithSysctl(context.Background()) applied %d settings, want 1", len(sysctls.Settings))
 	}
 }
 
@@ -187,13 +188,13 @@ func TestApplyInterfaceSysctlsWithSysctlReturnsIPv6SetErrors(t *testing.T) {
 		AcceptRA:  ptr.To[int32](2),
 	}
 
-	err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", interfaceConfig)
+	err := applyInterfaceSysctlsWithSysctl(context.Background(), sysctls, "rdma0", interfaceConfig)
 	if err == nil || !strings.Contains(err.Error(), sysctls.setting) {
-		t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want error naming %s", err, sysctls.setting)
+		t.Fatalf("applyInterfaceSysctlsWithSysctl(context.Background()) error = %v, want error naming %s", err, sysctls.setting)
 	}
 	// The IPv4 setting before the failing IPv6 one is still applied.
 	if len(sysctls.Settings) != 1 {
-		t.Errorf("applyInterfaceSysctlsWithSysctl() applied %d settings, want 1", len(sysctls.Settings))
+		t.Errorf("applyInterfaceSysctlsWithSysctl(context.Background()) applied %d settings, want 1", len(sysctls.Settings))
 	}
 }
 
@@ -230,13 +231,13 @@ func TestApplyInterfaceSysctlsWithSysctlAcceptRANotExist(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			sysctls := &erroringSetSysctl{Fake: sysctltesting.NewFake(), setting: setting, err: tt.err}
 			config := apis.InterfaceConfig{ARPIgnore: ptr.To[int32](1), AcceptRA: ptr.To(tt.acceptRA)}
-			err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", config)
+			err := applyInterfaceSysctlsWithSysctl(context.Background(), sysctls, "rdma0", config)
 			if tt.wantErr == "" {
 				if err != nil {
-					t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want nil", err)
+					t.Fatalf("applyInterfaceSysctlsWithSysctl(context.Background()) error = %v, want nil", err)
 				}
 			} else if err == nil || !strings.Contains(err.Error(), setting) || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want one naming %s and containing %q", err, setting, tt.wantErr)
+				t.Fatalf("applyInterfaceSysctlsWithSysctl(context.Background()) error = %v, want one naming %s and containing %q", err, setting, tt.wantErr)
 			}
 			// The IPv4 setting is applied in every case.
 			if got := sysctls.Settings["net/ipv4/conf/rdma0/arp_ignore"]; got != 1 {
@@ -247,8 +248,8 @@ func TestApplyInterfaceSysctlsWithSysctlAcceptRANotExist(t *testing.T) {
 }
 
 func TestApplyInterfaceSysctlConfigNoConfigDoesNotEnterNamespace(t *testing.T) {
-	if err := applyInterfaceSysctlConfig(netns.None(), "rdma0", apis.InterfaceConfig{Name: "rdma0"}); err != nil {
-		t.Fatalf("applyInterfaceSysctlConfig() error: %v", err)
+	if err := applyInterfaceSysctlConfig(context.Background(), netns.None(), "rdma0", apis.InterfaceConfig{Name: "rdma0"}); err != nil {
+		t.Fatalf("applyInterfaceSysctlConfig(context.Background()) error: %v", err)
 	}
 }
 
@@ -286,8 +287,8 @@ func testApplyInterfaceSysctlConfigUsesOpenNamespace_Namespaced(t *testing.T) {
 	}
 
 	config := apis.InterfaceConfig{ARPIgnore: ptr.To[int32](1)}
-	if err := applyInterfaceSysctlConfig(targetNs, "lo", config); err != nil {
-		t.Fatalf("applyInterfaceSysctlConfig() with an open namespace handle failed: %v", err)
+	if err := applyInterfaceSysctlConfig(context.Background(), targetNs, "lo", config); err != nil {
+		t.Fatalf("applyInterfaceSysctlConfig(context.Background()) with an open namespace handle failed: %v", err)
 	}
 
 	if err := netns.Set(targetNs); err != nil {

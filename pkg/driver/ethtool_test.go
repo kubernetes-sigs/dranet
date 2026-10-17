@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"os/exec"
@@ -168,7 +169,7 @@ func test_applyEthtoolConfig_Namespaced(t *testing.T) {
 	t.Logf("EthtoolConfig %#v", config.Features)
 
 	// Apply the ethtool configuration
-	err = applyEthtoolConfig(path.Join("/run/netns", nsName), ifaceName, config)
+	err = applyEthtoolConfig(context.Background(), path.Join("/run/netns", nsName), ifaceName, config)
 	if err != nil {
 		t.Fatalf("applyEthtoolConfig failed: %v", err)
 	}
@@ -225,7 +226,7 @@ func test_applyEthtoolConfig_Namespaced(t *testing.T) {
 	}
 
 	// Apply the ethtool configuration
-	err = applyEthtoolConfig(path.Join("/run/netns", nsName), ifaceName, config)
+	err = applyEthtoolConfig(context.Background(), path.Join("/run/netns", nsName), ifaceName, config)
 	if err == nil {
 		t.Fatalf("applyEthtoolConfig expected to fail: %v", err)
 	}

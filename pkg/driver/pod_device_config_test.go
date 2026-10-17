@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sort"
@@ -33,9 +34,9 @@ import (
 
 // mustNewPodConfigStore creates a PodConfigStore with no checkpointer for use in tests.
 func mustNewPodConfigStore() *PodConfigStore {
-	s, err := newPodConfigStoreWithCheckpointer(nil)
+	s, err := newPodConfigStoreWithCheckpointer(context.Background(), nil)
 	if err != nil {
-		panic(fmt.Sprintf("newPodConfigStoreWithCheckpointer(nil) should never fail: %v", err))
+		panic(fmt.Sprintf("newPodConfigStoreWithCheckpointer(context.Background(), nil) should never fail: %v", err))
 	}
 	return s
 }
@@ -73,7 +74,7 @@ func TestPodConfigStore_SetAndGet(t *testing.T) {
 		t.Errorf("Get() found a config before Set(), expected not found")
 	}
 
-	store.SetDeviceConfig(podUID, deviceName, config)
+	store.SetDeviceConfig(context.Background(), podUID, deviceName, config)
 
 	retrievedConfig, found := store.GetDeviceConfig(podUID, deviceName)
 	if !found {
@@ -102,7 +103,7 @@ func TestPodConfigStore_SetAndGet(t *testing.T) {
 			Ethtool:   &apis.EthtoolConfig{PrivateFlags: map[string]bool{"custom-flag": false}},
 		},
 	}
-	store.SetDeviceConfig(podUID, deviceName, newConfig)
+	store.SetDeviceConfig(context.Background(), podUID, deviceName, newConfig)
 	retrievedConfig, found = store.GetDeviceConfig(podUID, deviceName)
 	if !found {
 		t.Fatalf("Get() did not find config after overwrite, expected found")
@@ -125,7 +126,7 @@ func TestPodConfigStore_NetNs(t *testing.T) {
 	}
 
 	// Add a dummy device config so the pod exists in the store
-	store.SetDeviceConfig(podUID, "dummy-device", DeviceConfig{})
+	store.SetDeviceConfig(context.Background(), podUID, "dummy-device", DeviceConfig{})
 
 	// Verify that NetNS is empty initially
 	podCfg, found = store.GetPodConfig(podUID)
@@ -136,7 +137,7 @@ func TestPodConfigStore_NetNs(t *testing.T) {
 		t.Errorf("NetNS should be empty initially, got %s", podCfg.NetNS)
 	}
 
-	store.SetPodNetNs(podUID, netns)
+	store.SetPodNetNs(context.Background(), podUID, netns)
 
 	podCfg, found = store.GetPodConfig(podUID)
 	if !found {
@@ -154,7 +155,7 @@ func TestPodConfigStore_NetNs(t *testing.T) {
 
 	// Test overwriting
 	newNetNs := "/var/run/netns/new-ns"
-	store.SetPodNetNs(podUID, newNetNs)
+	store.SetPodNetNs(context.Background(), podUID, newNetNs)
 	podCfg, found = store.GetPodConfig(podUID)
 	if !found {
 		t.Fatalf("GetPodConfig() did not find config after overwrite, expected found")
@@ -174,11 +175,11 @@ func TestPodConfigStore_DeletePod(t *testing.T) {
 	config2 := DeviceConfig{NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "p1eth1"}}}
 	config3 := DeviceConfig{NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "p2eth0"}}}
 
-	store.SetDeviceConfig(podUID1, dev1, config1)
-	store.SetDeviceConfig(podUID1, dev2, config2)
-	store.SetDeviceConfig(podUID2, dev1, config3)
+	store.SetDeviceConfig(context.Background(), podUID1, dev1, config1)
+	store.SetDeviceConfig(context.Background(), podUID1, dev2, config2)
+	store.SetDeviceConfig(context.Background(), podUID2, dev1, config3)
 
-	store.DeletePod(podUID1)
+	store.DeletePod(context.Background(), podUID1)
 
 	_, found := store.GetDeviceConfig(podUID1, dev1)
 	if found {
@@ -198,7 +199,7 @@ func TestPodConfigStore_DeletePod(t *testing.T) {
 	}
 
 	// Test deleting non-existent pod
-	store.DeletePod(types.UID("non-existent-pod")) // Should not panic
+	store.DeletePod(context.Background(), types.UID("non-existent-pod")) // Should not panic
 }
 
 func TestPodConfigStore_GetPodConfigs(t *testing.T) {
@@ -211,9 +212,9 @@ func TestPodConfigStore_GetPodConfigs(t *testing.T) {
 	config2 := DeviceConfig{NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "p1eth1"}}}
 	config3 := DeviceConfig{NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "p2eth0"}}}
 
-	store.SetDeviceConfig(podUID1, dev1, config1)
-	store.SetDeviceConfig(podUID1, dev2, config2)
-	store.SetDeviceConfig(podUID2, dev1, config3)
+	store.SetDeviceConfig(context.Background(), podUID1, dev1, config1)
+	store.SetDeviceConfig(context.Background(), podUID1, dev2, config2)
+	store.SetDeviceConfig(context.Background(), podUID2, dev1, config3)
 
 	expectedPod1Config := PodConfig{DeviceConfigs: map[string]DeviceConfig{
 		dev1: config1,
@@ -254,13 +255,13 @@ func TestPodConfigStore_ThreadSafety(t *testing.T) {
 			podUID := types.UID(fmt.Sprintf("pod-%d", i))
 			deviceName := fmt.Sprintf("eth%d", i%2)
 			config := DeviceConfig{NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: fmt.Sprintf("dev-%d", i)}}}
-			store.SetDeviceConfig(podUID, deviceName, config)
+			store.SetDeviceConfig(context.Background(), podUID, deviceName, config)
 			retrieved, _ := store.GetDeviceConfig(podUID, deviceName)
 			if !reflect.DeepEqual(retrieved, config) {
 				t.Errorf("goroutine %d: Get() retrieved %+v, want %+v", i, retrieved, config)
 			}
 			if i%10 == 0 {
-				store.DeletePod(podUID)
+				store.DeletePod(context.Background(), podUID)
 				_, found := store.GetDeviceConfig(podUID, deviceName)
 				if found {
 					t.Errorf("goroutine %d: Get() found config after DeletePod()", i)
@@ -298,8 +299,8 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 			name: "delete claim associated with one pod, one device",
 			initialConfigs: func() *PodConfigStore {
 				s := mustNewPodConfigStore()
-				s.SetDeviceConfig(podUID3, dev1, config3_1) // Pod3 has Claim2
-				s.SetDeviceConfig(podUID1, dev1, config1_1) // Pod1 has Claim1
+				s.SetDeviceConfig(context.Background(), podUID3, dev1, config3_1) // Pod3 has Claim2
+				s.SetDeviceConfig(context.Background(), podUID1, dev1, config1_1) // Pod1 has Claim1
 				return s
 			},
 			claimToDelete: claim2, // Delete Claim2
@@ -311,10 +312,10 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 			name: "delete claim associated with multiple pods",
 			initialConfigs: func() *PodConfigStore {
 				s := mustNewPodConfigStore()
-				s.SetDeviceConfig(podUID1, dev1, config1_1) // Pod1, Dev1, Claim1
-				s.SetDeviceConfig(podUID1, dev2, config1_2) // Pod1, Dev2, Claim1
-				s.SetDeviceConfig(podUID2, dev1, config2_1) // Pod2, Dev1, Claim1
-				s.SetDeviceConfig(podUID3, dev1, config3_1) // Pod3, Dev1, Claim2
+				s.SetDeviceConfig(context.Background(), podUID1, dev1, config1_1) // Pod1, Dev1, Claim1
+				s.SetDeviceConfig(context.Background(), podUID1, dev2, config1_2) // Pod1, Dev2, Claim1
+				s.SetDeviceConfig(context.Background(), podUID2, dev1, config2_1) // Pod2, Dev1, Claim1
+				s.SetDeviceConfig(context.Background(), podUID3, dev1, config3_1) // Pod3, Dev1, Claim2
 				return s
 			},
 			claimToDelete: claim1, // Delete Claim1
@@ -326,7 +327,7 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 			name: "delete non-existent claim",
 			initialConfigs: func() *PodConfigStore {
 				s := mustNewPodConfigStore()
-				s.SetDeviceConfig(podUID1, dev1, config1_1)
+				s.SetDeviceConfig(context.Background(), podUID1, dev1, config1_1)
 				return s
 			},
 			claimToDelete: types.NamespacedName{Namespace: "ns-other", Name: "claim-non-existent"},
@@ -347,7 +348,7 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := tt.initialConfigs()
-			store.DeleteClaim(tt.claimToDelete)
+			store.DeleteClaim(context.Background(), tt.claimToDelete)
 
 			if !reflect.DeepEqual(store.configs, tt.expectedPodsAfter) {
 				t.Errorf("configs mismatch after DeleteClaim.\nGot:    %+v\nWanted: %+v", store.configs, tt.expectedPodsAfter)
@@ -392,9 +393,9 @@ func TestPodConfigStore_NoDuplicateDevices(t *testing.T) {
 	}
 
 	// Set the same device config multiple times
-	store.SetDeviceConfig(podUID, deviceName1, config1)
-	store.SetDeviceConfig(podUID, deviceName2, config2)
-	store.SetDeviceConfig(podUID, deviceName1, config1)
+	store.SetDeviceConfig(context.Background(), podUID, deviceName1, config1)
+	store.SetDeviceConfig(context.Background(), podUID, deviceName2, config2)
+	store.SetDeviceConfig(context.Background(), podUID, deviceName1, config1)
 
 	podConfigs, found := store.GetPodConfig(podUID)
 	if !found {
@@ -419,7 +420,7 @@ func TestPodConfigStore_GetAllocatedDeviceSnapshots(t *testing.T) {
 	podUID2 := types.UID("pod-2")
 
 	// Set config without device snapshot
-	err := store.SetDeviceConfig(podUID1, "eth0", DeviceConfig{
+	err := store.SetDeviceConfig(context.Background(), podUID1, "eth0", DeviceConfig{
 		Claim: types.NamespacedName{Namespace: "default", Name: "claim-1"},
 	})
 	if err != nil {
@@ -446,7 +447,7 @@ func TestPodConfigStore_GetAllocatedDeviceSnapshots(t *testing.T) {
 			},
 		},
 	}
-	err = store.SetDeviceConfig(podUID2, "0000:c0:14.0", DeviceConfig{
+	err = store.SetDeviceConfig(context.Background(), podUID2, "0000:c0:14.0", DeviceConfig{
 		Claim:          types.NamespacedName{Namespace: "default", Name: "claim-2"},
 		DeviceSnapshot: &snapDev,
 	})
@@ -530,7 +531,7 @@ func TestPodConfigStore_GetInUseSubinterfaceIPs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			store := mustNewPodConfigStore()
 			for _, d := range tt.devices {
-				if err := store.SetDeviceConfig(d.podUID, d.deviceName, DeviceConfig{
+				if err := store.SetDeviceConfig(context.Background(), d.podUID, d.deviceName, DeviceConfig{
 					NetworkInterfaceConfigInPod: d.netConfig,
 				}); err != nil {
 					t.Fatalf("SetDeviceConfig(%s, %s) failed: %v", d.podUID, d.deviceName, err)

@@ -189,7 +189,7 @@ func main() {
 
 	// Build the pod config store. If dbPath is empty the store is in-memory only;
 	// otherwise it is backed by a bbolt checkpoint at that path.
-	store, err := driver.NewPodConfigStore(dbPath)
+	store, err := driver.NewPodConfigStore(ctx, dbPath)
 	if err != nil {
 		klog.Fatalf("failed to initialize pod config store: %v", err)
 	}
@@ -255,7 +255,7 @@ func main() {
 	if err != nil {
 		klog.Fatalf("driver failed to start: %v", err)
 	}
-	defer dranet.Stop(cancel)
+	defer dranet.Stop(ctx, cancel)
 
 	ready.Store(true)
 	klog.Info("driver started")

@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"net"
@@ -118,7 +119,7 @@ func test_nhNetdev_Namespaced(t *testing.T) {
 		AcceptRA:       ptr.To[int32](2),
 	}
 
-	deviceData, err := nsAttachNetdev(ifaceName, containerNsPath, config)
+	deviceData, err := nsAttachNetdev(context.Background(), ifaceName, containerNsPath, config)
 	if err != nil {
 		t.Fatalf("fail to attach netdev to namespace: %v", err)
 	}
@@ -232,9 +233,9 @@ func test_nhNetdev_Namespaced(t *testing.T) {
 	}
 	t.Cleanup(func() { sysctlProvider = original })
 
-	if _, err := nsAttachNetdev(ifaceName, containerNsPath, config); err == nil ||
+	if _, err := nsAttachNetdev(context.Background(), ifaceName, containerNsPath, config); err == nil ||
 		!strings.Contains(err.Error(), "arp_ignore") {
-		t.Fatalf("nsAttachNetdev() error = %v, want an arp_ignore apply error", err)
+		t.Fatalf("nsAttachNetdev(context.Background()) error = %v, want an arp_ignore apply error", err)
 	}
 	if deleteNamedErr != nil {
 		t.Fatalf("failed to remove network namespace path during ARP failure: %v", deleteNamedErr)
@@ -319,9 +320,9 @@ func test_nsAttachNetdevRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T) {
 	events, done := subscribeLinkEvents(t, before.Attrs().Index)
 
 	config := apis.InterfaceConfig{Name: "dranet0", AcceptRA: ptr.To[int32](0)}
-	_, err = nsAttachNetdev(name, containerNsPath, config)
+	_, err = nsAttachNetdev(context.Background(), name, containerNsPath, config)
 	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
-		t.Fatalf("nsAttachNetdev() error = %v, want an MTU error", err)
+		t.Fatalf("nsAttachNetdev(context.Background()) error = %v, want an MTU error", err)
 	}
 	// Events of the call arrive asynchronously; give them a moment before stopping.
 	// The setup above may still deliver its own up event, so the check is that
@@ -425,7 +426,7 @@ func test_nsDetachNetdevFromNSUsesOpenNamespace_Namespaced(t *testing.T) {
 	}
 
 	containerNsPath := path.Join("/run/netns", nsName)
-	if _, err := nsAttachNetdev(ifaceName, containerNsPath, apis.InterfaceConfig{Name: "dranet0"}); err != nil {
+	if _, err := nsAttachNetdev(context.Background(), ifaceName, containerNsPath, apis.InterfaceConfig{Name: "dranet0"}); err != nil {
 		t.Fatalf("failed to attach dummy link: %v", err)
 	}
 	if err := netns.DeleteNamed(nsName); err != nil {

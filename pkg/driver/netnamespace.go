@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -192,7 +193,7 @@ func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) err
 
 // applyInterfaceForwarding enables IPv4 and IPv6 forwarding for a specific interface.
 // It uses the Kubernetes sysctl helper while locked into the pod's network namespace.
-func applyInterfaceForwarding(containerNsPath string, ifName string, enable bool) error {
+func applyInterfaceForwarding(ctx context.Context, containerNsPath string, ifName string, enable bool) error {
 	if !enable {
 		return nil
 	}
@@ -233,7 +234,7 @@ func applyInterfaceForwarding(containerNsPath string, ifName string, enable bool
 		if errors.Is(err, os.ErrNotExist) {
 			// If the file doesn't exist, IPv6 is likely disabled on the node or namespace.
 			// We log this at V(4) so it doesn't spam normal logs, and we don't fail the setup.
-			klog.V(4).Infof("IPv6 sysctl %s not found; assuming IPv6 is disabled and skipping", v6Sysctl)
+			klog.FromContext(ctx).V(4).Info("IPv6 sysctl not found; assuming IPv6 is disabled and skipping", "sysctl", v6Sysctl, "interface", ifName)
 		} else {
 			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", v6Sysctl, err))
 		}

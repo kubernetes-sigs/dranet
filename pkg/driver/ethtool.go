@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -280,7 +281,8 @@ func (c *ethtoolClient) GetPrivateFlags(ifaceName string) (map[string]bool, erro
 }
 
 // SetFeatures sets the device features for a given interface.
-func (c *ethtoolClient) SetFeatures(ifaceName string, featuresToSet map[string]bool) error {
+func (c *ethtoolClient) SetFeatures(ctx context.Context, ifaceName string, featuresToSet map[string]bool) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "interface", ifaceName)
 	features, err := c.executeSet(
 		unix.ETHTOOL_MSG_FEATURES_SET,
 		unix.ETHTOOL_A_FEATURES_HEADER,
@@ -291,7 +293,7 @@ func (c *ethtoolClient) SetFeatures(ifaceName string, featuresToSet map[string]b
 	if err != nil {
 		return err
 	}
-	klog.V(4).Infof("SetFeatures for %s result %s", ifaceName, features)
+	logger.V(4).Info("SetFeatures result", "features", features.String())
 
 	// ETHTOOL_A_FEATURES_WANTED reports the difference between client request and actual result: mask consists of bits which differ between requested features and result (dev->features after the operation)
 	// value consists of values of these bits in the request (i.e. negated values from resulting features)
@@ -301,7 +303,7 @@ func (c *ethtoolClient) SetFeatures(ifaceName string, featuresToSet map[string]b
 	// ETHTOOL_A_FEATURES_ACTIVE reports the difference between old and new dev->features: mask
 	// consists of bits which have changed, values are their values in new dev->features (after the operation).
 	if len(features.active) != len(featuresToSet) {
-		klog.V(2).Infof("not all features changed, desired: %#v active: %#v", featuresToSet, features.active)
+		logger.V(2).Info("Not all features changed", "desired", fmt.Sprintf("%#v", featuresToSet), "active", fmt.Sprintf("%#v", features.active))
 	}
 	return nil
 }
@@ -475,16 +477,17 @@ func parseBit(ad *netlink.AttributeDecoder) (name string, active bool, err error
 
 // applyEthtoolConfig applies ethtool configurations (features, private flags) to an interface
 // within a specified network namespace.
-func applyEthtoolConfig(containerNsPath string, ifName string, config *apis.EthtoolConfig) error {
+func applyEthtoolConfig(ctx context.Context, containerNsPath string, ifName string, config *apis.EthtoolConfig) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "interface", ifName, "netns", containerNsPath)
 	if config == nil {
-		klog.V(2).Infof("No ethtool configuration to apply for %s in ns %s", ifName, containerNsPath)
+		logger.V(2).Info("No ethtool configuration to apply")
 		return nil
 	}
 
 	hasFeatures := len(config.Features) > 0
 	hasPrivateFlags := len(config.PrivateFlags) > 0
 	if !hasFeatures && !hasPrivateFlags {
-		klog.V(2).Infof("Ethtool configuration for %s in ns %s is empty (no features or private flags).", ifName, containerNsPath)
+		logger.V(2).Info("Ethtool configuration is empty (no features or private flags)")
 		return nil
 	}
 
@@ -503,14 +506,14 @@ func applyEthtoolConfig(containerNsPath string, ifName string, config *apis.Etht
 	var errorList []error
 
 	if hasFeatures {
-		klog.V(2).Infof("Applying ethtool features for %s in ns %s: %v", ifName, containerNsPath, config.Features)
-		if err := client.SetFeatures(ifName, config.Features); err != nil {
+		logger.V(2).Info("Applying ethtool features", "features", config.Features)
+		if err := client.SetFeatures(ctx, ifName, config.Features); err != nil {
 			errorList = append(errorList, fmt.Errorf("failed to set ethtool features for %s: %w", ifName, err))
 		}
 	}
 
 	if hasPrivateFlags {
-		klog.V(2).Infof("Applying ethtool private flags for %s in ns %s: %v", ifName, containerNsPath, config.PrivateFlags)
+		logger.V(2).Info("Applying ethtool private flags", "privateFlags", config.PrivateFlags)
 		if err := client.SetPrivateFlags(ifName, config.PrivateFlags); err != nil {
 			errorList = append(errorList, fmt.Errorf("failed to set ethtool private flags for %s: %w", ifName, err))
 		}
