@@ -191,6 +191,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		// https://github.com/containerd/nri/pull/173
 		// Otherwise it silently exits the program
 		stub.WithOnClose(func() {
+			nriPluginDisconnectsTotal.Inc()
 			klog.Infof("%s NRI plugin closed", driverName)
 		}),
 	}
@@ -210,7 +211,8 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				klog.Infof("Restarting NRI plugin %d out of %d", i, maxAttempts)
+				nriPluginReconnectAttemptsTotal.Inc()
+				klog.Infof("Restarting NRI plugin %d out of %d", i+1, maxAttempts)
 			}
 		}
 		klog.Fatalf("NRI plugin failed for %d times to be restarted", maxAttempts)
@@ -230,7 +232,8 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				klog.Infof("Restarting Network Device DB %d out of %d", i, maxAttempts)
+				netdbReconnectAttemptsTotal.Inc()
+				klog.Infof("Restarting Network Device DB %d out of %d", i+1, maxAttempts)
 			}
 		}
 		klog.Fatalf("Network Device DB failed for %d times to be restarted", maxAttempts)
