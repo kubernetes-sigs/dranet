@@ -329,7 +329,7 @@ wait_for_ready_pods() {
 @test "test metric server is up and operating on host" {
   # Run a temporary pod to access metrics
   kubectl run test-metrics \
-    --image registry.k8s.io/e2e-test-images/agnhost:2.54 \
+    --image registry.k8s.io/e2e-test-images/agnhost:2.66.1 \
     --overrides='{"spec": {"hostNetwork": true}}' \
     --restart=Never \
     --command \
@@ -358,7 +358,7 @@ wait_for_ready_pods() {
   assert_output --partial "00:11:22:33:44:55"
 
   # Validate ethtool settings inside the pod for interface dranet0
-  run kubectl exec pod-advanced-cfg -- ash -c "apk add ethtool && ethtool -k dranet0"
+  run kubectl exec pod-advanced-cfg -- ethtool -k dranet0
   assert_success
   assert_output --partial "tcp-segmentation-offload: off"
   assert_output --partial "generic-receive-offload: off"
@@ -383,7 +383,7 @@ wait_for_ready_pods() {
   assert_output --partial "gso_ipv4_max_size 65536"
   assert_output --partial "gro_ipv4_max_size 65536"
 
-  run kubectl exec pod-bigtcp-test -- ash -c "apk add ethtool && ethtool -k dranet1"
+  run kubectl exec pod-bigtcp-test -- ethtool -k dranet1
   assert_success
   assert_output --partial "tcp-segmentation-offload: on"
   assert_output --partial "generic-receive-offload: on"

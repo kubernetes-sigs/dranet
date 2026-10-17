@@ -29,6 +29,12 @@ const (
 )
 
 const (
+	attachResultAttached = "attached"
+	attachResultFailed   = "failed"
+	attachResultRejected = "rejected_timeout"
+)
+
+const (
 	methodPrepareResourceClaims   = "PrepareResourceClaims"
 	methodUnprepareResourceClaims = "UnprepareResourceClaims"
 	methodRunPodSandbox           = "RunPodSandbox"
@@ -45,6 +51,9 @@ func registerMetrics() {
 		prometheus.MustRegister(draPluginRequestsLatencySeconds)
 		prometheus.MustRegister(nriPluginRequestsTotal)
 		prometheus.MustRegister(nriPluginRequestsLatencySeconds)
+		prometheus.MustRegister(nriRequestTimeoutSeconds)
+		prometheus.MustRegister(deviceAttachDurationSeconds)
+		prometheus.MustRegister(sandboxAttachTotal)
 		prometheus.MustRegister(publishedDevicesTotal)
 		prometheus.MustRegister(lastPublishedTime)
 	})
@@ -75,6 +84,25 @@ var (
 		Name:      "nri_plugin_requests_latency_seconds",
 		Help:      "NRI plugin request latency in seconds.",
 	}, []string{"method", "status"})
+	nriRequestTimeoutSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "nri_request_timeout_seconds",
+		Help:      "The effective NRI plugin request timeout in seconds observed on incoming runtime requests.",
+	})
+	deviceAttachDurationSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "device_attach_duration_seconds",
+		Help:      "Time in seconds to move and configure a single network device in a pod namespace.",
+		Buckets:   []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	}, []string{"result"})
+	sandboxAttachTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "sandbox_attach_total",
+		Help:      "Total number of pod sandboxes by network device attachment outcome.",
+	}, []string{"result"})
 	publishedDevicesTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",
