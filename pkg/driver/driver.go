@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
+	"sigs.k8s.io/dranet/pkg/runtimeprovider"
 
 	"github.com/containerd/nri/pkg/stub"
 	"sigs.k8s.io/dranet/internal/nlwrap"
@@ -115,6 +116,10 @@ type NetworkDriver struct {
 	// kubelet runs with a non-default --root-dir.
 	kubeletRootDir string
 
+	// runtimeProvider runs the provider's hook before the first container of a
+	// Pod starts; nil when no provider has one.
+	runtimeProvider *runtimeprovider.Manager
+
 	clock clock.WithTicker // Injectable clock for testing
 }
 
@@ -181,6 +186,12 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		return status.PluginRegistered, nil
 	})
 	if err != nil {
+		return nil, err
+	}
+
+	// Serve the runtime provider's OCI hooks before the NRI plugin registers: the
+	// hooks of the containers it adjusts connect right after.
+	if err := plugin.startRuntimeProvider(ctx); err != nil {
 		return nil, err
 	}
 

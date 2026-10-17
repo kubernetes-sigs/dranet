@@ -47,8 +47,26 @@ func registerMetrics() {
 		prometheus.MustRegister(nriPluginRequestsLatencySeconds)
 		prometheus.MustRegister(publishedDevicesTotal)
 		prometheus.MustRegister(lastPublishedTime)
+		prometheus.MustRegister(runtimeProviderRequestsTotal)
+		prometheus.MustRegister(runtimeProviderLatencySeconds)
 	})
 }
+
+var (
+	runtimeProviderRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "runtime_provider_requests_total",
+		Help:      "Runtime provider calls made before a Pod's first container started, by outcome. Failures fail the container start and the kubelet retries.",
+	}, []string{"status"})
+	runtimeProviderLatencySeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "runtime_provider_latency_seconds",
+		Help:      "Time the runtime provider held a container's start, in seconds.",
+		Buckets:   []float64{0.1, 0.5, 1, 2, 5, 10, 20, 30, 45, 60},
+	}, []string{"status"})
+)
 
 var (
 	draPluginRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{

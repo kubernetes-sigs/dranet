@@ -80,6 +80,58 @@ kubectl -n kube-system rollout restart ds dranet
 daemonset.apps/dranet restarted
 ```
 
+## Runtime provider
+
+A runtime provider (`site/content/docs/concepts/runtime-provider.md`), gated
+behind `--feature-gates=RuntimeProvider=true`, configures a Pod's network
+namespace between DRANET's `RunPodSandbox` and the start of the Pod's first
+container, with its own timeout. The pieces:
+
+* `pkg/ocihook`: the channel between the OCI hook process and the daemon. The
+  hook process is `dranet oci-hook`, dispatched in `cmd/dranet` before any flag
+  or daemon component is touched, and it only speaks a one-line protocol over a
+  UNIX socket. The package has no Kubernetes dependencies and is tested against
+  a real socket.
+* `pkg/runtimeprovider`: the daemon-side OCI hook manager (`*runtimeprovider.Manager`).
+  Owns host executable resolution (`Synchronize`), pending container hooks,
+  once-per-sandbox completion tracking, and ordered invocation of configured
+  `cloudprovider.RuntimeProvider`s.
+* `pkg/driver/runtime_provider.go`: thin driver glue connecting `NetworkDriver`'s
+  NRI/DRA hooks, `PodConfigStore` checkpoint persistence (`RuntimeProviderDone`
+  and `ResourceClaim` in `DeviceConfig`), Prometheus metrics, and Kubernetes
+  events to `*runtimeprovider.Manager`.
+* `cloudprovider.RuntimeProvider`: the provider contract, implemented by the
+  webhook provider as `POST /ConfigurePod` behind the `runtimeProvider` capability.
+
+The container runtime executes hooks on the host, where DRANET's executable
+path inside its image means nothing, so the hook path is `/proc/<pid>/exe` of
+the daemon with the PID in the runtime's PID namespace:
+* **With `hostPID: true`** (or when running directly on the host): the daemon
+  is in the initial PID namespace (recognized by the kernel's fixed inode
+  `PROC_PID_INIT_INO` on `/proc/self/ns/pid`), so `os.Getpid()` is used
+  directly at startup without depending on NRI `Synchronize` or container
+  entrypoint arguments.
+* **Without `hostPID: true` (default)**: the daemon finds its own container in
+  NRI `Synchronize`, matched by Pod UID (from the kubelet Pod directory in
+  `/proc/self/mountinfo`) and arguments, and uses the host PID reported by the
+  runtime. Keep the DRANET container running the `dranet` executable directly:
+  a wrapper changes the arguments and the PID the runtime reports.
+
+Package initializers of the daemon's dependencies run in the hook process too
+(Go runs every `init` before `main`); they must stay cheap and quiet, since the
+runtime reports the hook's stderr in the container start error. Today the AWS
+Neuron lookup logs one warning on non-EFA instances (see
+https://github.com/aws-neuron/connected-device-maps-over-efa-for-neuron/pull/3).
+
+Validation, from unit to end to end:
+
+```sh
+go test ./pkg/ocihook ./pkg/runtimeprovider ./pkg/cloudprovider/webhook -count=1
+go test ./pkg/driver -run 'RuntimeProvider|ConfigurePod|ClaimSnapshot' -count=1
+go test ./cmd/dranet -run 'TestRuntimeProviders|TestHookSubcommand' -count=1  # runs the built binary as the runtime does
+bats tests/python_webhook.bats  # kind: success and ordering, persistent failure, recovery through the kubelet retry
+```
+
 ## Checkpoint database: upgrades and rollbacks
 
 DRANET stores device state (`DeviceConfig`) in a node-local bbolt database

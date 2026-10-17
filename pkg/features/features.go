@@ -13,6 +13,12 @@ const (
 	// owner: @purvavj
 	// alpha: v1.4.0
 	PersistentResourceSliceAttributes featuregate.Feature = "PersistentResourceSliceAttributes"
+
+	// RuntimeProvider gates executing configured RuntimeProviders via an OCI
+	// createRuntime hook before a Pod's first container starts.
+	// owner: @aojea
+	// alpha: v1.5.0
+	RuntimeProvider featuregate.Feature = "RuntimeProvider"
 )
 
 // DefaultMutableFeatureGate is a mutable feature gate used only for registration
@@ -32,6 +38,10 @@ func init() {
 			PreRelease: featuregate.Alpha,
 		},
 		PersistentResourceSliceAttributes: {
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+		},
+		RuntimeProvider: {
 			Default:    false,
 			PreRelease: featuregate.Alpha,
 		},

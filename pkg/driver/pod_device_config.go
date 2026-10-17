@@ -41,6 +41,10 @@ type PodConfig struct {
 	// NetNS is the path to the Pod's network namespace as observed by the
 	// container runtime.
 	NetNS string
+
+	// RuntimeProviderDone reports whether the runtime provider has already
+	// configured this Pod's current sandbox.
+	RuntimeProviderDone bool
 }
 
 // DeviceConfig holds the set of configurations to be applied for a single
@@ -48,6 +52,16 @@ type PodConfig struct {
 // routes for the Pod's network namespace, and RDMA configurations.
 type DeviceConfig struct {
 	Claim types.NamespacedName `json:"claim"`
+
+	// ResourceClaim is the claim as the kubelet presented it when the device
+	// was prepared, without managedFields. It is what the provider runtime
+	// hook receives, long after the prepare call.
+	ResourceClaim *resourceapi.ResourceClaim `json:"resourceClaim,omitempty"`
+
+	// RuntimeProviderDone records in the checkpoint that the runtime provider
+	// completed for the Pod's current sandbox, so a daemon restart does not
+	// re-run it until a new sandbox is created.
+	RuntimeProviderDone bool `json:"runtimeProviderDone,omitempty"`
 
 	// DeviceSnapshot contains the original discovered ResourceSlice Device structure,
 	// which includes the device's identifying attributes and capacity.
@@ -197,8 +211,16 @@ func newPodConfigStoreWithCheckpointer(checkpointer Checkpointer) (*PodConfigSto
 		}
 		for podUID, devices := range saved {
 			klog.Infof("PodConfigStore: loaded checkpoint for pod %s (%d devices)", podUID, len(devices))
+			runtimeProviderDone := len(devices) > 0
+			for _, cfg := range devices {
+				if !cfg.RuntimeProviderDone {
+					runtimeProviderDone = false
+					break
+				}
+			}
 			s.configs[podUID] = PodConfig{
-				DeviceConfigs: devices,
+				DeviceConfigs:       devices,
+				RuntimeProviderDone: runtimeProviderDone,
 			}
 		}
 	}
@@ -257,9 +279,12 @@ func (s *PodConfigStore) SetDeviceConfig(podUID types.UID, deviceName string, co
 		podConfig = PodConfig{
 			DeviceConfigs: make(map[string]DeviceConfig),
 		}
-		s.configs[podUID] = podConfig
 	}
 	podConfig.DeviceConfigs[deviceName] = config
+	if config.RuntimeProviderDone {
+		podConfig.RuntimeProviderDone = true
+	}
+	s.configs[podUID] = podConfig
 	return nil
 }
 
@@ -324,9 +349,10 @@ func (s *PodConfigStore) GetPodConfig(podUID types.UID) (PodConfig, bool) {
 		configsCopy[k] = v
 	}
 	return PodConfig{
-		DeviceConfigs:   configsCopy,
-		LastNRIActivity: podConfig.LastNRIActivity,
-		NetNS:           podConfig.NetNS,
+		DeviceConfigs:       configsCopy,
+		LastNRIActivity:     podConfig.LastNRIActivity,
+		NetNS:               podConfig.NetNS,
+		RuntimeProviderDone: podConfig.RuntimeProviderDone,
 	}, true
 }
 
@@ -345,6 +371,43 @@ func (s *PodConfigStore) SetPodNetNs(podUID types.UID, netns string) {
 	klog.V(3).Infof("SetPodNetNs: setting NetNS for pod %s to %q", podUID, netns)
 	podCfg.NetNS = netns
 	s.configs[podUID] = podCfg
+}
+
+// SetRuntimeProviderDone records whether the runtime provider has completed
+// for the Pod's current sandbox, persisting the flag across the Pod's device
+// configs in the checkpoint. When clearing (done == false), in-memory state is
+// always cleared even if a checkpoint write fails so a new sandbox never
+// inherits a stale completion flag.
+func (s *PodConfigStore) SetRuntimeProviderDone(podUID types.UID, done bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	podCfg, ok := s.configs[podUID]
+	if !ok {
+		return nil
+	}
+	var firstErr error
+	for devName, devCfg := range podCfg.DeviceConfigs {
+		if devCfg.RuntimeProviderDone == done {
+			continue
+		}
+		devCfg.RuntimeProviderDone = done
+		if s.checkpointer != nil {
+			if err := s.checkpointer.Store(podUID, devName, devCfg); err != nil {
+				klog.Errorf("failed to checkpoint runtime provider state for pod %s device %s: %v", podUID, devName, err)
+				if done {
+					return err
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+		podCfg.DeviceConfigs[devName] = devCfg
+	}
+	podCfg.RuntimeProviderDone = done
+	s.configs[podUID] = podCfg
+	return firstErr
 }
 
 // DeleteClaim removes all configurations and allocated IPs associated with a given

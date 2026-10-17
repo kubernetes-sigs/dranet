@@ -19,13 +19,16 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -383,5 +386,124 @@ func TestWebhookReleaseProfileConfigPassesClaimUID(t *testing.T) {
 	}
 	if err := provider.ReleaseProfileConfig(cloudprovider.DeviceIdentifiers{}, "claim-123", &apis.NetworkConfig{Profile: "test-profile"}); err != nil {
 		t.Fatalf("ReleaseProfileConfig failed: %v", err)
+	}
+}
+
+func TestWebhookConfigurePod(t *testing.T) {
+	ctx := context.Background()
+	request := &cloudprovider.ConfigurePodRequest{
+		Pod:   cloudprovider.PodReference{Namespace: "team", Name: "workload", UID: "pod-uid"},
+		NetNS: "/var/run/netns/cni-1234",
+		Claims: []cloudprovider.PodClaim{{
+			Claim: &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "claim", UID: "claim-uid"}},
+			Devices: []cloudprovider.PodDevice{{
+				Name:       "nic-0",
+				Device:     cloudprovider.DeviceIdentifiers{Name: "eth1", MAC: "aa:bb:cc:dd:ee:ff", PCIAddress: "0000:00:01.0"},
+				Config:     &apis.NetworkConfig{Profile: "fabric", Interface: apis.InterfaceConfig{Name: "net1"}},
+				RDMADevice: "mlx5_1",
+			}},
+		}},
+	}
+	type call struct {
+		path        string
+		contentType string
+		body        cloudprovider.ConfigurePodRequest
+	}
+	calls := make(chan call, 1)
+	status := http.StatusOK
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case PathHealth:
+			json.NewEncoder(w).Encode(Capabilities{ProfileProvider: true, RuntimeProvider: true})
+		case PathConfigurePod:
+			var body cloudprovider.ConfigurePodRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			calls <- call{path: r.URL.Path, contentType: r.Header.Get("Content-Type"), body: body}
+			if status == http.StatusGatewayTimeout {
+				select {
+				case <-hold:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			w.WriteHeader(status)
+			fmt.Fprintf(w, "status %d from the provider", status)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	defer close(hold)
+
+	provider, err := NewWebhookProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !provider.HasRuntimeProvider() {
+		t.Fatal("expected the runtime provider capability")
+	}
+
+	t.Run("success sends the request as JSON", func(t *testing.T) {
+		if err := provider.ConfigurePod(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+		got := <-calls
+		if got.path != PathConfigurePod || got.contentType != "application/json" {
+			t.Fatalf("call = %+v", got)
+		}
+		if diff := cmp.Diff(*request, got.body); diff != "" {
+			t.Fatalf("request mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a failure carries the provider's answer", func(t *testing.T) {
+		status = http.StatusConflict
+		err := provider.ConfigurePod(ctx, request)
+		if err == nil || !strings.Contains(err.Error(), "HTTP 409") || !strings.Contains(err.Error(), "status 409 from the provider") {
+			t.Fatalf("ConfigurePod = %v", err)
+		}
+		<-calls
+	})
+
+	t.Run("the deadline of the context bounds the call", func(t *testing.T) {
+		status = http.StatusGatewayTimeout
+		deadline, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		err := provider.ConfigurePod(deadline, request)
+		if err == nil || !strings.Contains(err.Error(), "deadline") {
+			t.Fatalf("ConfigurePod with an expired deadline = %v", err)
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatalf("the call did not stop at the deadline")
+		}
+		<-calls
+	})
+}
+
+func TestWebhookConfigurePodRequiresTheCapability(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == PathHealth {
+			json.NewEncoder(w).Encode(Capabilities{ProfileProvider: true})
+			return
+		}
+		t.Errorf("unexpected call to %s", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	provider, err := NewWebhookProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.HasRuntimeProvider() {
+		t.Fatal("the runtime provider capability was not declared")
+	}
+	if err := provider.ConfigurePod(ctx, &cloudprovider.ConfigurePodRequest{}); err == nil || !strings.Contains(err.Error(), "does not declare") {
+		t.Fatalf("ConfigurePod without the capability = %v", err)
 	}
 }

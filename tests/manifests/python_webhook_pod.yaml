@@ -26,6 +26,14 @@ spec:
   containers:
   - name: app
     image: registry.k8s.io/e2e-test-images/agnhost:2.54
+    # The runtime provider tags the claimed interface before the first
+    # container starts; what the process sees when it starts is kept for the
+    # test to read.
+    command: ["sh", "-c", "cat /proc/sys/net/ipv4/conf/dummy1/tag > /tmp/tag-at-start; exec sleep infinity"]
+  # A second container: the runtime provider is called once per Pod, with the first
+  # container, and not again for this one.
+  - name: second
+    image: registry.k8s.io/e2e-test-images/agnhost:2.54
     command: ["sleep", "infinity"]
   resourceClaims:
   - name: dummy1

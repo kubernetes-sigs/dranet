@@ -50,6 +50,27 @@ sequenceDiagram
     W-->>D: 200 OK (Resources released)
 ```
 
+When the webhook is also a runtime provider, one more call happens between the profile resolution and the teardown, once the Pod's network namespace exists and DRANET has attached and configured the devices in it:
+
+```mermaid
+sequenceDiagram
+    participant K as kubelet / containerd
+    participant R as runc
+    participant D as DRANET Daemon
+    participant W as Webhook Server (BYODP)
+
+    K->>D: NRI RunPodSandbox
+    note over D: DRANET attaches and configures the devices in the Pod's netns
+    K->>D: NRI CreateContainer (first container)
+    D-->>K: OCI spec + createRuntime hook (dranet oci-hook)
+    K->>R: create container
+    R->>D: hook: READY <container>
+    D->>W: POST /ConfigurePod (Pod, netns, claims, devices)
+    W-->>D: 200 OK (netns configured) / error
+    D-->>R: OK / FAIL <reason>
+    R->>K: container starts / start fails, kubelet retries
+```
+
 
 ### How it Works in Practice
 
@@ -62,6 +83,9 @@ Cloud providers are the authoritative source for the VM and its hardware, which 
 **3. Solid and Predictable Runtime Abstraction**
 Regardless of which providers are in use, we always keep the same abstraction on the runtime for DRANET: a network interface and its associated network parameters (like IPs, routes, and rules). All of these external hooks work together to merge into a final, statically verifiable configuration for these interfaces *before* execution. This makes the DRANET runtime solid and predictable, in contrast with the dynamic behavior of standard CNI plugins that stop the world during runtime.
 
+**4. Runtime Providers (Pod Post-Configuration)**
+Some providers need to do their own plumbing in the Pod's network namespace once the devices are in it and before any workload process runs: program a fabric or SmartNIC for the Pod, load eBPF programs on the interface, run a CNI plugin, register the Pod with a controller. A runtime provider is DRANET's cloud-init for them: DRANET pauses the start of the Pod's first container, calls the webhook with the Pod, its network namespace path and its claims, and lets the container start only when the webhook answers successfully. See [Runtime Provider](../concepts/runtime-provider.md) for the mechanism and its guarantees.
+
 ### Webhook Capabilities Validation
 
 To ensure safe delegation, DRANET requires the webhook server to declare its capabilities via the `/health` endpoint.
@@ -71,11 +95,12 @@ When DRANET connects to the webhook, it performs an HTTP `GET /health` and expec
 ```json
 {
   "cloudProvider": false,
-  "profileProvider": true
+  "profileProvider": true,
+  "runtimeProvider": true
 }
 ```
 
-If you start DRANET with `--cloud-provider-hint=webhook` but the webhook returns `"cloudProvider": false`, DRANET will log a fatal error during initialization to prevent misconfiguration.
+If you start DRANET with `--cloud-provider-hint=webhook` but the webhook returns `"cloudProvider": false`, DRANET will log a fatal error during initialization to prevent misconfiguration. `runtimeProvider` is optional and independent of the other two: when `--feature-gates=RuntimeProvider=true` is enabled, DRANET uses it from any webhook configured as its cloud or profile provider.
 
 ### API Contracts
 
@@ -110,6 +135,35 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
 
 * `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). It receives the ResourceClaim UID and the full `NetworkConfig`. `NodeUnprepareResources` does not provide the complete ResourceClaim. The endpoint should return `200 OK` on success or if the resource was already released (idempotency).
   * **Best-effort teardown**: A failed `ReleaseProfileConfig` is logged but not retried by DRANET (teardown must not block pod deletion). The provider therefore owns leak reclamation and must be able to garbage-collect orphaned allocations on its own, otherwise resources leak permanently.
+
+#### Runtime Provider API (`runtimeProvider: true`)
+
+* `POST /ConfigurePod`: Called once per Pod sandbox, after DRANET attached and configured the Pod's devices in its network namespace and before the Pod's first container starts. The container runtime keeps the container paused until the call returns. The webhook configures the Pod's network namespace itself, from the node, and answers:
+
+  ```json
+  {
+    "pod": {"namespace": "team", "name": "trainer-0", "uid": "6f1c..."},
+    "netns": "/var/run/netns/cni-3d2a...",
+    "claims": [{
+      "claim": { "metadata": {"name": "nics", "namespace": "team", "uid": "9a4e..."}, "spec": {}, "status": {} },
+      "devices": [{
+        "name": "gpu0rdma0",
+        "device": {"name": "eth1", "mac_address": "aa:bb:cc:dd:ee:01", "pci_address": "0000:00:01.0"},
+        "config": {"profile": "acme.com/fabric", "interface": {"name": "net1", "addresses": ["10.0.0.5/24"]}, "routes": []},
+        "rdmaDevice": "mlx5_1"
+      }]
+    }]
+  }
+  ```
+
+  * `pod` identifies the Pod; `netns` is the path of its network namespace on the node, usable with `nsenter --net` or `setns(2)` by a provider that runs on the node with access to `/var/run/netns`.
+  * `claims` lists the Pod's ResourceClaims served by DRANET, sorted by namespace and name. `claim` is the ResourceClaim as DRANET received it at `NodePrepareResources` (without `managedFields`), so the Claim UID matches the one seen by `GetProfileConfig`. Each device carries its name in the ResourceSlice, its host identifiers, the `NetworkConfig` DRANET applied in the Pod (the interface name inside the Pod is `config.interface.name`) and its RDMA link device, if any.
+  * **200 OK**: the Pod is configured; the container starts. The response body is ignored.
+  * **Any other status, or a network failure**: the container start fails with the response body as the reason, visible in the Pod's events (`kubectl describe pod`) and in a `RuntimeProviderFailed` event from DRANET. The kubelet retries the container with its usual backoff, and DRANET runs the hook again; the webhook decides whether a failure is permanent by failing consistently.
+  * **Timeout**: the call must return within `--runtime-provider-timeout` (30s by default, up to a maximum of 60s) minus a 5s margin, after which DRANET fails the container start with a timeout reason. The container runtime kills the hook at the full timeout. Kubelet's own `--runtime-request-timeout` (2m by default) bounds the whole container start, so keep the hook timeout under it.
+  * **Idempotency**: the webhook is called again on the next container creation when it fails, after a DRANET restart for Pods whose containers were not running yet, and for every new sandbox of the Pod (a new network namespace). It must be safe to repeat for the same Pod, and two attempts for the same Pod can overlap when the kubelet starts another container of the Pod while the first retries.
+  * **Scope**: the webhook configures the Pod's network namespace; it must not move, rename or re-address the interfaces DRANET attached, which DRANET reports in the ResourceClaim status and detaches at teardown. Provider resources tied to the Pod are released through `ReleaseProfileConfig` at `NodeUnprepareResources`, which does not run the hook again; namespace-local state disappears with the namespace.
+  * The webhook must be reachable from the DRANET daemon at the configured `--webhook-url`, as for the other calls. Calls for several Pods starting at once are made concurrently.
 
 ### Reference Implementation
 

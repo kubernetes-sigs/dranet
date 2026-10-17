@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/driver"
 	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/inventory"
+	"sigs.k8s.io/dranet/pkg/ocihook"
 	"sigs.k8s.io/dranet/pkg/pcidb"
 
 	resourcev1 "k8s.io/api/resource/v1"
@@ -57,20 +58,22 @@ const (
 )
 
 var (
-	hostnameOverride     string
-	kubeconfig           string
-	bindAddress          string
-	celExpression        string
-	dbPath               string
-	minPollInterval      time.Duration
-	maxPollInterval      time.Duration
-	pollBurst            int
-	moveIBInterfaces     bool
-	cloudProviderHint    string
-	profileProvider      string
-	webhookURL           string
-	featureGates         string
-	cloudProviderOptions stringList
+	hostnameOverride       string
+	kubeconfig             string
+	bindAddress            string
+	celExpression          string
+	dbPath                 string
+	minPollInterval        time.Duration
+	maxPollInterval        time.Duration
+	pollBurst              int
+	moveIBInterfaces       bool
+	cloudProviderHint      string
+	profileProvider        string
+	webhookURL             string
+	featureGates           string
+	cloudProviderOptions   stringList
+	ociHookSocket          string
+	runtimeProviderTimeout time.Duration
 
 	kubeletRootDir string
 
@@ -93,16 +96,30 @@ func init() {
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 	flag.Var(&cloudProviderOptions, "cloud-provider-options", "A <provider>.<option>=<value> pair for a cloud provider. Repeat the flag for each option. Values can contain commas. The options of a provider apply only when that provider runs. Values must not contain secrets; flags are logged.")
+	flag.StringVar(&ociHookSocket, "oci-hook-socket", ocihook.DefaultSocketPath, "UNIX socket where the OCI hook DRANET adds to containers, run by the container runtime on the host, reaches the daemon. Used when the RuntimeProvider feature gate is enabled and a provider is a runtime provider; the path must be shared with the host.")
+	flag.DurationVar(&runtimeProviderTimeout, "runtime-provider-timeout", ocihook.DefaultTimeout, "Time the runtime provider has to configure a Pod before its container start fails (max 60s). Must stay under the kubelet runtime request timeout.")
 
 	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
+		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n")
+		fmt.Fprintf(os.Stderr, "       dranet %s --socket=<path> --container-id=<id> --timeout=<duration>  (run by the container runtime as an OCI hook)\n\n", ocihook.Subcommand)
 		flag.PrintDefaults()
 	}
 }
 
 func main() {
+	// The container runtime executes this binary as the OCI hook of the
+	// containers the daemon adjusts, with the container paused. That path
+	// does nothing but signal the daemon, and it starts no daemon component.
+	if len(os.Args) > 1 && os.Args[1] == ocihook.Subcommand {
+		os.Exit(ocihook.Run(os.Args[2:], os.Stdin, os.Stderr))
+	}
+
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if err := ocihook.ValidateTimeout(runtimeProviderTimeout); err != nil {
+		klog.Fatalf("invalid --runtime-provider-timeout: %v", err)
+	}
 
 	if featureGates != "" {
 		if err := features.DefaultMutableFeatureGate.Set(featureGates); err != nil {
@@ -232,6 +249,10 @@ func main() {
 	if err != nil {
 		klog.Fatalf("failed to setup providers: %v", err)
 	}
+	if providers := runtimeProviders(cloudInst, profProv); len(providers) > 0 {
+		klog.Infof("Configured %d runtime provider(s): Pods with DRANET devices start their first container after they configured them, with a %v timeout", len(providers), runtimeProviderTimeout)
+		opts = append(opts, driver.WithRuntimeProvider(ociHookSocket, runtimeProviderTimeout, providers...))
+	}
 
 	optsDb := []inventory.Option{
 		inventory.WithRateLimiter(rate.NewLimiter(rate.Every(minPollInterval), pollBurst)),
@@ -358,6 +379,41 @@ func setupProviders(ctx context.Context, opts providerOptions) (cloudprovider.Cl
 	}
 
 	return cloudInst, profProv, nil
+}
+
+// runtimeProviders returns all distinct providers that run a hook before a
+// Pod's first container starts, in the order given, when the RuntimeProvider
+// feature gate is enabled. Implementing the interface is not enough for a
+// provider whose capabilities are discovered at runtime, such as the webhook:
+// it must also report the capability.
+func runtimeProviders(providers ...any) []cloudprovider.RuntimeProvider {
+	var active []cloudprovider.RuntimeProvider
+	for _, provider := range providers {
+		runtimeProvider, ok := provider.(cloudprovider.RuntimeProvider)
+		if !ok || provider == nil {
+			continue
+		}
+		if declared, ok := provider.(interface{ HasRuntimeProvider() bool }); ok && !declared.HasRuntimeProvider() {
+			continue
+		}
+		alreadyAdded := false
+		if reflect.TypeOf(provider).Comparable() {
+			for _, existing := range active {
+				if any(existing) == provider {
+					alreadyAdded = true
+					break
+				}
+			}
+		}
+		if !alreadyAdded {
+			active = append(active, runtimeProvider)
+		}
+	}
+	if len(active) > 0 && !features.DefaultFeatureGate.Enabled(features.RuntimeProvider) {
+		klog.Infof("Ignoring %d runtime provider(s) because the %s feature gate is disabled", len(active), features.RuntimeProvider)
+		return nil
+	}
+	return active
 }
 
 // startMetricsServer binds addr and serves handler on it in the background.

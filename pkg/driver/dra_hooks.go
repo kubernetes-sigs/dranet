@@ -297,6 +297,9 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		NetworkInterfaceConfigInPod: netconf,
 		DeviceSnapshot:              deviceSnapshot,
 	}
+	if np.runtimeProvider != nil || features.DefaultFeatureGate.Enabled(features.RuntimeProvider) {
+		deviceCfg.ResourceClaim = claimSnapshot(claim)
+	}
 
 	// IB-only path: device has RDMA capability but no netdev interface.
 	if np.netdb.IsIBOnlyDevice(result.Device) {
@@ -588,8 +591,18 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 		}
 	}
 
-	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+	for _, podUID := range np.podConfigStore.DeleteClaim(claim.NamespacedName) {
+		np.resetRuntimeProvider(podUID)
+	}
 	return nil
+}
+
+// claimSnapshot copies the claim for the device configuration, without the
+// managedFields, which are large and of no use to anyone reading it back.
+func claimSnapshot(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+	snapshot := claim.DeepCopy()
+	snapshot.ManagedFields = nil
+	return snapshot
 }
 
 func (np *NetworkDriver) HandleError(ctx context.Context, err error, msg string) {

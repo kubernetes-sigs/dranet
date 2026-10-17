@@ -60,6 +60,10 @@ func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox
 		}
 	}
 
+	if np.runtimeProvider != nil {
+		np.runtimeProvider.Synchronize(pods, containers)
+	}
+
 	return nil, nil
 }
 
@@ -94,7 +98,7 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 	return adjust, update, err
 }
 
-func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+func (np *NetworkDriver) createContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// Containers only care about the RDMA char devices.
 	devPaths := set.Set[string]{}
 	adjust := &api.ContainerAdjustment{}
@@ -113,6 +117,19 @@ func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _
 				Major: dev.Major,
 				Minor: dev.Minor,
 			})
+		}
+	}
+
+	// The runtime provider configures the Pod with this container paused, before its
+	// process starts, until it succeeds once for the Pod's sandbox.
+	if np.runtimeProvider != nil {
+		hook, err := np.runtimeProviderAdjustment(pod, ctr, podConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		if hook != nil {
+			adjust.AddHooks(&api.Hooks{CreateRuntime: []*api.Hook{hook}})
+			klog.FromContext(ctx).V(2).Info("Added the runtime provider OCI hook", "containerID", ctr.GetId(), "timeout", hook.GetTimeout().GetValue())
 		}
 	}
 
@@ -154,6 +171,9 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 	}
 	// store the Pod network namespace in the pod config store
 	np.podConfigStore.SetPodNetNs(types.UID(pod.GetUid()), ns)
+	// A new sandbox is a new network namespace: the runtime provider
+	// runs again for it.
+	np.resetRuntimeProvider(types.UID(pod.GetUid()))
 
 	// Track all the status updates needed for the resource claims of the pod.
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
@@ -424,6 +444,7 @@ func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox
 
 func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
 	logger := klog.FromContext(ctx)
+	np.resetRuntimeProvider(types.UID(pod.GetUid()))
 	// get the pod network namespace
 	ns := getNetworkNamespace(pod)
 	if ns == "" {
@@ -519,6 +540,7 @@ func (np *NetworkDriver) RemovePodSandbox(ctx context.Context, pod *api.PodSandb
 }
 
 func (np *NetworkDriver) removePodSandbox(_ context.Context, pod *api.PodSandbox) error {
+	np.resetRuntimeProvider(types.UID(pod.GetUid()))
 	return nil
 }
 

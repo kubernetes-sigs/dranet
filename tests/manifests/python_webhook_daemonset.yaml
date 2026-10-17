@@ -20,6 +20,10 @@ spec:
       - name: webhook
         image: python:3-alpine
         command: ["python3", "/usr/local/bin/webhook.py", "--port=8081"]
+        # As a runtime provider it enters the network namespaces of the Pods DRANET
+        # configures (setns), like a provider on the node would.
+        securityContext:
+          privileged: true
         readinessProbe:
           httpGet:
             path: /health
@@ -30,8 +34,14 @@ spec:
         - name: script
           mountPath: /usr/local/bin/webhook.py
           subPath: webhook.py
+        - name: netns
+          mountPath: /var/run/netns
+          mountPropagation: HostToContainer
       volumes:
       - name: script
         configMap:
           name: python-webhook-script
           defaultMode: 0777
+      - name: netns
+        hostPath:
+          path: /var/run/netns

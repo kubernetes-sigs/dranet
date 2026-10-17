@@ -27,3 +27,6 @@ go.work
 .idea
 .vscode
 tests/bpftool
+__pycache__/
+*.pyc
+

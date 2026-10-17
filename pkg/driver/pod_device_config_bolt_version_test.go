@@ -29,6 +29,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -39,6 +40,13 @@ import (
 func fullDeviceConfig() DeviceConfig {
 	return DeviceConfig{
 		Claim: types.NamespacedName{Namespace: "default", Name: "claim-1"},
+		ResourceClaim: &resourceapi.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "claim-1", UID: "claim-uid-1"},
+			Spec: resourceapi.ResourceClaimSpec{Devices: resourceapi.DeviceClaim{
+				Requests: []resourceapi.DeviceRequest{{Name: "nic", Exactly: &resourceapi.ExactDeviceRequest{DeviceClassName: "dra.net"}}},
+			}},
+		},
+		RuntimeProviderDone: true,
 		DeviceSnapshot: &resourceapi.Device{
 			Name: "dev0",
 			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
@@ -121,7 +129,7 @@ func fullDeviceConfig() DeviceConfig {
 // goldenDeviceConfigJSON is the expected JSON output of fullDeviceConfig().
 // If TestDeviceConfigWireFormatGolden fails, either make the change backward-compatible
 // or bump checkpointSchemaVersion, add a migration, and update this golden string.
-const goldenDeviceConfigJSON = `{"claim":{"Namespace":"default","Name":"claim-1"},"deviceSnapshot":{"name":"dev0","attributes":{"dra.net/mac":{"string":"aa:bb:cc:dd:ee:ff"}}},"networkInterfaceConfigInHost":{"interface":{"name":"eth1","addresses":["192.168.1.10/24"],"hardwareAddr":"aa:bb:cc:dd:ee:ff"}},"networkInterfaceConfigInPod":{"profile":"hpc","interface":{"name":"net0","type":"IPVLAN","addressing":"DHCP","addresses":["10.0.0.5/24"],"dhcp":true,"mtu":9000,"hardwareAddr":"02:00:00:00:00:01","gsoMaxSize":65536,"groMaxSize":65536,"gsoIPv4MaxSize":65536,"groIPv4MaxSize":65536,"disableEbpfPrograms":true,"forwarding":true,"arpIgnore":1,"arpAnnounce":2,"acceptRA":2,"vrf":{"name":"vrf0","table":100},"ipvlan":{"mode":"L2","flag":"Bridge"}},"routes":[{"destination":"0.0.0.0/0","gateway":"10.0.0.1","source":"10.0.0.5","scope":253,"table":100}],"rules":[{"priority":1000,"source":"10.0.0.5/32","destination":"10.1.0.0/16","table":100}],"neighbors":[{"destination":"10.0.0.1","hardwareAddr":"02:00:00:00:00:02"}],"ethtool":{"features":{"tcp-segmentation-offload":true},"privateFlags":{"my-flag":false}}},"networkInterfaceStateInPod":{"dhcpLease":{"clientIP":"10.0.0.5","clientMAC":"02:00:00:00:00:01","serverID":"10.0.0.1"}},"rdmaDevice":{"linkDev":"mlx5_0","devChars":[{"path":"/dev/infiniband/uverbs0","type":"c","major":231,"minor":192,"fileMode":438,"uid":1000,"gid":1000}]}}`
+const goldenDeviceConfigJSON = `{"claim":{"Namespace":"default","Name":"claim-1"},"resourceClaim":{"metadata":{"name":"claim-1","namespace":"default","uid":"claim-uid-1"},"spec":{"devices":{"requests":[{"name":"nic","exactly":{"deviceClassName":"dra.net"}}]}},"status":{}},"runtimeProviderDone":true,"deviceSnapshot":{"name":"dev0","attributes":{"dra.net/mac":{"string":"aa:bb:cc:dd:ee:ff"}}},"networkInterfaceConfigInHost":{"interface":{"name":"eth1","addresses":["192.168.1.10/24"],"hardwareAddr":"aa:bb:cc:dd:ee:ff"}},"networkInterfaceConfigInPod":{"profile":"hpc","interface":{"name":"net0","type":"IPVLAN","addressing":"DHCP","addresses":["10.0.0.5/24"],"dhcp":true,"mtu":9000,"hardwareAddr":"02:00:00:00:00:01","gsoMaxSize":65536,"groMaxSize":65536,"gsoIPv4MaxSize":65536,"groIPv4MaxSize":65536,"disableEbpfPrograms":true,"forwarding":true,"arpIgnore":1,"arpAnnounce":2,"acceptRA":2,"vrf":{"name":"vrf0","table":100},"ipvlan":{"mode":"L2","flag":"Bridge"}},"routes":[{"destination":"0.0.0.0/0","gateway":"10.0.0.1","source":"10.0.0.5","scope":253,"table":100}],"rules":[{"priority":1000,"source":"10.0.0.5/32","destination":"10.1.0.0/16","table":100}],"neighbors":[{"destination":"10.0.0.1","hardwareAddr":"02:00:00:00:00:02"}],"ethtool":{"features":{"tcp-segmentation-offload":true},"privateFlags":{"my-flag":false}}},"networkInterfaceStateInPod":{"dhcpLease":{"clientIP":"10.0.0.5","clientMAC":"02:00:00:00:00:01","serverID":"10.0.0.1"}},"rdmaDevice":{"linkDev":"mlx5_0","devChars":[{"path":"/dev/infiniband/uverbs0","type":"c","major":231,"minor":192,"fileMode":438,"uid":1000,"gid":1000}]}}`
 
 func openRawBolt(t *testing.T, path string) *bolt.DB {
 	t.Helper()

@@ -40,6 +40,7 @@ const (
 	PathGetDeviceConfig      = "/GetDeviceConfig"
 	PathGetProfileConfig     = "/GetProfileConfig"
 	PathReleaseProfileConfig = "/ReleaseProfileConfig"
+	PathConfigurePod         = "/ConfigurePod"
 	PathHealth               = "/health"
 )
 
@@ -47,6 +48,9 @@ const (
 type Capabilities struct {
 	CloudProvider   bool `json:"cloudProvider"`
 	ProfileProvider bool `json:"profileProvider"`
+	// RuntimeProvider declares PathConfigurePod: the webhook configures the Pod's
+	// network namespace before the Pod's first container starts.
+	RuntimeProvider bool `json:"runtimeProvider,omitempty"`
 }
 
 // API Contracts (JSON payloads)
@@ -64,11 +68,17 @@ type ProfileReleaseRequest struct {
 	Config   *apis.NetworkConfig             `json:"config,omitempty"`
 }
 
+// ConfigurePodRequest is the body of PathConfigurePod.
+type ConfigurePodRequest = cloudprovider.ConfigurePodRequest
+
 // WebhookProvider implements CloudInstance and ProfileProvider via HTTP POST.
 type WebhookProvider struct {
 	baseURL *url.URL
 	client  *http.Client
-	caps    Capabilities
+	// runtimeClient has no timeout of its own: the runtime provider's deadline, in
+	// the request context, is much longer than the other calls'.
+	runtimeClient *http.Client
+	caps          Capabilities
 }
 
 func (p *WebhookProvider) HasCloudProvider() bool {
@@ -77,6 +87,11 @@ func (p *WebhookProvider) HasCloudProvider() bool {
 
 func (p *WebhookProvider) HasProfileProvider() bool {
 	return p.caps.ProfileProvider
+}
+
+// HasRuntimeProvider reports whether the webhook declared itself a runtime provider.
+func (p *WebhookProvider) HasRuntimeProvider() bool {
+	return p.caps.RuntimeProvider
 }
 
 func newWebhookClient(endpoint string) (*http.Client, *url.URL, error) {
@@ -135,6 +150,7 @@ func OnWebhook(ctx context.Context, endpoint string) bool {
 
 var _ cloudprovider.CloudInstance = &WebhookProvider{}
 var _ cloudprovider.ProfileProvider = &WebhookProvider{}
+var _ cloudprovider.RuntimeProvider = &WebhookProvider{}
 
 // NewWebhookProvider initializes the HTTP client and fetches capabilities.
 func NewWebhookProvider(ctx context.Context, endpoint string) (*WebhookProvider, error) {
@@ -145,8 +161,9 @@ func NewWebhookProvider(ctx context.Context, endpoint string) (*WebhookProvider,
 	client.Timeout = 10 * time.Second
 
 	p := &WebhookProvider{
-		baseURL: u,
-		client:  client,
+		baseURL:       u,
+		client:        client,
+		runtimeClient: &http.Client{Transport: client.Transport},
 	}
 
 	reqURL := p.baseURL.JoinPath(PathHealth).String()
@@ -176,10 +193,17 @@ func NewWebhookProvider(ctx context.Context, endpoint string) (*WebhookProvider,
 
 // helper to perform the HTTP POST
 func (p *WebhookProvider) post(path string, reqPayload interface{}, respObj interface{}) error {
+	return p.postContext(context.Background(), p.client, path, reqPayload, respObj)
+}
+
+func (p *WebhookProvider) postContext(ctx context.Context, client *http.Client, path string, reqPayload interface{}, respObj interface{}) error {
 	if (path == PathGetDeviceAttributes || path == PathGetDeviceConfig) && !p.caps.CloudProvider {
 		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
 	}
 	if (path == PathGetProfileConfig || path == PathReleaseProfileConfig) && !p.caps.ProfileProvider {
+		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
+	}
+	if path == PathConfigurePod && !p.caps.RuntimeProvider {
 		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
 	}
 
@@ -189,13 +213,13 @@ func (p *WebhookProvider) post(path string, reqPayload interface{}, respObj inte
 	}
 
 	reqURL := p.baseURL.JoinPath(path).String()
-	req, err := http.NewRequest(http.MethodPost, reqURL, bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("webhook request failed: %v", err)
 	}
@@ -262,4 +286,14 @@ func (p *WebhookProvider) ReleaseProfileConfig(id cloudprovider.DeviceIdentifier
 	}
 
 	return p.post(PathReleaseProfileConfig, req, nil)
+}
+
+// ConfigurePod asks the webhook to configure the Pod's network namespace,
+// before the Pod's first container starts. The context carries the deadline
+// the container runtime leaves for the hook.
+func (p *WebhookProvider) ConfigurePod(ctx context.Context, req *cloudprovider.ConfigurePodRequest) error {
+	if !p.HasRuntimeProvider() {
+		return fmt.Errorf("webhook at %s does not declare the runtime provider capability", p.baseURL)
+	}
+	return p.postContext(ctx, p.runtimeClient, PathConfigurePod, req, nil)
 }
