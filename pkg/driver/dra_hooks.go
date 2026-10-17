@@ -253,7 +253,15 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 		// TODO: define a strategy for multiple configs
 		if conf != nil {
-			userConf = conf
+			// Merge the configuration as the user wrote it, not the defaulted
+			// one ValidateConfig returns: the merged configuration is defaulted
+			// again once the cloud provider may have set the interface type.
+			written, err := apis.UnmarshalConfig(&config.Opaque.Parameters)
+			if err != nil {
+				configErrors = append(configErrors, err)
+				continue
+			}
+			userConf = written
 			break
 		}
 	}
@@ -363,9 +371,13 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 	}
 
-	// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
-	// ... but we DO NOT apply them in the root namespace
-	if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeDHCP {
+	// Resolve how the interface gets its addresses. DHCP is resolved here, in
+	// the root namespace, so the slow part is out of the runtime hooks; SLAAC
+	// resolves itself inside the Pod; anything else inherits what the host has.
+	switch iface := deviceCfg.NetworkInterfaceConfigInPod.Interface; {
+	case iface.Addressing == apis.AddressingModeDHCP:
+		// Do a DHCP request to gather the network parameters (IPs and Routes)
+		// ... but we DO NOT apply them in the root namespace
 		klog.V(2).Infof("trying to get network configuration via DHCP")
 		contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -378,7 +390,33 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		if lease != nil {
 			deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
 		}
-	} else if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
+	case iface.Addressing == apis.AddressingModeSLAAC && iface.IsSubinterface():
+		// A subinterface has no host addresses to inherit: the parent keeps
+		// its addresses on the host, and a copy on the child would claim the
+		// host's own IPv4 address in the Pod. The child autoconfigures its IPv6
+		// and takes IPv4 only from the claim.
+		klog.V(2).Infof("device %s: %s child of %s uses SLAAC; inheriting no host addresses", result.Device, iface.Type, ifName)
+	case iface.Addressing == apis.AddressingModeSLAAC:
+		// The Pod autoconfigures its IPv6 from router advertisements on its
+		// own, so no IPv6 address is inherited: copying the host's in would
+		// pin a second, permanent copy of an address the kernel is about to
+		// manage with lifetimes of its own. IPv4 has no autoconfiguration to
+		// defer to, so a dual-stack interface keeps inheriting its IPv4
+		// addresses, or takes them from the claim, as any passthrough does.
+		klog.V(2).Infof("device %s: interface %s uses SLAAC; inheriting only IPv4 host addresses", result.Device, ifName)
+		if len(iface.Addresses) == 0 {
+			nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_V4)
+			if err != nil {
+				return fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err)
+			}
+			for _, address := range nlAddresses {
+				if address.Scope != unix.RT_SCOPE_UNIVERSE {
+					continue
+				}
+				deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = append(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses, address.IPNet.String())
+			}
+		}
+	case !iface.IsSubinterface() && len(iface.Addresses) == 0:
 		// For a passthrough interface with no custom addresses and no DHCP, then use the existing ones
 		// get the existing IP addresses
 		nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
@@ -430,7 +468,8 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 
 	// For non-subinterface type, obtain the routes and rules associated with the interface.
 	if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-		routes, tables, err := getRouteInfo(nlHandle, ifName, link)
+		slaac := deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeSLAAC
+		routes, tables, err := getRouteInfo(nlHandle, ifName, link, slaac)
 		if err != nil {
 			return err
 		}
@@ -472,14 +511,14 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	}
 
 	// A subinterface has no host addresses to inherit, so its addresses must
-	// come from the user config, a profile, or be explicitly waived via
-	// Addressing: Unnumbered. Routing (including any policy based routing) is
-	// owned by the user or the provider profile; the driver never synthesizes
-	// routes or rules.
+	// come from the user config, a profile, router advertisements via
+	// Addressing: SLAAC, or be explicitly waived via Addressing: Unnumbered.
+	// Routing (including any policy based routing) is owned by the user or the
+	// provider profile; the driver never synthesizes routes or rules.
 	if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
 		iface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
-		if len(iface.Addresses) == 0 && iface.Addressing != apis.AddressingModeUnnumbered {
-			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: Unnumbered", result.Device, iface.Type)
+		if len(iface.Addresses) == 0 && iface.Addressing != apis.AddressingModeUnnumbered && iface.Addressing != apis.AddressingModeSLAAC {
+			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: SLAAC or Unnumbered", result.Device, iface.Type)
 		}
 		if iface.Addressing == apis.AddressingModeUnnumbered {
 			klog.V(2).Infof("device %s: unnumbered %s interface requested; skipping address and route configuration", result.Device, iface.Type)
@@ -680,10 +719,12 @@ func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
 }
 
 // getRouteInfo retrieves all routes associated with a given network interface.
+// When dropAdvertised is set, routes the host learned from IPv6 router
+// advertisements are left out, because the Pod learns them itself.
 // It filters out routes that are not suitable for pod namespaces, such as
 // routes in the local table. It returns the list of suitable routes and a set
 // of the route table IDs to which they belong.
-func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]apis.RouteConfig, sets.Set[int], error) {
+func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link, dropAdvertised bool) ([]apis.RouteConfig, sets.Set[int], error) {
 	routes := []apis.RouteConfig{}
 	tables := sets.Set[int]{}
 	filter := &netlink.Route{
@@ -695,6 +736,14 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 	}
 	for _, route := range rl {
 		routeCfg := apis.RouteConfig{}
+		// A route learned from a router advertisement is re-learned inside the
+		// Pod when it autoconfigures, with a lifetime the kernel refreshes.
+		// Copying it in as a static route would instead leave the Pod with a
+		// gateway that is never revalidated.
+		if dropAdvertised && route.Protocol == unix.RTPROT_RA {
+			klog.V(5).Infof("Skipping advertised route %s for interface %s: the Pod re-learns it from router advertisements", route.String(), ifName)
+			continue
+		}
 		// routes need a destination
 		if route.Dst == nil {
 			klog.V(5).Infof("Skipping route %s for interface %s because it has no destination", route.String(), ifName)
@@ -770,7 +819,13 @@ func (np *NetworkDriver) getDeviceNetworkConfig(device string, claim *resourceap
 
 	profileAllocated := false
 	if mergedConf.Profile != "" {
-		profileConf, err := np.netdb.GetProfileConfig(device, claim, mergedConf)
+		// The user configuration is merged as written, so the defaults that
+		// depend on the interface type are applied once the type is known.
+		// Profile providers, webhooks among them, still get the configuration
+		// defaulted for the type known so far, as they always have: an OKE
+		// claim with the deprecated dhcp field has to reach the profile as
+		// addressing DHCP to be rejected there.
+		profileConf, err := np.netdb.GetProfileConfig(device, claim, mergedConf.DefaultedCopy())
 		if err != nil {
 			return nil, fmt.Errorf("failed to get profile config: %v", err)
 		}

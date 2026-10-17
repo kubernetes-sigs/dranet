@@ -39,10 +39,11 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		return nil, fmt.Errorf("failed to get link for interface %s: %w", hostIfName, err)
 	}
 
-	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be
-	// set. Reject it before the link is touched so the host device stays usable.
-	if interfaceConfig.AcceptRA != nil && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
-		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
+	// The kernel creates no IPv6 settings below this MTU, so none of the
+	// per-interface IPv6 settings (see HasIPv6Sysctls) can be set. Reject them
+	// before the link is touched so the host device stays usable.
+	if interfaceConfig.HasIPv6Sysctls() && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
+		return nil, fmt.Errorf("the IPv6 settings (acceptRA, dadTransmits, routerSolicitationDelay, routerSolicitationInterval, disableIPv6, addrGenMode) require an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
 	}
 
 	// Devices can be renamed only when down

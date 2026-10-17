@@ -320,7 +320,7 @@ func test_nsAttachNetdevRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T) {
 
 	config := apis.InterfaceConfig{Name: "dranet0", AcceptRA: ptr.To[int32](0)}
 	_, err = nsAttachNetdev(name, containerNsPath, config)
-	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
+	if err == nil || !strings.Contains(err.Error(), "require an MTU of at least 1280") {
 		t.Fatalf("nsAttachNetdev() error = %v, want an MTU error", err)
 	}
 	// Events of the call arrive asynchronously; give them a moment before stopping.

@@ -91,6 +91,12 @@ spec:
             {{- if (hasKey .Values.args "webhookURL") }}
             - {{ printf "--webhook-url=%s" .Values.args.webhookURL | quote }}
             {{- end }}
+            {{- if .Values.args.slaacReadyTimeout }}
+            - --slaac-ready-timeout={{ .Values.args.slaacReadyTimeout }}
+            {{- end }}
+            {{- if .Values.args.slaacRollbackReserve }}
+            - --slaac-rollback-reserve={{ .Values.args.slaacRollbackReserve }}
+            {{- end }}
             {{- if (hasKey .Values.args "featureGates") }}
             - {{ printf "--feature-gates=%s" .Values.args.featureGates | quote }}
             {{- end }}
