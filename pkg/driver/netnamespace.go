@@ -288,6 +288,16 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 		}
 	}
 
+	// Routes are installed into the requested table, so an existing device
+	// is only reused if it is a VRF bound to that same table.
+	vrf, ok := vrfLink.(*netlink.Vrf)
+	if !ok {
+		return 0, fmt.Errorf("link %s exists but is not a vrf (type %s)", vrfName, vrfLink.Type())
+	}
+	if vrf.Table != vrfTable {
+		return 0, fmt.Errorf("vrf %s uses table %d, requested table %d", vrfName, vrf.Table, vrfTable)
+	}
+
 	if err := nhNs.LinkSetUp(vrfLink); err != nil {
 		return 0, fmt.Errorf("failed to set up vrf %s: %w", vrfName, err)
 	}

@@ -20,9 +20,11 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net"
 	"path"
 	"runtime"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -154,6 +156,7 @@ func Test_applyVRFConfigKeepsIPv6Addresses(t *testing.T) {
 func test_applyVRFConfigKeepsIPv6Addresses(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
 	origns, err := netns.Get()
 	if err != nil {
 		t.Fatalf("unexpected error trying to get namespace: %v", err)
@@ -218,5 +221,145 @@ func test_applyVRFConfigKeepsIPv6Addresses(t *testing.T) {
 	}
 	if !slices.ContainsFunc(routes, func(r netlink.Route) bool { return r.Dst != nil && r.Dst.String() == "2001:db8:1::/64" }) {
 		t.Errorf("no route for 2001:db8:1::/64 in the VRF table: %v", routes)
+	}
+}
+
+func Test_applyVRFConfig(t *testing.T) {
+	userns.Run(t, test_applyVRFConfig_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+// newVRFTestNamespace creates a named network namespace containing a dummy0
+// interface and returns its path together with a netlink handle into it.
+func newVRFTestNamespace(t *testing.T) (string, nlwrap.Handle) {
+	t.Helper()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origns, err := netns.Get()
+	if err != nil {
+		t.Fatalf("unexpected error trying to get namespace: %v", err)
+	}
+	defer origns.Close()
+
+	rndString := make([]byte, 4)
+	if _, err := rand.Read(rndString); err != nil {
+		t.Fatalf("fail to generate random name: %v", err)
+	}
+	nsName := fmt.Sprintf("ns%x", rndString)
+	testNS, err := netns.NewNamed(nsName)
+	if err != nil {
+		t.Fatalf("Failed to create network namespace: %v", err)
+	}
+	t.Cleanup(func() { netns.DeleteNamed(nsName) })
+	t.Cleanup(func() { testNS.Close() })
+
+	if err := netns.Set(origns); err != nil {
+		t.Fatalf("failed to restore original network namespace: %v", err)
+	}
+
+	nhNs, err := nlwrap.NewHandleAt(testNS)
+	if err != nil {
+		t.Fatalf("fail to open netlink handle: %v", err)
+	}
+	t.Cleanup(nhNs.Close)
+
+	if err := nhNs.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}}); err != nil {
+		t.Fatalf("Failed to add dummy0 in ns %s: %v", nsName, err)
+	}
+	return path.Join("/run/netns", nsName), nhNs
+}
+
+func test_applyVRFConfig_Namespaced(t *testing.T) {
+	const (
+		ifName  = "dummy0"
+		vrfName = "vrf-blue"
+	)
+	table := 100
+
+	tests := []struct {
+		name string
+		// existing is created in the namespace before applyVRFConfig runs.
+		existing netlink.Link
+		wantErr  []string
+	}{
+		{
+			name: "creates missing vrf",
+		},
+		{
+			name:     "reuses vrf with matching table",
+			existing: &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: vrfName}, Table: 100},
+		},
+		{
+			name:     "rejects vrf with different table",
+			existing: &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: vrfName}, Table: 200},
+			wantErr:  []string{vrfName, "100", "200"},
+		},
+		{
+			name:     "rejects non-vrf device with vrf name",
+			existing: &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: vrfName}},
+			wantErr:  []string{vrfName, "not a vrf"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nsPath, nhNs := newVRFTestNamespace(t)
+			if tt.existing != nil {
+				if err := nhNs.LinkAdd(tt.existing); err != nil {
+					t.Fatalf("failed to add existing link %s: %v", vrfName, err)
+				}
+			}
+
+			got, err := applyVRFConfig(nsPath, ifName, &apis.VRFConfig{Name: vrfName, Table: &table})
+
+			nsLink, lerr := nhNs.LinkByName(ifName)
+			if lerr != nil {
+				t.Fatalf("failed to get %s: %v", ifName, lerr)
+			}
+			vrfLink, lerr := nhNs.LinkByName(vrfName)
+			if lerr != nil {
+				t.Fatalf("failed to get %s: %v", vrfName, lerr)
+			}
+
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("applyVRFConfig() succeeded with table %d, want error", got)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("applyVRFConfig() error = %q, want it to mention %q", err, want)
+					}
+				}
+				// The existing device must be left alone and the interface
+				// must not be moved into it.
+				if nsLink.Attrs().MasterIndex != 0 {
+					t.Errorf("%s was attached to master index %d, want no master", ifName, nsLink.Attrs().MasterIndex)
+				}
+				if vrfLink.Attrs().Flags&net.FlagUp != 0 {
+					t.Errorf("%s was brought up on error", vrfName)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("applyVRFConfig() unexpected error: %v", err)
+			}
+			if got != table {
+				t.Errorf("applyVRFConfig() = %d, want %d", got, table)
+			}
+			vrf, ok := vrfLink.(*netlink.Vrf)
+			if !ok {
+				t.Fatalf("%s is %s, want vrf", vrfName, vrfLink.Type())
+			}
+			if vrf.Table != uint32(table) {
+				t.Errorf("%s table = %d, want %d", vrfName, vrf.Table, table)
+			}
+			if vrfLink.Attrs().Flags&net.FlagUp == 0 {
+				t.Errorf("%s is not up", vrfName)
+			}
+			if nsLink.Attrs().MasterIndex != vrfLink.Attrs().Index {
+				t.Errorf("%s master index = %d, want %d (%s)", ifName, nsLink.Attrs().MasterIndex, vrfLink.Attrs().Index, vrfName)
+			}
+		})
 	}
 }
