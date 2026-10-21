@@ -273,6 +273,14 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
 	}
 
+	// Configure the moved device (ethtool, vrf, routes, neighbors, rules)
+	if err := configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice); err != nil {
+		if detachErr := nsDetachNetdev(ns, networkData.InterfaceName, ifName); detachErr != nil {
+			return errors.Join(err, fmt.Errorf("failed to return network device %s after a configuration failure: %w", deviceName, detachErr))
+		}
+		return err
+	}
+
 	resourceClaimStatusDevice.WithConditions(
 		metav1apply.Condition().
 			WithType("Ready").
@@ -284,9 +292,7 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 		WithHardwareAddress(networkData.HardwareAddress).
 		WithIPs(networkData.IPs...),
 	) // End of WithNetworkData
-
-	// Configure the moved device (ethtool, vrf, routes, neighbors, rules)
-	return configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice)
+	return nil
 }
 
 // createSubinterfaceInNS creates a subinterface in the pod network namespace,
