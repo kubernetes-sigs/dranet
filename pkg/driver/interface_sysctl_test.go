@@ -85,6 +85,26 @@ func TestHasInterfaceSysctlConfig(t *testing.T) {
 			want:            true,
 		},
 		{
+			name:            "dad transmits only",
+			interfaceConfig: apis.InterfaceConfig{DADTransmits: ptr.To[int32](0)},
+			want:            true,
+		},
+		{
+			name:            "router solicitation delay only",
+			interfaceConfig: apis.InterfaceConfig{RouterSolicitationDelay: ptr.To[int32](0)},
+			want:            true,
+		},
+		{
+			name:            "disable ipv6 false is still requested",
+			interfaceConfig: apis.InterfaceConfig{DisableIPv6: ptr.To(false)},
+			want:            true,
+		},
+		{
+			name:            "addr gen mode only",
+			interfaceConfig: apis.InterfaceConfig{AddrGenMode: ptr.To[int32](3)},
+			want:            true,
+		},
+		{
 			name:            "zero values are still requested",
 			interfaceConfig: apis.InterfaceConfig{ARPIgnore: ptr.To[int32](0), ARPAnnounce: ptr.To[int32](0)},
 			want:            true,
@@ -108,15 +128,52 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 		{
 			name: "all settings",
 			interfaceConfig: apis.InterfaceConfig{
-				ARPIgnore:   ptr.To[int32](1),
-				ARPAnnounce: ptr.To[int32](2),
-				AcceptRA:    ptr.To[int32](0),
+				ARPIgnore:               ptr.To[int32](1),
+				ARPAnnounce:             ptr.To[int32](2),
+				AcceptRA:                ptr.To[int32](0),
+				DADTransmits:            ptr.To[int32](0),
+				RouterSolicitationDelay: ptr.To[int32](0),
 			},
 			want: map[string]int{
-				"net/ipv4/conf/rdma0/arp_ignore":   1,
-				"net/ipv4/conf/rdma0/arp_announce": 2,
-				"net/ipv6/conf/rdma0/accept_ra":    0,
+				"net/ipv4/conf/rdma0/arp_ignore":                1,
+				"net/ipv4/conf/rdma0/arp_announce":              2,
+				"net/ipv6/conf/rdma0/accept_ra":                 0,
+				"net/ipv6/conf/rdma0/dad_transmits":             0,
+				"net/ipv6/conf/rdma0/router_solicitation_delay": 0,
 			},
+		},
+		{
+			name: "the settings SLAAC defaults to",
+			interfaceConfig: apis.InterfaceConfig{
+				AcceptRA:                ptr.To[int32](2),
+				DADTransmits:            ptr.To[int32](0),
+				RouterSolicitationDelay: ptr.To[int32](0),
+			},
+			want: map[string]int{
+				"net/ipv6/conf/rdma0/accept_ra":                 2,
+				"net/ipv6/conf/rdma0/dad_transmits":             0,
+				"net/ipv6/conf/rdma0/router_solicitation_delay": 0,
+			},
+		},
+		{
+			name: "the settings SLAAC defaults to on an IPVLAN child",
+			interfaceConfig: apis.InterfaceConfig{
+				AcceptRA:                ptr.To[int32](2),
+				RouterSolicitationDelay: ptr.To[int32](0),
+				DisableIPv6:             ptr.To(false),
+				AddrGenMode:             ptr.To[int32](3),
+			},
+			want: map[string]int{
+				"net/ipv6/conf/rdma0/accept_ra":                 2,
+				"net/ipv6/conf/rdma0/router_solicitation_delay": 0,
+				"net/ipv6/conf/rdma0/disable_ipv6":              0,
+				"net/ipv6/conf/rdma0/addr_gen_mode":             3,
+			},
+		},
+		{
+			name:            "disable ipv6 true is written as 1",
+			interfaceConfig: apis.InterfaceConfig{DisableIPv6: ptr.To(true)},
+			want:            map[string]int{"net/ipv6/conf/rdma0/disable_ipv6": 1},
 		},
 		{
 			name:            "only accept_ra",
@@ -303,5 +360,71 @@ func testApplyInterfaceSysctlConfigUsesOpenNamespace_Namespaced(t *testing.T) {
 	}
 	if got != 1 {
 		t.Errorf("arp_ignore = %d, want 1", got)
+	}
+}
+
+// orderRecordingSysctl records the order in which settings are written.
+type orderRecordingSysctl struct {
+	*sysctltesting.Fake
+	order []string
+}
+
+func (o *orderRecordingSysctl) SetSysctl(setting string, value int) error {
+	o.order = append(o.order, setting)
+	return o.Fake.SetSysctl(setting, value)
+}
+
+// Enabling IPv6 starts address configuration with whatever the other settings
+// are at that moment, so the address generation mode comes first and
+// disable_ipv6 last.
+func TestApplyInterfaceSysctlsWithSysctlEnablesIPv6Last(t *testing.T) {
+	sysctls := &orderRecordingSysctl{Fake: sysctltesting.NewFake()}
+	interfaceConfig := apis.InterfaceConfig{
+		ARPIgnore:               ptr.To[int32](1),
+		AcceptRA:                ptr.To[int32](2),
+		DADTransmits:            ptr.To[int32](0),
+		RouterSolicitationDelay: ptr.To[int32](0),
+		DisableIPv6:             ptr.To(false),
+		AddrGenMode:             ptr.To[int32](3),
+	}
+	if err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", interfaceConfig); err != nil {
+		t.Fatalf("applyInterfaceSysctlsWithSysctl() error: %v", err)
+	}
+	want := []string{
+		"net/ipv4/conf/rdma0/arp_ignore",
+		"net/ipv6/conf/rdma0/addr_gen_mode",
+		"net/ipv6/conf/rdma0/dad_transmits",
+		"net/ipv6/conf/rdma0/router_solicitation_delay",
+		"net/ipv6/conf/rdma0/accept_ra",
+		"net/ipv6/conf/rdma0/disable_ipv6",
+	}
+	if diff := cmp.Diff(want, sysctls.order); diff != "" {
+		t.Errorf("applyInterfaceSysctlsWithSysctl() order mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestApplyInterfaceSysctlsWithSysctlDisableIPv6WithoutIPv6(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		disable bool
+		wantErr bool
+	}{
+		{name: "disabling is already satisfied", disable: true, wantErr: false},
+		{name: "enabling fails", disable: false, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sysctls := &erroringSetSysctl{
+				Fake:    sysctltesting.NewFake(),
+				setting: "net/ipv6/conf/rdma0/disable_ipv6",
+				err:     fmt.Errorf("open: %w", os.ErrNotExist),
+			}
+			err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", apis.InterfaceConfig{DisableIPv6: ptr.To(tt.disable)})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "IPv6 is not available") {
+				t.Errorf("applyInterfaceSysctlsWithSysctl() error = %v, want it to say IPv6 is not available", err)
+			}
+		})
 	}
 }

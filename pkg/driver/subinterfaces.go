@@ -194,9 +194,10 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis
 		return nil, fmt.Errorf("requested MTU %d for %s subinterface %s exceeds parent interface %s MTU %d", *config.MTU, config.Type, config.Name, hostIfName, parentLink.Attrs().MTU)
 	}
 	// Without an mtu the child inherits the parent MTU. Below the IPv6 minimum
-	// the kernel creates no IPv6 settings, so accept_ra cannot be set.
-	if config.AcceptRA != nil && config.MTU == nil && parentLink.Attrs().MTU < apis.MinIPv6MTU {
-		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but parent interface %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, parentLink.Attrs().MTU)
+	// the kernel creates no IPv6 settings, so none of the per-interface IPv6
+	// settings (see HasIPv6Sysctls) can be set.
+	if config.HasIPv6Sysctls() && config.MTU == nil && parentLink.Attrs().MTU < apis.MinIPv6MTU {
+		return nil, fmt.Errorf("the IPv6 settings (acceptRA, dadTransmits, routerSolicitationDelay, routerSolicitationInterval, disableIPv6, addrGenMode) require an MTU of at least %d, but parent interface %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, parentLink.Attrs().MTU)
 	}
 
 	// Make sure the parent link is up on the host, otherwise subinterfaces cannot transmit traffic.

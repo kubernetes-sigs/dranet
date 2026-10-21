@@ -371,7 +371,7 @@ func testSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T)
 	}
 
 	_, err = nsCreateSubinterface(env.parent, env.nsPath, config)
-	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
+	if err == nil || !strings.Contains(err.Error(), "require an MTU of at least 1280") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want an MTU error", err)
 	}
 	assertOnlyLoopback(t, env)
@@ -479,7 +479,7 @@ func testCreateSubinterfaceInNS_RollsBackOnConfigureFailure_Namespaced(t *testin
 	}
 
 	status := resourceapply.AllocatedDeviceStatus()
-	err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
+	_, err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
 	if err == nil || !strings.Contains(err.Error(), "error configuring device net-dev-0 routes") {
 		t.Fatalf("createSubinterfaceInNS() error = %v, want a routes configuration error", err)
 	}
@@ -513,7 +513,7 @@ func testCreateSubinterfaceInNS_ReportsStatusOnSuccess_Namespaced(t *testing.T) 
 	}
 
 	status := resourceapply.AllocatedDeviceStatus()
-	if err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status); err != nil {
+	if _, err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status); err != nil {
 		t.Fatalf("createSubinterfaceInNS() error = %v", err)
 	}
 
