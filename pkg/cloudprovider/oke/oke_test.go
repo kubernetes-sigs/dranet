@@ -487,12 +487,13 @@ func TestGetDeviceConfig(t *testing.T) {
 			want:         profile,
 		},
 		{
-			name:         "IPv6 fabric gets no profile",
+			name:         "IPv6 fabric keeps the profile",
 			ifName:       "rdma0",
 			pciAddress:   "0000:0c:00.0",
 			hardwareType: unix.ARPHRD_ETHER,
 			metadata:     &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
 			id:           rdma0ID,
+			want:         profile,
 		},
 		{
 			name:         "unnamed RDMA NIC with an OCA address gets the profile",
@@ -838,11 +839,13 @@ func TestGetProfileConfig(t *testing.T) {
 			wantErr: "fabric data is not available yet",
 		},
 		{
-			name:     "IPv6 fabric",
+			// The IPv6 profile needs no OCA data but the claim; TestIPv6ProfileConfig
+			// covers it.
+			name:     "IPv6 fabric needs the claim",
 			config:   profileConfig(apis.InterfaceConfig{}),
 			metadata: &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}, PrimaryVNIC: testVNIC()},
 			ifName:   "rdma0",
-			wantErr:  "IPv6 RDMA fabric",
+			wantErr:  "needs the claim UID",
 		},
 		{
 			name:     "missing primary VNIC",

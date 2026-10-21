@@ -29,9 +29,31 @@ The profile needs these conditions:
 
 The profile rejects `interface.type: Passthrough`, DHCP, unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 
-RDMA NICs on an IPv6 fabric get no profile and move into the pod as before.
+A PCI function that carries several netdevs, one of them with an RDMA name, stays on the host on every fabric, and a claim for it fails. Such a function is, for example, the PF of a multi-planar rail with its plane netdevs, or a PF in switchdev mode with its VF representors. Claim a netdev with a PCI function of its own, such as a VF. The rail VFs of a multi-planar shape, `rdma_vf_rail<N>`, get the profile on an IPv6 fabric only: on an IPv4 fabric a claim for one fails.
+
+On an IPv6 fabric the profile resolves differently, see [IPv6 RDMA fabrics](#ipv6-rdma-fabrics).
 
 The profile needs `--profile-provider=cloud`, the default. With `webhook`, the webhook receives the `oke-rdma` profile and must resolve it itself. With `none` the profile is removed but the IPvlan type stays, so a claim needs its own `addresses` and the RDMA NIC stays on the host. The profile validation does not run under `none`, so a claim that sets `interface.type: Passthrough` explicitly moves the RDMA NIC into the pod, and the OCA routing of that RDMA NIC is not restored on return.
+
+## IPv6 RDMA fabrics
+
+On an IPv6 fabric (`oke.dra.net/rdmaFabricIpv6` is true) the rail routers advertise one `/64` for each RDMA NIC of each host, and the host autoconfigures the RDMA NIC from it. The provider advertises the profile for each Ethernet RDMA NIC with the `rdmaN` name and for each rail VF of a multi-planar shape, `rdma_vf_rail<N>`, the endpoint a pod claims there. A claim gets an IPvlan child of the RDMA NIC with:
+
+- one address in the `/64` of the RDMA NIC. The interface identifier is a hash of the claim UID and the RDMA NIC name: a repeated prepare of the claim gets the same address, and the next claim on the RDMA NIC a new one, so it does not clash with a child of the previous claim that is still being torn down;
+- `acceptRA: 0`: the child ignores the router's advertisements, so the pod autoconfigures nothing next to that address. A claim that sets another `acceptRA` fails;
+- a route table with a link route for the `/64` and the default route through the router of the RDMA NIC's IPv6 default route, and a source rule from the child address to that table. The table is 100 plus the index for `rdmaN` and 116 plus the index for `rdma_vf_rail<N>`.
+
+On an IPv6 fabric a claim with its own `routes` or `rules` owns the routing, but `interface.vrf` fails the claim: joining a VRF cycles the child, which then loses its static IPv6 address until the driver keeps it ([#390](https://github.com/kubernetes-sigs/dranet/pull/390)), and the per-rail tables already keep the rails apart.
+
+The provider reads the `/64` and the router from the host, where the RDMA NIC's default route may sit in the table of a VRF. An address that is deprecated, tentative, or failed duplicate address detection does not count, so the old prefix of a renumbered fabric is ignored while it expires. Until the host has a usable address and a default route, prepare fails and Kubernetes retries it. An RDMA NIC with usable addresses in more than one `/64` fails the claim. With several default routes the lowest metric wins, then the lowest router address; the router preference of the advertisement is not read. A default route through a nexthop object, as routing daemons such as FRR install, is not read; when the host has only such routes, prepare fails with an error that says so. Kernel RA routes do not use nexthop objects.
+
+The provider reads the `/64` and the router once, when it prepares the claim. The child ignores advertisements, so it keeps them when the fabric renumbers the prefix or the rail router changes, while the host follows the new advertisements. Recreate the pod after such a change.
+
+On a multi-planar shape the PF of each rail shares its PCI function with the plane netdevs, `rdma_p<P>_rail<N>`, and an `rdmaN` netdev that can be the PF or the rail VF's representor. A claim for such a PCI function fails, as on every fabric: those netdevs stay on the host. Claim the rail VF.
+
+Every RDMA NIC's default route is `::/0`, which is why each one gets its own table: RoCE resolves a GID's peers with the GID's address as the source, which the rule sends to the table of its own RDMA NIC. Other traffic must use the child address as its source, as on an IPv4 fabric; a socket bound only to the interface finds no route. For NCCL set `NCCL_IB_ADDR_FAMILY=AF_INET6` and leave `NCCL_IB_GID_INDEX` unset: NCCL then selects the child's RoCE v2 GID. The address goes through duplicate address detection when the pod starts, so an application that binds to it within about a second can get `EADDRNOTAVAIL`.
+
+The pod network namespace must have IPv6 enabled. A CNI that disables IPv6 there, as the OCI VCN-Native CNI does on an IPv4-only cluster, makes the address fail. The child range and the OCA files do not apply on an IPv6 fabric.
 
 ## The child range
 

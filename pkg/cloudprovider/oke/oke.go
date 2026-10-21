@@ -408,20 +408,26 @@ func ocidSuffix(s string) (string, error) {
 }
 
 // GetDeviceConfig advertises the OKE profile with the IPvlan type for an
-// Ethernet RDMA NIC, so the RDMA NIC never moves into a pod. An RDMA NIC on an IPv6
-// fabric gets no profile and moves into the pod as before, because the
-// profile has no IPv6 support yet. A native InfiniBand NIC gets the profile
-// only when a claim would take it from the host, so GetProfileConfig fails
-// that claim.
+// Ethernet RDMA NIC, so the RDMA NIC never moves into a pod. That includes the
+// rail VFs of a multi-planar shape, rdma_vf_rail<N>, whatever the fabric
+// metadata says so far. A native InfiniBand NIC, and a PCI function with
+// several netdevs of which one has an RDMA name, get the profile without a
+// type, so GetProfileConfig fails a claim for them instead of moving them into
+// the pod. Neither check waits for the metadata: this runs when the inventory
+// is scanned, possibly before IMDS answers.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
+	guard := &apis.NetworkConfig{Profile: okeRDMAProfile}
 	if infiniBandHostError(id) != nil {
-		return &apis.NetworkConfig{Profile: okeRDMAProfile}
+		return guard
+	}
+	if sharedRDMAFunction(id.PCIAddress) {
+		return guard
 	}
 	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
-	if err != nil || !o.isRDMANic(ifName) {
+	if err != nil {
 		return nil
 	}
-	if metadata := o.metadata.Load(); metadata != nil && metadata.RDMAFabric != nil && metadata.RDMAFabric.IPv6 {
+	if !o.isRDMANic(ifName) && !isEthernetRailVF(ifName) {
 		return nil
 	}
 	return &apis.NetworkConfig{
@@ -430,10 +436,28 @@ func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.
 	}
 }
 
+// ethernetParent returns the netdev of the PCI function at pciAddress, which
+// the OKE profile on either fabric needs to be Ethernet.
+func ethernetParent(pciAddress string) (string, error) {
+	ifName, err := interfaceNameForPCIAddress(pciAddress)
+	if err != nil {
+		return "", err
+	}
+	hardwareType, err := interfaceHardwareType(ifName)
+	if err != nil {
+		return "", err
+	}
+	if hardwareType != unix.ARPHRD_ETHER {
+		return "", fmt.Errorf("the OKE profile requires an Ethernet parent, but %s has ARPHRD type %d", ifName, hardwareType)
+	}
+	return ifName, nil
+}
+
 // GetProfileConfig resolves the OKE profile into an IPvlan child with the
 // deterministic address and its source routing. It returns an error, which
-// Kubernetes retries, until the metadata and the OCA parent address exist.
-func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+// Kubernetes retries, until the metadata and the OCA parent address exist, or
+// on an IPv6 fabric the parent's autoconfigured address and default route.
+func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	if config == nil {
 		return nil, errors.New("OKE profile configuration is required")
 	}
@@ -444,6 +468,11 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 	if err := infiniBandHostError(id); err != nil {
 		return nil, err
 	}
+	// On every fabric: such a function is, for example, the PF of a rail with
+	// its plane netdevs, or a PF in switchdev mode with its VF representors.
+	if sharedRDMAFunction(id.PCIAddress) {
+		return nil, fmt.Errorf("PCI device %s carries several netdevs, one of them an RDMA netdev, and the OKE profile keeps it on the host; claim a netdev with a PCI function of its own, such as a VF", id.PCIAddress)
+	}
 	if err := validateOKEProfileRequest(&config.Interface); err != nil {
 		return nil, err
 	}
@@ -453,7 +482,11 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 	case metadata == nil || metadata.RDMAFabric == nil:
 		return nil, errors.New("OKE RDMA fabric data is not available yet")
 	case metadata.RDMAFabric.IPv6:
-		return nil, errors.New("the OKE profile does not support an IPv6 RDMA fabric yet")
+		ifName, err := ethernetParent(id.PCIAddress)
+		if err != nil {
+			return nil, err
+		}
+		return o.ipv6ProfileConfig(ifName, claim, config)
 	case metadata.PrimaryVNIC == nil:
 		return nil, errors.New("OKE primary VNIC metadata is not available yet")
 	}
@@ -462,16 +495,15 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 		return nil, fmt.Errorf("the OKE profile does not support OCA IPv4 address mode %q", mode)
 	}
 
-	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	ifName, err := ethernetParent(id.PCIAddress)
 	if err != nil {
 		return nil, err
 	}
-	hardwareType, err := interfaceHardwareType(ifName)
-	if err != nil {
-		return nil, err
-	}
-	if hardwareType != unix.ARPHRD_ETHER {
-		return nil, fmt.Errorf("the OKE profile requires an Ethernet parent, but %s has ARPHRD type %d", ifName, hardwareType)
+	// GetDeviceConfig gives rail VFs the profile before the fabric is known.
+	// They exist on IPv6 fabrics only, and the OCA IPv4 layout has no index
+	// for them.
+	if _, ok := railVFIndex(ifName); ok {
+		return nil, fmt.Errorf("%s is the VF of a multi-planar rail, which the OKE profile supports on an IPv6 RDMA fabric only, and this fabric is IPv4", ifName)
 	}
 	// The sysctl reads are cheap and can reject the request before any
 	// address read, which costs a netlink dump.
@@ -1417,6 +1449,22 @@ func interfaceHardwareType(ifName string) (int, error) {
 		return 0, fmt.Errorf("could not parse %s: %w", name, err)
 	}
 	return value, nil
+}
+
+// sharedRDMAFunction reports whether the PCI device carries several netdevs of
+// which one has an RDMA name. On a multi-planar shape that is the PF of a rail:
+// rdma<N> with the plane netdevs rdma_p<P>_rail<N>, which the host needs.
+func sharedRDMAFunction(pciAddress string) bool {
+	if pciAddress == "" {
+		return false
+	}
+	entries, err := os.ReadDir(filepath.Join(sysfsPCIDevices, pciAddress, "net"))
+	if err != nil || len(entries) < 2 {
+		return false
+	}
+	return slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+		return strings.HasPrefix(entry.Name(), rdmaNicPrefix)
+	})
 }
 
 func interfaceNameForPCIAddress(pciAddress string) (string, error) {

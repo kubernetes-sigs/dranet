@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	resourceapply "k8s.io/client-go/applyconfigurations/resource/v1"
@@ -294,6 +296,109 @@ func testSubinterface_IPVlan_Namespaced(t *testing.T) {
 		t.Fatalf("fail to delete subinterface: %v", err)
 	}
 	assertOnlyLoopback(t, env)
+}
+
+// The OKE profile on an IPv6 RDMA fabric merges into a claim that sets only the
+// interface type. The kernel must accept the merged config: the child's address,
+// the link route and the default route through a link-local router in the
+// rail's own table, and the rule from the child's address. Only a lookup from
+// the child's address finds the rail's router.
+func TestSubinterface_IPVlanIPv6SourceRouting(t *testing.T) {
+	userns.Run(t, testSubinterface_IPVlanIPv6SourceRouting_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testSubinterface_IPVlanIPv6SourceRouting_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, 1500)
+
+	const (
+		table  = 119
+		prefix = "fdcd:1:2:3::/64"
+		child  = "fdcd:1:2:3:aaaa:bbbb:cccc:dddd"
+		router = "fe80::b061:4eff:fe05:60c1"
+	)
+	// The shape the OKE profile returns for rdma_vf_rail3.
+	profile := &apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{
+			Type:      apis.InterfaceTypeIPVLAN,
+			Addresses: []string{child + "/64"},
+			AcceptRA:  ptr.To[int32](0),
+		},
+		Routes: []apis.RouteConfig{
+			{Destination: prefix, Scope: unix.RT_SCOPE_LINK, Table: table},
+			{Destination: "::/0", Gateway: router, Table: table},
+		},
+		Rules: []apis.RuleConfig{{Priority: apis.SourceRoutingRulePriority, Source: child + "/128", Table: table}},
+	}
+	user := &apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "dranet0", Type: apis.InterfaceTypeIPVLAN}}
+	merged := apis.MergeNetworkConfig(user, profile)
+	if errs := merged.Validate(); len(errs) > 0 {
+		t.Fatalf("merged config is invalid: %v", errs)
+	}
+
+	if _, err := nsCreateSubinterface(env.parent, env.nsPath, merged.Interface); err != nil {
+		t.Fatalf("fail to create subinterface: %v", err)
+	}
+	if err := applyRoutingConfig(env.nsPath, merged.Interface.Name, merged.Routes, 0); err != nil {
+		t.Fatalf("applyRoutingConfig failed: %v", err)
+	}
+	if err := applyRulesConfig(env.nsPath, merged.Rules); err != nil {
+		t.Fatalf("applyRulesConfig failed: %v", err)
+	}
+
+	nhNs, err := nlwrap.NewHandleAt(env.testNS)
+	if err != nil {
+		t.Fatalf("fail to open netlink handle: %v", err)
+	}
+	defer nhNs.Close()
+	link, err := nhNs.LinkByName(merged.Interface.Name)
+	if err != nil {
+		t.Fatalf("failed to find %s in the test namespace: %v", merged.Interface.Name, err)
+	}
+	index := link.Attrs().Index
+
+	routes, err := nhNs.RouteListFiltered(netlink.FAMILY_V6, &netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		t.Fatalf("failed to list the routes of table %d: %v", table, err)
+	}
+	var got []string
+	for _, r := range routes {
+		if r.LinkIndex != index {
+			continue
+		}
+		got = append(got, fmt.Sprintf("%s via %s", r.Dst, r.Gw))
+	}
+	slices.Sort(got)
+	want := []string{"::/0 via " + router, prefix + " via <nil>"}
+	if !slices.Equal(got, want) {
+		t.Errorf("table %d routes through %s = %v, want %v", table, merged.Interface.Name, got, want)
+	}
+
+	rules, err := nhNs.RuleList(netlink.FAMILY_V6)
+	if err != nil {
+		t.Fatalf("failed to list rules: %v", err)
+	}
+	found := false
+	for _, r := range rules {
+		if r.Priority == apis.SourceRoutingRulePriority && r.Table == table && r.Src != nil && r.Src.String() == child+"/128" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no rule from %s/128 to table %d at priority %d in %+v", child, table, apis.SourceRoutingRulePriority, rules)
+	}
+
+	remote := net.ParseIP("2001:db8::9")
+	lookup, err := nhNs.RouteGetWithOptions(remote, &netlink.RouteGetOptions{SrcAddr: net.ParseIP(child)})
+	if err != nil {
+		t.Fatalf("route lookup from %s to %s failed: %v", child, remote, err)
+	}
+	if len(lookup) != 1 || lookup[0].LinkIndex != index || lookup[0].Gw.String() != router {
+		t.Errorf("route from %s to %s = %+v, want via %s dev %s", child, remote, lookup, router, merged.Interface.Name)
+	}
+	// Without the child's address as the source, the main table has no route.
+	if _, err := nhNs.RouteGet(remote); !errors.Is(err, syscall.ENETUNREACH) {
+		t.Errorf("route lookup to %s without a source: error = %v, want ENETUNREACH", remote, err)
+	}
 }
 
 func TestSubinterface_IPVlanMTU(t *testing.T) {
