@@ -506,7 +506,25 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 	}
 
+	// Set passthrough interfaces down during NodePrepareResources after their
+	// addresses, routes, and neighbors have been captured so hardware queue
+	// teardown happens before the latency-sensitive RunPodSandbox NRI hook.
+	linkDowned := false
+	if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() &&
+		(deviceCfg.NetworkInterfaceConfigInPod.Interface.AcceptRA == nil ||
+			deviceCfg.NetworkInterfaceConfigInPod.Interface.MTU != nil ||
+			link.Attrs().MTU >= apis.MinIPv6MTU) &&
+		link.Attrs().Flags&net.FlagUp != 0 {
+		if err := nlHandle.LinkSetDown(link); err != nil {
+			return fmt.Errorf("failed to set interface %s down: %v", ifName, err)
+		}
+		linkDowned = true
+	}
+
 	if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
+		if linkDowned {
+			_ = nlHandle.LinkSetUp(link)
+		}
 		return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 	}
 	deviceCommitted = true
@@ -565,12 +583,19 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 		}
 		for deviceName, devCfg := range podCfg.DeviceConfigs {
 			if devCfg.Claim.Namespace == claim.Namespace && devCfg.Claim.Name == claim.Name {
+				ifName := devCfg.NetworkInterfaceConfigInHost.Interface.Name
+				if ifName != "" && !devCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
+					if hostDev, err := nlwrap.LinkByName(ifName); err == nil && hostDev.Attrs().Flags&net.FlagUp == 0 {
+						if err := netlink.LinkSetUp(hostDev); err != nil {
+							klog.Infof("failed to set %q up for claim %v device %s: %v", ifName, claim.NamespacedName, deviceName, err)
+						}
+					}
+				}
 				// Give the address back: the client is one-shot, so without
 				// this the server holds it for the whole valid-lifetime even
 				// though nothing uses it any more.
 				if state := devCfg.NetworkInterfaceStateInPod; state != nil && state.DHCPLease != nil {
 					releaseCtx, cancel := context.WithTimeout(context.Background(), dhcpReleaseTimeout)
-					ifName := devCfg.NetworkInterfaceConfigInHost.Interface.Name
 					if err := releaseDHCP(releaseCtx, ifName, state.DHCPLease); err != nil {
 						// Non-fatal: the lease expires on its own, which is the
 						// behaviour without this release. Failing here would

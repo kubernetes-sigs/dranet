@@ -18,14 +18,35 @@ package driver
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"net"
+	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
+	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"sigs.k8s.io/dranet/internal/nlwrap"
+	userns "sigs.k8s.io/dranet/internal/testutils"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
 )
@@ -783,6 +804,602 @@ func TestCreateContainerSubinterfaceRDMAInjection(t *testing.T) {
 	for i, expectedPath := range expectedPaths {
 		if got := adjust.Linux.Devices[i].Path; got != expectedPath {
 			t.Errorf("expected device %d path to be %q, got %q", i, expectedPath, got)
+		}
+	}
+}
+
+func TestRequestBudget(t *testing.T) {
+	t.Run("no deadline returns parent context", func(t *testing.T) {
+		np := &NetworkDriver{}
+		ctx, cancel := np.requestBudget(context.Background())
+		defer cancel()
+		if _, ok := ctx.Deadline(); ok {
+			t.Fatal("expected no deadline when parent context has no deadline")
+		}
+	})
+
+	t.Run("deadline larger than margin subtracts default margin", func(t *testing.T) {
+		np := &NetworkDriver{}
+		parent, parentCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer parentCancel()
+		parentDeadline, _ := parent.Deadline()
+
+		ctx, cancel := np.requestBudget(parent)
+		defer cancel()
+		got, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected deadline on budget context")
+		}
+		want := parentDeadline.Add(-defaultNRIReplyMargin)
+		if diff := got.Sub(want).Abs(); diff > 5*time.Millisecond {
+			t.Fatalf("budget deadline = %v, want %v (diff %v)", got, want, diff)
+		}
+	})
+
+	t.Run("deadline smaller than or equal to margin is already expired", func(t *testing.T) {
+		np := &NetworkDriver{}
+		parent, parentCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer parentCancel()
+
+		ctx, cancel := np.requestBudget(parent)
+		defer cancel()
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("expected budget context to be immediately expired when remaining <= margin, got %v", ctx.Err())
+		}
+		if parent.Err() != nil {
+			t.Fatalf("parent context should still be active, got %v", parent.Err())
+		}
+	})
+}
+
+func TestRunPodSandboxAlreadyWithinReplyMarginFailsImmediately(t *testing.T) {
+	origAttachNetdev := attachNetdev
+	defer func() {
+		attachNetdev = origAttachNetdev
+	}()
+
+	var calls atomic.Int32
+	attachNetdev = func(h *podNetnsHandle, hostIfName string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, netlink.Link, error) {
+		calls.Add(1)
+		return &resourceapi.NetworkDeviceData{InterfaceName: interfaceConfig.Name}, nil, nil
+	}
+
+	store := mustNewPodConfigStore()
+	podUID := types.UID("pod-no-budget")
+	if err := store.SetDeviceConfig(podUID, "eth0", DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "default", Name: "claim"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		},
+	}); err != nil {
+		t.Fatalf("SetDeviceConfig: %v", err)
+	}
+
+	recorder := record.NewFakeRecorder(10)
+	np := &NetworkDriver{
+		podConfigStore: store,
+		netdb:          inventory.New(),
+		eventRecorder:  recorder,
+		nriReplyMargin: 200 * time.Millisecond,
+	}
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "pod-no-budget",
+		Namespace: "default",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: "/var/run/netns/pod-no-budget"},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := np.RunPodSandbox(ctx, pod)
+	if !errors.Is(err, errNRIBudgetExceeded) {
+		t.Fatalf("RunPodSandbox error = %v, want %v", err, errNRIBudgetExceeded)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("parent NRI context already expired (%v)", ctx.Err())
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("attachNetdev calls = %d, want 0 when already within reply margin", got)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "NetworkDeviceAttachTimeout") || !strings.Contains(ev, "attached 0/1") {
+			t.Fatalf("unexpected event: %s", ev)
+		}
+	default:
+		t.Fatal("expected NetworkDeviceAttachTimeout warning event")
+	}
+}
+
+func TestRunPodSandboxFailsBeforeRuntimeDeadline(t *testing.T) {
+	origAttachNetdev := attachNetdev
+	defer func() {
+		attachNetdev = origAttachNetdev
+	}()
+
+	var calls int
+	attachNetdev = func(h *podNetnsHandle, hostIfName string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, netlink.Link, error) {
+		calls++
+		time.Sleep(60 * time.Millisecond)
+		return &resourceapi.NetworkDeviceData{InterfaceName: interfaceConfig.Name}, nil, nil
+	}
+
+	store := mustNewPodConfigStore()
+	podUID := types.UID("pod-timeout")
+	for _, dev := range []string{"eth0", "eth1", "eth2"} {
+		cfg := DeviceConfig{
+			Claim: types.NamespacedName{Namespace: "default", Name: "claim"},
+			NetworkInterfaceConfigInHost: apis.NetworkConfig{
+				Interface: apis.InterfaceConfig{Name: dev},
+			},
+			NetworkInterfaceConfigInPod: apis.NetworkConfig{
+				Interface: apis.InterfaceConfig{Name: dev},
+			},
+		}
+		if err := store.SetDeviceConfig(podUID, dev, cfg); err != nil {
+			t.Fatalf("SetDeviceConfig(%s): %v", dev, err)
+		}
+	}
+
+	recorder := record.NewFakeRecorder(10)
+	np := &NetworkDriver{
+		podConfigStore: store,
+		netdb:          inventory.New(),
+		eventRecorder:  recorder,
+		nriReplyMargin: 100 * time.Millisecond,
+	}
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "pod-timeout",
+		Namespace: "default",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: "/var/run/netns/pod-timeout"},
+			},
+		},
+	}
+
+	// 250ms runtime deadline minus 100ms reply margin leaves a 150ms budget.
+	// After 2 devices (120ms), only 30ms of budget remains (< 60ms/device), so
+	// RunPodSandbox stops before starting the 3rd device and fails closed well
+	// before the 250ms runtime deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	err := np.RunPodSandbox(ctx, pod)
+	if !errors.Is(err, errNRIBudgetExceeded) {
+		t.Fatalf("RunPodSandbox error = %v, want %v", err, errNRIBudgetExceeded)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("parent NRI context already expired (%v); RunPodSandbox must return before the runtime deadline", ctx.Err())
+	}
+	if calls != 2 {
+		t.Fatalf("attachNetdev calls = %d, want 2 (should stop before starting 3rd device)", calls)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "NetworkDeviceAttachTimeout") {
+			t.Fatalf("unexpected event: %s", ev)
+		}
+	default:
+		t.Fatal("expected NetworkDeviceAttachTimeout warning event")
+	}
+}
+
+func TestRunPodSandboxReplyMargin(t *testing.T) {
+	origAttachNetdev := attachNetdev
+	defer func() {
+		attachNetdev = origAttachNetdev
+	}()
+
+	attachNetdev = func(h *podNetnsHandle, hostIfName string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, netlink.Link, error) {
+		time.Sleep(180 * time.Millisecond)
+		return &resourceapi.NetworkDeviceData{InterfaceName: interfaceConfig.Name}, nil, nil
+	}
+
+	store := mustNewPodConfigStore()
+	podUID := types.UID("pod-custom-margin")
+	if err := store.SetDeviceConfig(podUID, "eth0", DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "default", Name: "claim"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		},
+	}); err != nil {
+		t.Fatalf("SetDeviceConfig: %v", err)
+	}
+
+	np := &NetworkDriver{
+		podConfigStore: store,
+		netdb:          inventory.New(),
+		eventRecorder:  record.NewFakeRecorder(10),
+	}
+	WithNRIReplyMargin(350 * time.Millisecond)(np)
+
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "pod-custom-margin",
+		Namespace: "default",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: "/var/run/netns/pod-custom-margin"},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := np.RunPodSandbox(ctx, pod)
+	elapsed := time.Since(start)
+	if !errors.Is(err, errNRIBudgetExceeded) {
+		t.Fatalf("RunPodSandbox error = %v, want %v", err, errNRIBudgetExceeded)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("parent NRI context already expired (%v)", ctx.Err())
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("RunPodSandbox took %v, expected ~180ms (well before 500ms timeout)", elapsed)
+	}
+}
+
+func TestRunPodSandboxNonTimeoutDeviceError(t *testing.T) {
+	origAttachNetdev := attachNetdev
+	defer func() {
+		attachNetdev = origAttachNetdev
+	}()
+
+	wantErr := errors.New("simulated netlink failure")
+	attachNetdev = func(h *podNetnsHandle, hostIfName string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, netlink.Link, error) {
+		return nil, nil, wantErr
+	}
+
+	store := mustNewPodConfigStore()
+	podUID := types.UID("pod-device-error")
+	if err := store.SetDeviceConfig(podUID, "eth0", DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "default", Name: "claim"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		},
+	}); err != nil {
+		t.Fatalf("SetDeviceConfig: %v", err)
+	}
+
+	recorder := record.NewFakeRecorder(10)
+	np := &NetworkDriver{
+		podConfigStore: store,
+		netdb:          inventory.New(),
+		eventRecorder:  recorder,
+	}
+	pod := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "pod-device-error",
+		Namespace: "default",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: "/var/run/netns/pod-device-error"},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := np.RunPodSandbox(ctx, pod)
+	if err == nil || !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Fatalf("RunPodSandbox error = %v, want error containing %q", err, wantErr)
+	}
+	if errors.Is(err, errNRIBudgetExceeded) {
+		t.Fatalf("RunPodSandbox error should not wrap errNRIBudgetExceeded on non-timeout error: %v", err)
+	}
+}
+
+func TestRunPodSandboxIntegrationRealNetns(t *testing.T) {
+	userns.Run(t, testRunPodSandboxIntegrationRealNetns, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func newTestNamedNetns(t *testing.T) (string, string, func()) {
+	t.Helper()
+	origns, err := netns.Get()
+	if err != nil {
+		t.Fatalf("netns.Get: %v", err)
+	}
+	defer origns.Close()
+
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	nsName := fmt.Sprintf("ns%x", rnd)
+	nsPath := path.Join("/run/netns", nsName)
+	nsHandle, err := netns.NewNamed(nsName)
+	if err != nil {
+		t.Fatalf("netns.NewNamed(%s): %v", nsName, err)
+	}
+	if err := netns.Set(origns); err != nil {
+		t.Fatalf("netns.Set(origns): %v", err)
+	}
+	var cleaned atomic.Bool
+	cleanup := func() {
+		if cleaned.CompareAndSwap(false, true) {
+			_ = netns.DeleteNamed(nsName)
+			_ = nsHandle.Close()
+		}
+	}
+	t.Cleanup(cleanup)
+	return nsName, nsPath, cleanup
+}
+
+func testRunPodSandboxIntegrationRealNetns(t *testing.T) {
+	ifNames := []string{"dranet0", "dranet1", "dranet2"}
+	ips := []string{"192.0.2.11/24", "192.0.2.12/24", "192.0.2.13/24"}
+	for i, ifName := range ifNames {
+		la := netlink.NewLinkAttrs()
+		la.Name = ifName
+		dummy := &netlink.Dummy{LinkAttrs: la}
+		if err := netlink.LinkAdd(dummy); err != nil {
+			t.Fatalf("LinkAdd(%s): %v", ifName, err)
+		}
+		t.Cleanup(func() {
+			if l, err := nlwrap.LinkByName(ifName); err == nil {
+				_ = netlink.LinkDel(l)
+			}
+		})
+		link, err := nlwrap.LinkByName(ifName)
+		if err != nil {
+			t.Fatalf("LinkByName(%s): %v", ifName, err)
+		}
+		addr, err := netlink.ParseAddr(ips[i])
+		if err != nil {
+			t.Fatalf("ParseAddr(%s): %v", ips[i], err)
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			t.Fatalf("AddrAdd(%s): %v", ifName, err)
+		}
+		if err := netlink.LinkSetUp(link); err != nil {
+			t.Fatalf("LinkSetUp(%s): %v", ifName, err)
+		}
+	}
+
+	podUID := types.UID("pod-real-netns-uid")
+	claimUID := types.UID("claim-real-netns-uid")
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "claim-real",
+			Namespace: "default",
+			UID:       claimUID,
+		},
+		Status: resourceapi.ResourceClaimStatus{
+			ReservedFor: []resourceapi.ResourceClaimConsumerReference{
+				{Resource: "pods", Name: "pod-real", UID: podUID},
+			},
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Request: "req0", Driver: "dra.net", Pool: "node-1", Device: "dranet0"},
+						{Request: "req1", Driver: "dra.net", Pool: "node-1", Device: "dranet1"},
+						{Request: "req2", Driver: "dra.net", Pool: "node-1", Device: "dranet2"},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewSimpleClientset(claim)
+	eventCreated := make(chan *v1.Event, 10)
+	fakeClient.PrependReactor("create", "events", func(action ktesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(ktesting.CreateAction)
+		if ok {
+			if ev, ok := createAction.GetObject().(*v1.Event); ok {
+				eventCreated <- ev
+			}
+		}
+		return false, nil, nil
+	})
+	statusPatched := make(chan ktesting.PatchAction, 10)
+	fakeClient.PrependReactor("patch", "resourceclaims", func(action ktesting.Action) (bool, runtime.Object, error) {
+		if patchAction, ok := action.(ktesting.PatchAction); ok && patchAction.GetSubresource() == "status" {
+			statusPatched <- patchAction
+		}
+		return false, nil, nil
+	})
+
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: fakeClient.CoreV1().Events("")})
+	t.Cleanup(eventBroadcaster.Shutdown)
+	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "dra.net", Host: "node-1"})
+
+	netdb := newFakeInventoryDB()
+	netdb.GetNetInterfaceNameFunc = func(deviceName string) (string, error) {
+		return deviceName, nil
+	}
+	netdb.GetDeviceFunc = func(deviceName string) (resourceapi.Device, bool) {
+		return resourceapi.Device{Name: deviceName}, true
+	}
+
+	np := &NetworkDriver{
+		driverName:     "dra.net",
+		nodeName:       "node-1",
+		kubeClient:     fakeClient,
+		podConfigStore: mustNewPodConfigStore(),
+		netdb:          netdb,
+		eventRecorder:  eventRecorder,
+		rdmaSharedMode: true,
+		nriReplyMargin: 100 * time.Millisecond,
+	}
+
+	// 1. PrepareResourceClaims captures addresses/routes and sets host links DOWN.
+	prepRes, err := np.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	if err != nil {
+		t.Fatalf("PrepareResourceClaims error: %v", err)
+	}
+	if res := prepRes[claimUID]; res.Err != nil {
+		t.Fatalf("PrepareResourceClaims claim error: %v", res.Err)
+	}
+	for _, ifName := range ifNames {
+		link, err := nlwrap.LinkByName(ifName)
+		if err != nil {
+			t.Fatalf("LinkByName(%s) after PrepareResourceClaims: %v", ifName, err)
+		}
+		if link.Attrs().Flags&net.FlagUp != 0 {
+			t.Fatalf("expected %s to be DOWN after PrepareResourceClaims", ifName)
+		}
+	}
+
+	// 2. Attempt #1: RunPodSandbox with 60ms per device and 250ms deadline (150ms budget).
+	// Attaches 2 of 3 devices and fails before starting the 3rd device.
+	_, nsPath1, cleanupNs1 := newTestNamedNetns(t)
+	podAttempt1 := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "pod-real",
+		Namespace: "default",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: nsPath1},
+			},
+		},
+	}
+
+	origAttachNetdev := attachNetdev
+	attachNetdev = func(h *podNetnsHandle, hostIfName string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, netlink.Link, error) {
+		time.Sleep(60 * time.Millisecond)
+		return origAttachNetdev(h, hostIfName, interfaceConfig)
+	}
+
+	attempt1Ctx, attempt1Cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	err = np.RunPodSandbox(attempt1Ctx, podAttempt1)
+	attachNetdev = origAttachNetdev
+	if attempt1Ctx.Err() != nil {
+		attempt1Cancel()
+		t.Fatalf("attempt #1 parent NRI context already expired (%v)", attempt1Ctx.Err())
+	}
+	// Simulate the NRI RPC completing and canceling its request context immediately.
+	attempt1Cancel()
+	if !errors.Is(err, errNRIBudgetExceeded) {
+		t.Fatalf("attempt #1 RunPodSandbox error = %v, want %v", err, errNRIBudgetExceeded)
+	}
+
+	// Verify the Warning event is still published to the API server via EventBroadcaster
+	// even though attempt1Ctx was canceled immediately upon RunPodSandbox returning.
+	select {
+	case ev := <-eventCreated:
+		if ev.Reason != "NetworkDeviceAttachTimeout" {
+			t.Fatalf("event Reason = %q, want NetworkDeviceAttachTimeout", ev.Reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for NetworkDeviceAttachTimeout event to be published to fakeClient")
+	}
+
+	// Simulate the container runtime tearing down the failed sandbox (StopPodSandbox + deleting the netns).
+	if err := np.StopPodSandbox(context.Background(), podAttempt1); err != nil {
+		t.Fatalf("StopPodSandbox after failed attempt #1 error: %v", err)
+	}
+	cleanupNs1()
+
+	for _, ifName := range ifNames {
+		if _, err := nlwrap.LinkByName(ifName); err != nil {
+			t.Fatalf("device %s was not returned to host netns after tearing down failed sandbox #1: %v", ifName, err)
+		}
+	}
+
+	// 3. Attempt #2 (Kubelet retry): new sandbox netns, enough budget for all 3 devices.
+	_, nsPath2, cleanupNs2 := newTestNamedNetns(t)
+	defer cleanupNs2()
+	podAttempt2 := &api.PodSandbox{
+		Uid:       string(podUID),
+		Name:      "pod-real",
+		Namespace: "default",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{
+				{Type: "network", Path: nsPath2},
+			},
+		},
+	}
+
+	attempt2Ctx, attempt2Cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err = np.RunPodSandbox(attempt2Ctx, podAttempt2)
+	// Cancel the NRI request context immediately after RunPodSandbox returns to prove
+	// the asynchronous ResourceClaim ApplyStatus call is not cut off by context termination.
+	attempt2Cancel()
+	if err != nil {
+		t.Fatalf("attempt #2 RunPodSandbox error = %v", err)
+	}
+
+	select {
+	case patchAction := <-statusPatched:
+		patchBytes := string(patchAction.GetPatch())
+		for _, ifName := range ifNames {
+			if !strings.Contains(patchBytes, ifName) {
+				t.Fatalf("ResourceClaim status patch missing device %s: %s", ifName, patchBytes)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async ResourceClaim ApplyStatus after attempt2Ctx cancellation")
+	}
+
+	// Verify all 3 interfaces are inside pod netns #2, UP, with their IP addresses.
+	podNs2, err := netns.GetFromPath(nsPath2)
+	if err != nil {
+		t.Fatalf("netns.GetFromPath(%s): %v", nsPath2, err)
+	}
+	defer podNs2.Close()
+	nhPod2, err := nlwrap.NewHandleAt(podNs2)
+	if err != nil {
+		t.Fatalf("nlwrap.NewHandleAt(podNs2): %v", err)
+	}
+	defer nhPod2.Close()
+
+	for i, ifName := range ifNames {
+		link, err := nhPod2.LinkByName(ifName)
+		if err != nil {
+			t.Fatalf("device %s not found in pod netns #2: %v", ifName, err)
+		}
+		if link.Attrs().Flags&net.FlagUp == 0 {
+			t.Fatalf("device %s in pod netns #2 is not UP", ifName)
+		}
+		addrs, err := nhPod2.AddrList(link, netlink.FAMILY_V4)
+		if err != nil || len(addrs) != 1 || addrs[0].IPNet.String() != ips[i] {
+			t.Fatalf("device %s in pod netns #2 addresses = %v (err %v), want %s", ifName, addrs, err, ips[i])
+		}
+	}
+
+	// 4. StopPodSandbox + UnprepareResourceClaims returns all devices to host netns and sets them UP.
+	if err := np.StopPodSandbox(context.Background(), podAttempt2); err != nil {
+		t.Fatalf("StopPodSandbox error: %v", err)
+	}
+	unprepRes, err := np.UnprepareResourceClaims(context.Background(), []kubeletplugin.NamespacedObject{
+		{NamespacedName: types.NamespacedName{Namespace: "default", Name: "claim-real"}, UID: claimUID},
+	})
+	if err != nil {
+		t.Fatalf("UnprepareResourceClaims error: %v", err)
+	}
+	if unprepErr := unprepRes[claimUID]; unprepErr != nil {
+		t.Fatalf("UnprepareResourceClaims claim error: %v", unprepErr)
+	}
+
+	for _, ifName := range ifNames {
+		link, err := nlwrap.LinkByName(ifName)
+		if err != nil {
+			t.Fatalf("device %s not found in host netns after StopPodSandbox: %v", ifName, err)
+		}
+		if link.Attrs().Flags&net.FlagUp == 0 {
+			t.Fatalf("device %s in host netns is not UP after teardown", ifName)
 		}
 	}
 }

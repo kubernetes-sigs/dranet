@@ -95,6 +95,15 @@ func WithKubeletRootDir(dir string) Option {
 	}
 }
 
+// WithNRIReplyMargin sets the time reserved at the end of every NRI request
+// for the reply to reach the container runtime before its plugin request
+// timeout fires. Defaults to 200ms.
+func WithNRIReplyMargin(d time.Duration) Option {
+	return func(o *NetworkDriver) {
+		o.nriReplyMargin = d
+	}
+}
+
 type NetworkDriver struct {
 	draPlugin     pluginHelper
 	driverName    string
@@ -110,6 +119,8 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+
+	nriReplyMargin time.Duration
 
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.

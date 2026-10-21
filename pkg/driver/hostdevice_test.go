@@ -443,3 +443,68 @@ func test_nsDetachNetdevFromNSUsesOpenNamespace_Namespaced(t *testing.T) {
 		t.Error("network device was not brought up after detach")
 	}
 }
+
+func Test_nsAttachNetdevWithHandleReusesPodNetlinkHandle(t *testing.T) {
+	userns.Run(t, testNsAttachNetdevWithHandleReusesPodNetlinkHandle, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testNsAttachNetdevWithHandleReusesPodNetlinkHandle(t *testing.T) {
+	originalNs, err := netns.Get()
+	if err != nil {
+		t.Fatalf("failed to get current network namespace: %v", err)
+	}
+	defer originalNs.Close()
+
+	nsName := "ns-shared-h"
+	targetNs, err := netns.NewNamed(nsName)
+	if err != nil {
+		t.Fatalf("failed to create network namespace: %v", err)
+	}
+	defer targetNs.Close()
+	defer func() { _ = netns.DeleteNamed(nsName) }()
+
+	if err := netns.Set(originalNs); err != nil {
+		t.Fatalf("failed to restore original network namespace: %v", err)
+	}
+
+	for i := range 2 {
+		hostName := fmt.Sprintf("hd-sh-%d", i)
+		link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: hostName}}
+		if err := netlink.LinkAdd(link); err != nil {
+			t.Fatalf("failed to add dummy link %s: %v", hostName, err)
+		}
+		// Leave link DOWN to exercise the pre-downed fast path in nsAttachNetdevWithHandle.
+	}
+
+	containerNsPath := path.Join("/run/netns", nsName)
+	h := newPodNetnsHandle(containerNsPath)
+	defer h.Close()
+
+	for i := range 2 {
+		hostName := fmt.Sprintf("hd-sh-%d", i)
+		podName := fmt.Sprintf("pod-sh-%d", i)
+		data, nsLink, err := nsAttachNetdevWithHandle(h, hostName, apis.InterfaceConfig{
+			Name:      podName,
+			Addresses: []string{fmt.Sprintf("10.88.%d.1/24", i)},
+		})
+		if err != nil {
+			t.Fatalf("nsAttachNetdevWithHandle(%s) failed: %v", hostName, err)
+		}
+		if data.InterfaceName != podName {
+			t.Fatalf("InterfaceName = %q, want %q", data.InterfaceName, podName)
+		}
+		if nsLink == nil || nsLink.Attrs().Name != podName {
+			t.Fatalf("returned nsLink = %v, want link named %q", nsLink, podName)
+		}
+		liveLink, err := h.podHandle.LinkByName(podName)
+		if err != nil {
+			t.Fatalf("podHandle.LinkByName(%s) failed: %v", podName, err)
+		}
+		if liveLink.Attrs().Index != nsLink.Attrs().Index {
+			t.Fatalf("nsLink index = %d, want %d", nsLink.Attrs().Index, liveLink.Attrs().Index)
+		}
+		if liveLink.Attrs().Flags&net.FlagUp == 0 {
+			t.Fatalf("expected %s to be UP in pod netns", podName)
+		}
+	}
+}
