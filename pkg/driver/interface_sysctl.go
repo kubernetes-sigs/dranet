@@ -19,8 +19,10 @@ package driver
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 
 	"github.com/vishvananda/netns"
 	"k8s.io/component-helpers/node/util/sysctl"
@@ -34,7 +36,19 @@ var sysctlProvider = sysctl.New
 
 // hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
-	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil
+	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil ||
+		keepsIPv6AddressesInVRF(interfaceConfig)
+}
+
+// keepsIPv6AddressesInVRF reports whether the interface joins a VRF with IPv6
+// addresses. Joining the VRF cycles the interface, after its addresses are
+// added, and the kernel then removes its IPv6 addresses unless it keeps them on
+// down.
+func keepsIPv6AddressesInVRF(interfaceConfig apis.InterfaceConfig) bool {
+	return interfaceConfig.VRF != nil && slices.ContainsFunc(interfaceConfig.Addresses, func(address string) bool {
+		prefix, err := netip.ParsePrefix(address)
+		return err == nil && prefix.Addr().Is6()
+	})
 }
 
 func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
@@ -66,6 +80,9 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 		default:
 			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", name, err))
 		}
+	}
+	if keepsIPv6AddressesInVRF(interfaceConfig) {
+		set("ipv6", "keep_addr_on_down", 1)
 	}
 	return errors.Join(errorList...)
 }

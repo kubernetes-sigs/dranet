@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"path"
 	"runtime"
+	"slices"
 	"syscall"
 	"testing"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/dranet/internal/nlwrap"
 	userns "sigs.k8s.io/dranet/internal/testutils"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -139,5 +141,76 @@ func test_applyRoutingConfig_Namespaced(t *testing.T) {
 		if !found {
 			t.Errorf("route %s not found in namespace", want.Destination)
 		}
+	}
+}
+
+// Joining a VRF cycles the interface after its addresses are added. Its IPv6
+// addresses are kept, and their routes move into the table of the VRF.
+func Test_applyVRFConfigKeepsIPv6Addresses(t *testing.T) {
+	userns.Run(t, test_applyVRFConfigKeepsIPv6Addresses, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func test_applyVRFConfigKeepsIPv6Addresses(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	origns, err := netns.Get()
+	if err != nil {
+		t.Fatalf("unexpected error trying to get namespace: %v", err)
+	}
+	defer origns.Close()
+	rndString := make([]byte, 4)
+	if _, err := rand.Read(rndString); err != nil {
+		t.Fatalf("fail to generate random name: %v", err)
+	}
+	nsName := fmt.Sprintf("ns%x", rndString)
+	containerNsPath := path.Join("/run/netns", nsName)
+	testNS, err := netns.NewNamed(nsName)
+	if err != nil {
+		t.Fatalf("Failed to create network namespace: %v", err)
+	}
+	defer netns.DeleteNamed(nsName)
+	defer testNS.Close()
+	if err := netns.Set(origns); err != nil {
+		t.Fatalf("failed to restore original network namespace: %v", err)
+	}
+
+	ifaceName := "vrfipv6"
+	if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: ifaceName}}); err != nil {
+		t.Fatalf("Failed to add dummy link %s: %v", ifaceName, err)
+	}
+	cfg := apis.InterfaceConfig{
+		Name:      ifaceName,
+		Addresses: []string{"2001:db8:1::5/64"},
+		VRF:       &apis.VRFConfig{Name: "vrf-blue", Table: ptr.To(101)},
+	}
+	if _, err := nsAttachNetdev(ifaceName, containerNsPath, cfg); err != nil {
+		t.Fatalf("nsAttachNetdev() error = %v", err)
+	}
+	if _, err := applyVRFConfig(containerNsPath, ifaceName, cfg.VRF); err != nil {
+		t.Fatalf("applyVRFConfig() error = %v", err)
+	}
+
+	nhNs, err := nlwrap.NewHandleAt(testNS)
+	if err != nil {
+		t.Fatalf("fail to open netlink handle: %v", err)
+	}
+	defer nhNs.Close()
+	link, err := nhNs.LinkByName(ifaceName)
+	if err != nil {
+		t.Fatalf("link %s: %v", ifaceName, err)
+	}
+	addrs, err := nhNs.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		t.Fatalf("list addresses: %v", err)
+	}
+	if !slices.ContainsFunc(addrs, func(a netlink.Addr) bool { return a.IPNet.String() == "2001:db8:1::5/64" }) {
+		t.Errorf("address 2001:db8:1::5/64 removed when %s joined the VRF; addresses: %v", ifaceName, addrs)
+	}
+	routes, err := nhNs.RouteListFiltered(netlink.FAMILY_V6, &netlink.Route{Table: 101}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		t.Fatalf("list routes: %v", err)
+	}
+	if !slices.ContainsFunc(routes, func(r netlink.Route) bool { return r.Dst != nil && r.Dst.String() == "2001:db8:1::/64" }) {
+		t.Errorf("no route for 2001:db8:1::/64 in the VRF table: %v", routes)
 	}
 }
