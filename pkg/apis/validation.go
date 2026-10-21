@@ -188,10 +188,25 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 
 	allErrors = append(allErrors, isValidLinuxInterfaceName(cfg.Name, fieldPath+".name")...)
 
+	// The kernel rejects adding the same address twice with EEXIST: an IPv6
+	// address regardless of its prefix length, an IPv4 address only with the same
+	// prefix length. Track what was seen with the same keys.
+	seenAddresses := map[netip.Prefix]int{}
 	for i, addr := range cfg.Addresses {
-		if _, err := netip.ParsePrefix(addr); err != nil {
+		prefix, err := netip.ParsePrefix(addr)
+		if err != nil {
 			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: invalid IP CIDR format '%s': %w", fieldPath, i, addr, err))
+			continue
 		}
+		key := prefix
+		if prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+			key = netip.PrefixFrom(prefix.Addr(), 128)
+		}
+		if j, ok := seenAddresses[key]; ok {
+			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: '%s' duplicates addresses[%d] '%s'", fieldPath, i, addr, j, cfg.Addresses[j]))
+			continue
+		}
+		seenAddresses[key] = i
 	}
 
 	if (cfg.Addressing == AddressingModeDHCP || (cfg.DHCP != nil && *cfg.DHCP)) && len(cfg.Addresses) > 0 {

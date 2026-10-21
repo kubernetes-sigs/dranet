@@ -458,6 +458,41 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "duplicate IPv4 address",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"10.0.0.1/24", "10.0.0.1/24"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			// The kernel accepts the same IPv4 address with a different prefix length.
+			name:      "same IPv4 address with different prefix lengths",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"10.0.0.1/24", "10.0.0.1/16"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "duplicate IPv6 address in a different notation",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"2001:db8::1/64", "2001:DB8:0::1/64"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			// The kernel rejects the same IPv6 address even with a different prefix length.
+			name:      "same IPv6 address with different prefix lengths",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"2001:db8::1/64", "2001:db8::1/96"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "distinct dual-stack addresses",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"10.0.0.1/24", "10.0.0.2/24", "2001:db8::1/64", "2001:db8::2/64"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "multiple errors",
 			cfg:       &InterfaceConfig{Name: "eth/0", Addresses: []string{"badip"}, MTU: ptr.To[int32](0)},
 			fieldPath: "iface",
