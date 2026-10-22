@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/internal/nlwrap"
@@ -68,6 +69,10 @@ type AlibabaInstance struct {
 }
 
 const alibabaEfloSubinterfaceProfile = "alibaba-eflo-subinterface"
+
+// efloGatewayMAC is the virtual gateway MAC used by the eFLO RDMA fabric.
+// Keep it scoped to this profile; it is not a general cloud gateway default.
+const efloGatewayMAC = "00:00:5e:00:01:01"
 
 // OnAlibaba returns true if running on an Alibaba Cloud ECS instance.
 func OnAlibaba(ctx context.Context) bool {
@@ -145,7 +150,8 @@ func (a *AlibabaInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *a
 	return &apis.NetworkConfig{
 		Profile: alibabaEfloSubinterfaceProfile,
 		Interface: apis.InterfaceConfig{
-			Type: apis.InterfaceTypeIPVLAN,
+			Type:        apis.InterfaceTypeIPVLAN,
+			AddrGenMode: ptr.To[int32](1),
 		},
 	}
 }
@@ -183,7 +189,7 @@ func (a *AlibabaInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, c
 }
 
 // efloSourceRoutingConfig returns the allocated addresses plus PBR for them:
-// the parent's IPv6 routes moved to a per-device table and one source rule
+// the parent's gateway IPv6 routes moved to a per-device table and one source rule
 // per address. If the merged config already defines routes, rules or a VRF,
 // routing is user-owned and nothing is synthesized.
 func efloSourceRoutingConfig(ifName string, config *apis.NetworkConfig, allocated []string, parentRoutes []apis.RouteConfig) *apis.NetworkConfig {
@@ -201,10 +207,19 @@ func efloSourceRoutingConfig(ifName string, config *apis.NetworkConfig, allocate
 	}
 
 	tableID := apis.TableIDForName(ifName)
+	gateways := sets.New[string]()
 	for i := range parentRoutes {
 		route := parentRoutes[i]
 		route.Table = tableID
 		profile.Routes = append(profile.Routes, route)
+		// Without a link-local address, RDMA cannot dynamically resolve even
+		// the gateway on a cold neighbor cache. Install its fabric MAC directly.
+		if route.Gateway != "" && !gateways.Has(route.Gateway) {
+			profile.Neighbors = append(profile.Neighbors, apis.NeighborConfig{
+				Destination: route.Gateway, HardwareAddr: efloGatewayMAC,
+			})
+			gateways.Insert(route.Gateway)
+		}
 	}
 	for _, addrStr := range addrs {
 		prefix, err := netip.ParsePrefix(addrStr)
@@ -365,14 +380,11 @@ func efloRouteConfigs(ifName string, routes []netlink.Route) ([]apis.RouteConfig
 	result := make([]apis.RouteConfig, 0, len(routes)+1)
 	gateways := sets.New[string]()
 	for _, route := range routes {
-		if route.Dst == nil {
-			continue
-		}
 		if route.Gw == nil {
-			result = append(result, apis.RouteConfig{
-				Destination: route.Dst.String(),
-				Scope:       unix.RT_SCOPE_LINK,
-			})
+			// Children have /128 addresses and must reach peers through the
+			// gateway. Copying the parent's connected prefix would send peer
+			// traffic directly and require dynamic NDP, which RDMA cannot
+			// initiate without a usable link-local address on the child.
 			continue
 		}
 		gateway := route.Gw.String()
@@ -387,8 +399,12 @@ func efloRouteConfigs(ifName string, routes []netlink.Route) ([]apis.RouteConfig
 			})
 			gateways.Insert(gateway)
 		}
+		destination := "::/0"
+		if route.Dst != nil {
+			destination = route.Dst.String()
+		}
 		result = append(result, apis.RouteConfig{
-			Destination: route.Dst.String(),
+			Destination: destination,
 			Gateway:     gateway,
 		})
 	}

@@ -114,6 +114,12 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 		return nil, fmt.Errorf("failed to rename interface %s to %s: %w", tempName, ifName, err)
 	}
 
+	if config.AddrGenMode != nil {
+		if err := nhNs.LinkSetIP6AddrGenMode(nsLink, int(*config.AddrGenMode)); err != nil {
+			return nil, fmt.Errorf("failed to set addrgenmode on interface %s: %w", ifName, err)
+		}
+	}
+
 	if err := applyOffloadSizes(nhNs, nsLink, ifName, config); err != nil {
 		return nil, err
 	}
