@@ -236,27 +236,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	}
 
 	requestName := result.Request
-	userConf := &apis.NetworkConfig{}
-	var configErrors []error
-	for _, config := range claim.Status.Allocation.Devices.Config {
-		// Check there is a config associated to this device
-		if config.Opaque == nil ||
-			config.Opaque.Driver != np.driverName ||
-			len(config.Requests) > 0 && !slices.Contains(config.Requests, requestName) {
-			continue
-		}
-		// Check if there is a custom configuration
-		conf, errs := apis.ValidateConfig(&config.Opaque.Parameters)
-		if len(errs) > 0 {
-			configErrors = append(configErrors, errs...)
-			continue
-		}
-		// TODO: define a strategy for multiple configs
-		if conf != nil {
-			userConf = conf
-			break
-		}
-	}
+	userConf, configErrors := np.claimDeviceConfig(claim, requestName)
 	if len(configErrors) > 0 {
 		return errors.Join(configErrors...)
 	}
@@ -755,6 +735,43 @@ func clearStaleRouteSources(routes []apis.RouteConfig, addresses []string) {
 			klog.V(4).Infof("Clearing source %s of route %s: address not assigned in the Pod", routes[i].Source, routes[i].Destination)
 			routes[i].Source = ""
 		}
+	}
+}
+
+// claimDeviceConfig returns the opaque configuration for requestName. The
+// scheduler lists the DeviceClass configs before the claim configs, and both
+// apply: the class carries the defaults and the claim overrides them, with the
+// same rule MergeNetworkConfig applies between user and cloud provider.
+func (np *NetworkDriver) claimDeviceConfig(claim *resourceapi.ResourceClaim, requestName string) (*apis.NetworkConfig, []error) {
+	var classConf, claimConf *apis.NetworkConfig
+	var errorList []error
+	for _, config := range claim.Status.Allocation.Devices.Config {
+		if config.Opaque == nil ||
+			config.Opaque.Driver != np.driverName ||
+			len(config.Requests) > 0 && !slices.Contains(config.Requests, requestName) {
+			continue
+		}
+		conf, errs := apis.ValidateConfig(&config.Opaque.Parameters)
+		if len(errs) > 0 {
+			errorList = append(errorList, errs...)
+			continue
+		}
+		if conf == nil {
+			continue
+		}
+		if config.Source == resourceapi.AllocationConfigSourceClaim {
+			claimConf = apis.MergeNetworkConfig(conf, claimConf)
+		} else {
+			classConf = apis.MergeNetworkConfig(conf, classConf)
+		}
+	}
+	switch {
+	case claimConf != nil:
+		return apis.MergeNetworkConfig(claimConf, classConf), errorList
+	case classConf != nil:
+		return classConf, errorList
+	default:
+		return &apis.NetworkConfig{}, errorList
 	}
 }
 
