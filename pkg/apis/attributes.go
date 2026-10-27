@@ -29,16 +29,20 @@ const (
 	// IB-only devices, which have no netdev.
 	AttrInterfaceName = AttrPrefix + "/" + "ifName"
 	// AttrPCIAddress is the PCI address in BDF notation, e.g. "0000:3f:00.0".
-	// Absent for virtual interfaces (bond, veth, tunnels, ...).
+	// Absent for any interface whose sysfs path contains no PCI component.
 	AttrPCIAddress = AttrPrefix + "/" + "pciAddress"
 	// AttrMac is the interface's MAC address.
 	AttrMac = AttrPrefix + "/" + "mac"
-	// AttrPCIVendor is the PCI vendor name, e.g. "Mellanox Technologies".
+	// AttrPCIVendor is the PCI vendor name reported by ghw, or "unknown" when
+	// the vendor ID is not found in its PCI ID database. Truncated to the DRA
+	// attribute value limit.
 	AttrPCIVendor = AttrPrefix + "/" + "pciVendor"
-	// AttrPCIDevice is the PCI device/product name, e.g. "ConnectX Family
-	// mlx5Gen Virtual Function".
+	// AttrPCIDevice is the PCI device/product name reported by ghw, or "unknown"
+	// when the device ID is not found in its PCI ID database. Truncated to the
+	// DRA attribute value limit.
 	AttrPCIDevice = AttrPrefix + "/" + "pciDevice"
-	// AttrPCISubsystem is the PCI subsystem ID.
+	// AttrPCISubsystem is the 4-hex-digit subsystem device ID such as 0016,
+	// with no subsystem vendor component.
 	AttrPCISubsystem = AttrPrefix + "/" + "pciSubsystem"
 	// AttrNUMANode is the NUMA node of the PCI device. Kept alongside the
 	// standardized resource.kubernetes.io/numaNode for compatibility.
@@ -55,8 +59,10 @@ const (
 	AttrState = AttrPrefix + "/" + "state"
 	// AttrType is the netlink link type, e.g. "device", "bond", "veth".
 	AttrType = AttrPrefix + "/" + "type"
-	// AttrIPv4 is a comma-separated list of global unicast IPv4 addresses,
-	// truncated to the DRA attribute size limit. Absent if none.
+	// AttrIPv4 is a comma-separated, lexicographically sorted list of the
+	// interface's global unicast IPv4 addresses in CIDR notation (e.g.
+	// "10.0.0.5/24"). Trailing entries are dropped so the value stays within
+	// the DRA attribute size limit. Absent if none.
 	AttrIPv4 = AttrPrefix + "/" + "ipv4"
 	// AttrIPv6 is the IPv6 equivalent of AttrIPv4.
 	AttrIPv6 = AttrPrefix + "/" + "ipv6"
@@ -82,10 +88,11 @@ const (
 	// tunnels, ...) not backed by a PCI device. Such interfaces do not
 	// inherit the PCI/NUMA/RDMA attributes of their physical members.
 	AttrVirtual = AttrPrefix + "/" + "virtual"
-	// AttrRDMA is true if the device has RDMA capability, independent of
-	// AttrEncapsulation: a RoCE-capable Ethernet NIC reports true here with
-	// encapsulation "ether". Each SR-IOV VF of an RDMA-capable PF reports
-	// its own RDMA capability too.
+	// AttrRDMA indicates whether an RDMA link is associated with the device's
+	// network interface or PCI address. Detection is per device, so an SR-IOV VF
+	// is true only when its own RDMA link is visible during host discovery.
+	// RoCE-capable Ethernet interfaces use this attribute with encapsulation
+	// "ether".
 	AttrRDMA = AttrPrefix + "/" + "rdma"
 	// AttrRDMADevice is the RDMA link name, e.g. "mlx5_0". Set only when
 	// AttrRDMA is true.
