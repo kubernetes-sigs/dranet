@@ -65,7 +65,7 @@ docker exec dranet-integration-control-plane systemctl restart dranet
 Call `newEnv(t)` to get a namespace that is cleaned up (pods first, then the
 links the test created, then the namespace) and dumped on failure. Use
 client-go and `wait.PollUntilContextTimeout` directly for the Kubernetes
-side; the only shared pieces are node queries (`addDummyLink`, `hostLink`,
+side; the only shared pieces are node queries (`addDummyLink`, `addDummyLinks`, `hostLink`,
 `deviceByIfName`, `tc.nodeExec`) and driver control (`withDranetArgs` to run
 one test with extra flags, `tc.restartDranet` for crash and restart
 scenarios).

@@ -96,9 +96,12 @@ func (e *env) cleanup() {
 	if err != nil {
 		e.t.Logf("pods in %s did not go away: %v", e.ns, err)
 	}
-	for _, link := range e.links {
-		if out, err := tc.nodeExec(ctx, "ip", "link", "del", link); err != nil {
-			e.t.Logf("delete link %s: %s", link, out)
+	// Links that were inside a destroyed pod namespace are already gone, so
+	// a missing link is not an error here.
+	if len(e.links) > 0 {
+		script := "for l in " + strings.Join(e.links, " ") + "; do ip link del $l 2>&1 | grep -v 'Cannot find device'; done; true"
+		if out, err := tc.nodeExec(ctx, "sh", "-c", script); err != nil || strings.TrimSpace(out) != "" {
+			e.t.Logf("delete links: %v %s", err, out)
 		}
 	}
 	if err := tc.client.CoreV1().Namespaces().Delete(ctx, e.ns, metav1.DeleteOptions{}); err != nil {
@@ -154,6 +157,21 @@ func (e *env) addDummyLink(cidr string) string {
 	}
 	e.links = append(e.links, name)
 	return name
+}
+
+// addDummyLinks creates n dummy links without addresses in one node exec and
+// returns their common name prefix.
+func (e *env) addDummyLinks(n int) string {
+	e.t.Helper()
+	prefix := fmt.Sprintf("it%x", rand.Uint32())
+	script := fmt.Sprintf("set -e; for i in $(seq 0 %d); do ip link add %s$i type dummy; ip link set up dev %s$i; done", n-1, prefix, prefix)
+	if out, err := tc.nodeExec(e.ctx, "sh", "-c", script); err != nil {
+		e.t.Fatalf("create %d dummy links: %s", n, out)
+	}
+	for i := 0; i < n; i++ {
+		e.links = append(e.links, fmt.Sprintf("%s%d", prefix, i))
+	}
+	return prefix
 }
 
 // hostLink reports whether the link is in the node's network namespace and
