@@ -1,0 +1,61 @@
+# Copyright The Kubernetes Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: integration
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.26"
+  KIND_VERSION: "v0.33.0"
+
+permissions:
+  contents: read
+
+jobs:
+  integration_tests:
+    runs-on: ubuntu-22.04
+    name: Integration tests (single node kind)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install kind
+        run: |
+          curl -Lo "${RUNNER_TEMP}/kind" "https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64"
+          sudo install -m 0755 "${RUNNER_TEMP}/kind" /usr/local/bin/kind
+
+      # The suite creates the cluster, builds dranet, runs it inside the node
+      # and deletes the cluster. See tests/integration/README.md.
+      - name: Integration tests
+        run: make integration-test
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-logs-${{ github.run_id }}
+          path: ./_artifacts/integration
+          if-no-files-found: ignore
