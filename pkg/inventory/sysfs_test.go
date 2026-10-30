@@ -499,3 +499,51 @@ func TestRDMAPortLinkLayers(t *testing.T) {
 		}
 	}
 }
+
+func TestSysfsRootAndLinkFallback(t *testing.T) {
+	origRoot := sysfsRoot
+	defer setSysfsRoot(origRoot)
+
+	// 1. Default root
+	setSysfsRoot("/sys")
+	if isCustomSysfsRoot() {
+		t.Errorf("isCustomSysfsRoot() = true for /sys, want false")
+	}
+	if chroot := ghwChroot(); chroot != "" {
+		t.Errorf("ghwChroot() = %q, want empty string", chroot)
+	}
+
+	// 2. Custom root
+	setSysfsRoot("/var/run/dranet/sysfs/sys")
+	if !isCustomSysfsRoot() {
+		t.Errorf("isCustomSysfsRoot() = false for custom root, want true")
+	}
+	if chroot := ghwChroot(); chroot != "/var/run/dranet/sysfs" {
+		t.Errorf("ghwChroot() = %q, want %q", chroot, "/var/run/dranet/sysfs")
+	}
+
+	// 3. Create mock link under custom sysfs and test resolution
+	tempDir := t.TempDir()
+	customSys := filepath.Join(tempDir, "custom-sys")
+	setSysfsRoot(customSys)
+
+	mockNetDir := filepath.Join(customSys, "class", "net")
+	if err := os.MkdirAll(mockNetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	targetDevice := filepath.Join(customSys, "devices", "pci0000:00", "0000:00:10.0", "net", "mlx0")
+	if err := os.MkdirAll(targetDevice, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetDevice, filepath.Join(mockNetDir, "mlx0")); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := readNetSysfsLink("mlx0", mockNetDir)
+	if err != nil {
+		t.Fatalf("readNetSysfsLink(mlx0) failed: %v", err)
+	}
+	if resolved != targetDevice {
+		t.Errorf("readNetSysfsLink(mlx0) = %q, want %q", resolved, targetDevice)
+	}
+}
