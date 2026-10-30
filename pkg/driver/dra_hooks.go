@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
@@ -44,6 +45,7 @@ import (
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -589,6 +591,12 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 	}
 
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+	// The claim's device snapshots are gone, so republish now instead of on
+	// the next periodic poll. Otherwise attributes merged from the snapshots
+	// stay in the ResourceSlice after the device becomes allocatable again.
+	if np.netdb != nil {
+		np.netdb.RequestRescan()
+	}
 	return nil
 }
 
@@ -803,12 +811,24 @@ func mergeDevices(live, snapshot []resourceapi.Device) []resourceapi.Device {
 	merged := make(map[string]resourceapi.Device)
 
 	// 1. Initial Load from Host Scan (Live devices)
+	liveAddresses := sets.New[string]()
 	for _, dev := range live {
 		merged[dev.Name] = dev
+		for _, attr := range addressAttributes {
+			for _, address := range splitAddresses(dev.Attributes[attr]) {
+				liveAddresses.Insert(addressKey(address))
+			}
+		}
 	}
 
 	// 2. Merge database snapshots
 	for _, dev := range snapshot {
+		// An address that a live device publishes now belongs to that device.
+		// Keeping it in a snapshot as well would publish it twice, for
+		// example after a host agent moved it to another interface while
+		// the snapshot's netdev was in a pod.
+		dev = dropLiveAddresses(dev, liveAddresses)
+
 		liveDev, exists := merged[dev.Name]
 		if !exists {
 			// Device is completely missing from host (e.g. virtual interface in pod namespace).
@@ -835,6 +855,15 @@ func mergeDevices(live, snapshot []resourceapi.Device) []resourceapi.Device {
 func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
 	merged := *live.DeepCopy()
 
+	// When the live scan sees the netdev, it is back in the host namespace
+	// and the scan reports every attribute it has. An attribute missing from
+	// the live device, such as dra.net/ipv4 on an interface without a global
+	// address, is absent on the host right now, so filling it from the
+	// snapshot taken at prepare time would publish stale data.
+	if _, ok := live.Attributes[apis.AttrInterfaceName]; ok {
+		return merged
+	}
+
 	if merged.Attributes == nil {
 		merged.Attributes = make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
 	}
@@ -854,4 +883,62 @@ func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
 	}
 
 	return merged
+}
+
+// addressAttributes are the device attributes that hold comma separated
+// lists of interface addresses.
+var addressAttributes = []resourceapi.QualifiedName{apis.AttrIPv4, apis.AttrIPv6}
+
+// splitAddresses returns the addresses in a comma separated address
+// attribute.
+func splitAddresses(attr resourceapi.DeviceAttribute) []string {
+	if attr.StringValue == nil || *attr.StringValue == "" {
+		return nil
+	}
+	return strings.Split(*attr.StringValue, ",")
+}
+
+// addressKey identifies an address by its IP, so the same IP published with
+// a different prefix length still counts as the same address.
+func addressKey(address string) string {
+	if prefix, err := netip.ParsePrefix(address); err == nil {
+		return prefix.Addr().String()
+	}
+	if addr, err := netip.ParseAddr(address); err == nil {
+		return addr.String()
+	}
+	return address
+}
+
+// dropLiveAddresses returns dev without the addresses in liveAddresses. An
+// address attribute left with no addresses is removed. dev is not modified.
+func dropLiveAddresses(dev resourceapi.Device, liveAddresses sets.Set[string]) resourceapi.Device {
+	if liveAddresses.Len() == 0 {
+		return dev
+	}
+	var out *resourceapi.Device
+	for _, attr := range addressAttributes {
+		addresses := splitAddresses(dev.Attributes[attr])
+		kept := make([]string, 0, len(addresses))
+		for _, address := range addresses {
+			if !liveAddresses.Has(addressKey(address)) {
+				kept = append(kept, address)
+			}
+		}
+		if len(kept) == len(addresses) {
+			continue
+		}
+		if out == nil {
+			out = dev.DeepCopy()
+		}
+		if len(kept) == 0 {
+			delete(out.Attributes, attr)
+		} else {
+			out.Attributes[attr] = resourceapi.DeviceAttribute{StringValue: ptr.To(strings.Join(kept, ","))}
+		}
+	}
+	if out == nil {
+		return dev
+	}
+	return *out
 }

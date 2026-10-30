@@ -1077,13 +1077,12 @@ func TestMergeDevices(t *testing.T) {
 			expected: []resourcev1.Device{pciDevSnapshot},
 		},
 		{
-			name: "Live device attribute takes precedence over snapshot",
+			name: "Live device attribute takes precedence over snapshot while netdev is in the pod",
 			live: []resourcev1.Device{{
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
-					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-live"),
-					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("9000"),
+					resourcev1.QualifiedName(apis.AttrPCIAddress): stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrNUMANode):   stringAttr("1"),
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"network-bandwidth": qtyCap("10G"),
@@ -1093,6 +1092,7 @@ func TestMergeDevices(t *testing.T) {
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
 					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrNUMANode):      stringAttr("0"),
 					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-snap"),
 					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
 					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
@@ -1106,14 +1106,135 @@ func TestMergeDevices(t *testing.T) {
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
 					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
-					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-live"),
-					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("9000"),
+					resourcev1.QualifiedName(apis.AttrNUMANode):      stringAttr("1"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-snap"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
 					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"network-bandwidth": qtyCap("10G"),
 					"other-capacity":    qtyCap("50"),
 				},
+			}},
+		},
+		{
+			name: "Snapshot not backfilled when live device has a netdev",
+			live: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("9000"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
+				},
+			}},
+			snapshot: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
+					resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("10.0.0.5/24"),
+					resourcev1.QualifiedName(apis.AttrIPv6):          stringAttr("fd00::5/64"),
+					resourcev1.QualifiedName(apis.AttrTCFilterNames): stringAttr("old-filter"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("1G"),
+					"other-capacity":    qtyCap("50"),
+				},
+			}},
+			expected: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("9000"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
+				},
+			}},
+		},
+		{
+			name: "Snapshot addresses published by a live device are dropped per address",
+			live: []resourcev1.Device{
+				pciDev,
+				{
+					Name: "0000:c0:15.0",
+					Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+						resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth2"),
+						resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("10.0.0.5/16,10.0.9.9/24"),
+						resourcev1.QualifiedName(apis.AttrIPv6):          stringAttr("fd00::5/64"),
+					},
+				},
+			},
+			snapshot: []resourcev1.Device{
+				{
+					Name: "0000:c0:14.0",
+					Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+						resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+						resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+						resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("10.0.0.5/24,192.168.1.9/24"),
+						resourcev1.QualifiedName(apis.AttrIPv6):          stringAttr("fd00::5/64"),
+					},
+				},
+				{
+					Name: "macvlan-pod",
+					Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+						resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("macvlan0"),
+						resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("10.0.9.9/24"),
+						resourcev1.QualifiedName(apis.AttrIPv6):          stringAttr("fd00::7/64,fd00::5/64"),
+					},
+				},
+			},
+			expected: []resourcev1.Device{
+				{
+					Name: "0000:c0:14.0",
+					Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+						resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+						resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+						resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("192.168.1.9/24"),
+					},
+					Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{},
+				},
+				{
+					Name: "0000:c0:15.0",
+					Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+						resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth2"),
+						resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("10.0.0.5/16,10.0.9.9/24"),
+						resourcev1.QualifiedName(apis.AttrIPv6):          stringAttr("fd00::5/64"),
+					},
+				},
+				{
+					Name: "macvlan-pod",
+					Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+						resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("macvlan0"),
+						resourcev1.QualifiedName(apis.AttrIPv6):          stringAttr("fd00::7/64"),
+					},
+				},
+			},
+		},
+		{
+			name: "Snapshot addresses kept while netdev is in the pod",
+			live: []resourcev1.Device{pciDev},
+			snapshot: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+					resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("10.0.0.5/24"),
+				},
+			}},
+			expected: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth1"),
+					resourcev1.QualifiedName(apis.AttrIPv4):          stringAttr("10.0.0.5/24"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{},
 			}},
 		},
 	}
@@ -1125,6 +1246,51 @@ func TestMergeDevices(t *testing.T) {
 				t.Errorf("mergeDevices result mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestMergeDevicesDoesNotModifySnapshot(t *testing.T) {
+	addr := "10.0.0.5/24,192.168.1.9/24"
+	live := []resourcev1.Device{{
+		Name: "live-dev",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			resourcev1.QualifiedName(apis.AttrInterfaceName): {StringValue: ptr.To("eth2")},
+			resourcev1.QualifiedName(apis.AttrIPv4):          {StringValue: ptr.To("10.0.0.5/24")},
+		},
+	}}
+	snapshot := []resourcev1.Device{{
+		Name: "pod-dev",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			resourcev1.QualifiedName(apis.AttrIPv4): {StringValue: ptr.To(addr)},
+		},
+	}}
+	want := snapshot[0].DeepCopy()
+
+	mergeDevices(live, snapshot)
+
+	if diff := cmp.Diff(*want, snapshot[0]); diff != "" {
+		t.Errorf("mergeDevices modified the snapshot (-want +got):\n%s", diff)
+	}
+}
+
+func TestUnprepareResourceClaimRequestsRescan(t *testing.T) {
+	netdb := newFakeInventoryDB()
+	np := &NetworkDriver{
+		netdb:          netdb,
+		podConfigStore: mustNewPodConfigStore(),
+	}
+	claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
+	np.podConfigStore.SetDeviceConfig("pod-uid-1", "device-a", DeviceConfig{Claim: claimName})
+
+	claims := []kubeletplugin.NamespacedObject{
+		{NamespacedName: claimName, UID: "claim-uid-1"},
+	}
+	if _, err := np.UnprepareResourceClaims(context.Background(), claims); err != nil {
+		t.Fatalf("UnprepareResourceClaims failed: %v", err)
+	}
+
+	if got := netdb.rescanCalls.Load(); got != 1 {
+		t.Errorf("RequestRescan call count = %d, want 1", got)
 	}
 }
 
