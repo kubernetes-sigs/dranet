@@ -24,6 +24,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	userns "sigs.k8s.io/dranet/internal/testutils"
@@ -80,6 +81,7 @@ func testGetDefaultGwInterfaces_Namespaced(t *testing.T) {
 	tests := []struct {
 		name           string
 		setupRoutes    func() error
+		families       sets.Set[v1.IPFamily]
 		expectedResult sets.Set[string]
 	}{
 		{
@@ -140,6 +142,47 @@ func testGetDefaultGwInterfaces_Namespaced(t *testing.T) {
 				return netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth0"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN})
 			},
 			expectedResult: sets.New[string]("eth0"),
+		},
+		{
+			name: "IPv4-only cluster ignores the IPv6 default route",
+			setupRoutes: func() error {
+				if err := netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V4, Dst: defaultIPv4, Gw: gwIPv4, LinkIndex: links["eth0"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN}); err != nil {
+					return err
+				}
+				return netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth2"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN})
+			},
+			families:       sets.New(v1.IPv4Protocol),
+			expectedResult: sets.New[string]("eth0"),
+		},
+		{
+			name: "IPv6-only cluster ignores the IPv4 default route",
+			setupRoutes: func() error {
+				if err := netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V4, Dst: defaultIPv4, Gw: gwIPv4, LinkIndex: links["eth0"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN}); err != nil {
+					return err
+				}
+				return netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth2"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN})
+			},
+			families:       sets.New(v1.IPv6Protocol),
+			expectedResult: sets.New[string]("eth2"),
+		},
+		{
+			name: "Dual-stack cluster excludes both default routes",
+			setupRoutes: func() error {
+				if err := netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V4, Dst: defaultIPv4, Gw: gwIPv4, LinkIndex: links["eth0"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN}); err != nil {
+					return err
+				}
+				return netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth2"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN})
+			},
+			families:       sets.New(v1.IPv4Protocol, v1.IPv6Protocol),
+			expectedResult: sets.New[string]("eth0", "eth2"),
+		},
+		{
+			name: "IPv4-only cluster with only an IPv6 default route excludes nothing",
+			setupRoutes: func() error {
+				return netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth2"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN})
+			},
+			families:       sets.New(v1.IPv4Protocol),
+			expectedResult: sets.New[string](),
 		},
 		{
 			name: "ECMP: Multiple standard routes with the same metric",
@@ -247,7 +290,7 @@ func testGetDefaultGwInterfaces_Namespaced(t *testing.T) {
 				t.Fatalf("setupRoutes failed: %v", err)
 			}
 
-			got := getDefaultGwInterfaces()
+			got := getDefaultGwInterfaces(tt.families)
 			if diff := cmp.Diff(tt.expectedResult, got); diff != "" {
 				t.Errorf("getDefaultGwInterfaces() mismatch (-want +got):\n%s", diff)
 			}
@@ -363,7 +406,7 @@ func testGetExcludedUplinkInterfaces_Namespaced(t *testing.T) {
 
 			tt.setup(t)
 
-			got := getExcludedUplinkInterfaces()
+			got := getExcludedUplinkInterfaces(nil)
 			if diff := cmp.Diff(tt.expectedResult, got); diff != "" {
 				t.Errorf("getExcludedUplinkInterfaces() mismatch (-want +got):\n%s", diff)
 			}

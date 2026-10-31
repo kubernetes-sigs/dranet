@@ -35,6 +35,7 @@ import (
 	"github.com/jaypipes/ghw"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/time/rate"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -75,6 +76,11 @@ type DB struct {
 	// gateway changes revisit once we have more evidence this can be a
 	// potential problem or break some use cases.
 	gwInterfaces sets.Set[string]
+	// ipFamilies is the set of IP families used by the cluster on this node,
+	// derived from the node addresses. Only the default-gateway uplinks of
+	// these families are excluded from the inventory. Empty means unknown,
+	// in which case the uplinks of both families are excluded.
+	ipFamilies sets.Set[v1.IPFamily]
 
 	mu sync.RWMutex
 	// deviceStore is an in-memory cache of the available devices on the node.
@@ -152,6 +158,14 @@ func WithMoveIBInterfaces(move bool) Option {
 	}
 }
 
+// WithIPFamilies restricts the default-gateway uplink exclusion to the given
+// IP families, typically the families of the node IPs.
+func WithIPFamilies(families sets.Set[v1.IPFamily]) Option {
+	return func(db *DB) {
+		db.ipFamilies = families
+	}
+}
+
 // WithListNUMAAttributes publishes resource.kubernetes.io/numaNode as an
 // integer list containing the physical NUMA node followed by equally local,
 // same-socket NUMA nodes.
@@ -202,8 +216,8 @@ func (db *DB) Run(ctx context.Context) error {
 		klog.Error(err, "error subscribing to netlink interfaces, only syncing periodically", "interval", db.maxPollInterval.String())
 	}
 
-	db.gwInterfaces = getExcludedUplinkInterfaces()
-	klog.V(2).Infof("Excluded uplink interfaces and children: %v", db.gwInterfaces.UnsortedList())
+	db.gwInterfaces = getExcludedUplinkInterfaces(db.ipFamilies)
+	klog.V(2).Infof("Excluded uplink interfaces and children for IP families %v: %v", sets.List(db.ipFamilies), db.gwInterfaces.UnsortedList())
 
 	for {
 		err := db.rateLimiter.Wait(ctx)
