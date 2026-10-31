@@ -40,9 +40,21 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 		return &NetworkConfig{} // or log error? We'll just return nil or early? Let's just return what we have.
 	}
 
+	// Do not let merging a pointer value mutate the provider configuration.
+	if merged.Interface.AddrGenMode != nil {
+		mode := *merged.Interface.AddrGenMode
+		merged.Interface.AddrGenMode = &mode
+	}
+
 	// Merge the user configuration on top, overriding cloud settings and appending slices.
 	if err := mergo.Merge(merged, user, mergo.WithOverride, mergo.WithAppendSlice); err != nil {
 		return &NetworkConfig{}
+	}
+
+	// EUI64 (0) is an explicit setting, not an absent override.
+	if user.Interface.AddrGenMode != nil {
+		mode := *user.Interface.AddrGenMode
+		merged.Interface.AddrGenMode = &mode
 	}
 
 	// Deduplicate slices where order or uniqueness matters.

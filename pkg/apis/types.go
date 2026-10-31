@@ -123,6 +123,12 @@ type InterfaceConfig struct {
 	// must be requested explicitly.
 	ARPAnnounce *int32 `json:"arpAnnounce,omitempty"`
 
+	// AddrGenMode controls automatic IPv6 address generation (ip link addrgenmode):
+	// 0 = EUI64, 1 = none, 2 = stable privacy, 3 = random.
+	// When unset, the kernel setting is unchanged. Applied before bringing the
+	// interface up; it does not remove existing addresses.
+	AddrGenMode *int32 `json:"addrGenMode,omitempty"`
+
 	// AcceptRA controls IPv6 router advertisement acceptance through
 	// /proc/sys/net/ipv6/conf/<iface>/accept_ra. Valid values are 0-2.
 	// Moving the interface resets it to the destination namespace default, so it
