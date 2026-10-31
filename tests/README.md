@@ -9,6 +9,10 @@
 
 4. Run `bats tests/`
 
+For fast Go integration tests against a single node kind cluster (no image
+build, dranet runs as a host process in the node) see
+[integration/README.md](./integration/README.md).
+
 # Best practices for writing integration tests
 
 * For clear and debuggable test failures, prefer using a suitable helper

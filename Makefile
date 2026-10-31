@@ -36,6 +36,12 @@ test:
 e2e-test:
 	bats --verbose-run tests/
 
+# Fast integration tests against a single node kind cluster; dranet runs as a
+# host process inside the node. See tests/integration/README.md.
+.PHONY: integration-test
+integration-test:
+	go test -tags=integration -v -count=1 -timeout=30m ./tests/integration/...
+
 # code linters
 lint:
 	hack/lint.sh
