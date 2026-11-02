@@ -445,6 +445,31 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "addrGenMode none with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AddrGenMode: ptr.To[int32](1), MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "addrGenMode with mtu at the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AddrGenMode: ptr.To[int32](0), MTU: ptr.To[int32](1280)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "addrGenMode without explicit mtu",
+			cfg:       &InterfaceConfig{Name: "eth0", AddrGenMode: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "IPv4-only mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", MTU: ptr.To[int32](1279), Addresses: []string{"192.0.2.1/24"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "acceptRA with mtu below the IPv6 minimum",
 			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1279)},
 			fieldPath: "iface",
