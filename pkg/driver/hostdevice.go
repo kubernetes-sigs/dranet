@@ -150,6 +150,12 @@ func setupNetdevInNS(containerNs netns.NsHandle, containerNsPath string, ifName 
 		return nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPath, err)
 	}
 
+	if interfaceConfig.AddrGenMode != nil {
+		if err := nhNs.LinkSetIP6AddrGenMode(nsLink, int(*interfaceConfig.AddrGenMode)); err != nil {
+			return nil, fmt.Errorf("failed to set addrgenmode on interface %s: %w", ifName, err)
+		}
+	}
+
 	// Apply before the link comes up so it never answers ARP or accepts router
 	// advertisements with the wrong policy.
 	if err := applyInterfaceSysctlConfig(containerNs, ifName, interfaceConfig); err != nil {

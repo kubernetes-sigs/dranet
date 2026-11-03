@@ -305,8 +305,6 @@ func testGetProfileConfig_Namespaced(t *testing.T) {
 	const addrHostPrefix = "2001:db8:1234:5678:0:f:0:c0"
 	wantTable := apis.TableIDForName("bond0")
 	wantParentRoutes := []apis.RouteConfig{
-		{Destination: "2001:db8:1234:5678::/64", Scope: unix.RT_SCOPE_LINK, Table: wantTable},
-		{Destination: "fe80::/64", Scope: unix.RT_SCOPE_LINK, Table: wantTable},
 		{Destination: "fe80::1/128", Scope: unix.RT_SCOPE_LINK, Table: wantTable},
 		{Destination: "2001:db8:1000::/36", Gateway: "fe80::1", Table: wantTable},
 	}
@@ -434,6 +432,9 @@ func TestEfloRouteConfigs(t *testing.T) {
 		{Dst: connected},
 		{Dst: linkLocal},
 		{Dst: fabric, Gw: net.ParseIP("fe80::1")},
+		// A default route may be represented without a destination. Reusing
+		// the gateway must not create a duplicate on-link host route.
+		{Gw: net.ParseIP("fe80::1")},
 	}
 
 	got, err := efloRouteConfigs("bond0", routes)
@@ -441,13 +442,47 @@ func TestEfloRouteConfigs(t *testing.T) {
 		t.Fatalf("efloRouteConfigs() error = %v", err)
 	}
 	want := []apis.RouteConfig{
-		{Destination: "2001:db8:1234:5678::/64", Scope: unix.RT_SCOPE_LINK},
-		{Destination: "fe80:db8:1234:5678::/64", Scope: unix.RT_SCOPE_LINK},
 		{Destination: "fe80::1/128", Scope: unix.RT_SCOPE_LINK},
 		{Destination: "2001:db8:1000::/36", Gateway: "fe80::1"},
+		{Destination: "::/0", Gateway: "fe80::1"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("efloRouteConfigs() = %+v, want %+v", got, want)
+	}
+}
+
+func TestEfloRouteConfigsWithoutGateway(t *testing.T) {
+	_, connected, _ := net.ParseCIDR("2001:db8:1234:5678::/64")
+	got, err := efloRouteConfigs("bond0", []netlink.Route{{Dst: connected}})
+	if err != nil {
+		t.Fatalf("efloRouteConfigs() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("connected-only parent must not produce child routes: %+v", got)
+	}
+}
+
+func TestEfloSourceRoutingGatewayNeighbors(t *testing.T) {
+	config := &apis.NetworkConfig{Interface: apis.InterfaceConfig{
+		Type: apis.InterfaceTypeIPVLAN, Addresses: []string{"2001:db8::10/128"},
+	}}
+	routes := []apis.RouteConfig{
+		{Destination: "fe80::1/128", Scope: unix.RT_SCOPE_LINK},
+		{Destination: "2001:db8::/32", Gateway: "fe80::1"},
+		{Destination: "::/0", Gateway: "fe80::1"},
+		{Destination: "2001:db8:ffff::/48", Gateway: "fe80::2"},
+	}
+	got := efloSourceRoutingConfig("bond0", config, nil, routes)
+	want := []apis.NeighborConfig{
+		{Destination: "fe80::1", HardwareAddr: "00:00:5e:00:01:01"},
+		{Destination: "fe80::2", HardwareAddr: "00:00:5e:00:01:01"},
+	}
+	if !reflect.DeepEqual(got.Neighbors, want) {
+		t.Fatalf("neighbors = %+v, want %+v", got.Neighbors, want)
+	}
+	config.Routes = []apis.RouteConfig{{Destination: "::/0", Gateway: "fe80::99"}}
+	if got := efloSourceRoutingConfig("bond0", config, nil, routes); got != nil {
+		t.Fatalf("user-owned routing must not inherit fabric neighbors: %+v", got)
 	}
 }
 

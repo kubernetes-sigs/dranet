@@ -23,6 +23,37 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+func TestMergeNetworkConfigAddrGenMode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		user *int32
+		want int32
+	}{
+		{name: "inherit provider", want: 1},
+		{name: "explicit zero overrides provider", user: ptr.To[int32](0), want: 0},
+		{name: "nonzero override", user: ptr.To[int32](3), want: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := &NetworkConfig{Interface: InterfaceConfig{AddrGenMode: tc.user}}
+			cloud := &NetworkConfig{Interface: InterfaceConfig{AddrGenMode: ptr.To[int32](1)}}
+			got := MergeNetworkConfig(user, cloud)
+			if got.Interface.AddrGenMode == nil || *got.Interface.AddrGenMode != tc.want {
+				t.Fatalf("addrGenMode = %v, want %d", got.Interface.AddrGenMode, tc.want)
+			}
+			if *cloud.Interface.AddrGenMode != 1 {
+				t.Fatal("merge mutated provider addrGenMode")
+			}
+			*got.Interface.AddrGenMode = 2
+			if *cloud.Interface.AddrGenMode != 1 {
+				t.Fatal("result aliases provider addrGenMode")
+			}
+			if tc.user != nil && *tc.user != tc.want {
+				t.Fatal("result aliases user addrGenMode")
+			}
+		})
+	}
+}
+
 func TestMergeNetworkConfig(t *testing.T) {
 	tests := []struct {
 		name  string
