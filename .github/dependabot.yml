@@ -4,6 +4,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       k8s-deps:
         patterns:
@@ -22,6 +24,12 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     labels:
       - "area/dependency"
       - "ok-to-test"
@@ -31,6 +39,12 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      docker-images:
+        patterns:
+          - "*"
     labels:
       - "area/dependency"
       - "ok-to-test"
