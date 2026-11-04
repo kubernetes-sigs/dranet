@@ -594,9 +594,7 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 	// The claim's device snapshots are gone, so republish now instead of on
 	// the next periodic poll. Otherwise attributes merged from the snapshots
 	// stay in the ResourceSlice after the device becomes allocatable again.
-	if np.netdb != nil {
-		np.netdb.RequestRescan()
-	}
+	np.netdb.RequestRescan()
 	return nil
 }
 

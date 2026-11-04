@@ -210,6 +210,7 @@ func TestUnprepareResourceClaimsMetrics(t *testing.T) {
 
 		np := &NetworkDriver{
 			podConfigStore: mustNewPodConfigStore(),
+			netdb:          newFakeInventoryDB(),
 		}
 		claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
 		np.podConfigStore.SetDeviceConfig("pod-uid-1", "device-a", DeviceConfig{Claim: claimName})
