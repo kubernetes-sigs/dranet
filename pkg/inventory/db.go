@@ -201,6 +201,27 @@ func (db *DB) Run(ctx context.Context) error {
 	if err := netlink.LinkSubscribe(nlChannel, doneCh); err != nil {
 		klog.Error(err, "error subscribing to netlink interfaces, only syncing periodically", "interval", db.maxPollInterval.String())
 	}
+	// Address changes do not produce link notifications, so without this
+	// subscription an address added to or removed from an interface that is
+	// already up is only reflected in the ipv4 and ipv6 attributes on the
+	// next periodic poll. The channel is buffered so a burst of address
+	// events, for example when an interface gets several addresses at once,
+	// is drained below and triggers a single scan.
+	addrChannel := make(chan netlink.AddrUpdate, 64)
+	if err := netlink.AddrSubscribeWithOptions(addrChannel, doneCh, netlink.AddrSubscribeOptions{
+		ErrorCallback: func(err error) {
+			select {
+			case <-doneCh:
+				// Closing the socket on return makes the pending receive fail.
+				return
+			default:
+			}
+			klog.ErrorS(err, "netlink address subscription error")
+		},
+	}); err != nil {
+		klog.ErrorS(err, "error subscribing to netlink addresses, address changes are only synced periodically", "interval", db.maxPollInterval.String())
+		addrChannel = nil
+	}
 
 	db.gwInterfaces = getExcludedUplinkInterfaces()
 	klog.V(2).Infof("Excluded uplink interfaces and children: %v", db.gwInterfaces.UnsortedList())
@@ -223,6 +244,19 @@ func (db *DB) Run(ctx context.Context) error {
 			// drain the channel so we only sync once
 			for len(nlChannel) > 0 {
 				<-nlChannel
+			}
+		case _, ok := <-addrChannel:
+			if !ok {
+				// The subscription stopped after a receive error. Stop
+				// selecting on the closed channel so it does not trigger a
+				// scan on every iteration.
+				klog.Errorf("netlink address subscription closed, address changes are only synced periodically every %s", db.maxPollInterval)
+				addrChannel = nil
+				break
+			}
+			// drain the channel so we only sync once
+			for len(addrChannel) > 0 {
+				<-addrChannel
 			}
 		case <-db.rescanCh:
 			klog.V(3).Infof("Triggering inventory rescan due to manual request")
