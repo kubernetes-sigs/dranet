@@ -112,12 +112,42 @@ func getDefaultGwInterfaces() sets.Set[string] {
 		interfaces.Insert(k)
 	}
 
+	// A host has one management uplink, or two for redundancy. A large winning
+	// set means something other than a management uplink is advertising a
+	// default route at the same metric, which on RDMA fabrics is common: every
+	// rail NIC gets a default route from a Router Advertisement, ties on metric
+	// 1024, and the whole fabric disappears from the inventory. Say so, because
+	// the symptom is otherwise just missing devices.
+	if len(v6Interfaces) > maxPlausibleUplinks {
+		klog.Warningf("Detected %d interfaces as IPv6 default-gateway uplinks (%v), which is more than a host plausibly has. "+
+			"If these are RDMA NICs receiving Router Advertisements, they are excluded from the inventory; "+
+			"set --uplink-interfaces to name the real uplinks instead.", len(v6Interfaces), v6Interfaces.UnsortedList())
+	}
+	if len(v4Interfaces) > maxPlausibleUplinks {
+		klog.Warningf("Detected %d interfaces as IPv4 default-gateway uplinks (%v), which is more than a host plausibly has. "+
+			"Set --uplink-interfaces to name the real uplinks instead.", len(v4Interfaces), v4Interfaces.UnsortedList())
+	}
+
 	return interfaces
 }
 
+// maxPlausibleUplinks is the largest number of default-gateway uplinks a host
+// is expected to have: one, or two for redundancy. Above that, the detection is
+// almost certainly picking up a fabric rather than a management uplink.
+const maxPlausibleUplinks = 2
+
 // getExcludedUplinkInterfaces returns the set of interface names that must be
 // excluded from the inventory: the active default-gateway uplinks plus every
-// netdev that is a descendant of one of those uplinks. A child tied to a
+// netdev that is a descendant of one of those uplinks.
+//
+// When uplinks is non-empty it names the uplinks explicitly and replaces the
+// automatic default-gateway detection. That is needed on fabrics where the RDMA
+// NICs themselves receive a default route from Router Advertisements: they are
+// indistinguishable from a management uplink by routing alone, so detection
+// would exclude the very devices DraNet exists to hand out. Names that do not
+// exist on this host are ignored, so one list can carry the uplink name of
+// every node shape in the cluster; detection runs instead only when none of
+// the names exist. A child tied to a
 // parent through MasterIndex (bond/team slave, bridge port, VF enslaved to
 // its PF, ...) shares its forwarding state with that parent, so moving just
 // the child into a pod netns strands it from the parent that owns that
@@ -125,13 +155,49 @@ func getDefaultGwInterfaces() sets.Set[string] {
 // host connectivity. There is no scenario where relocating only the child of
 // a default-gw uplink is correct, so the entire MasterIndex-linked subtree
 // rooted at each uplink should be excluded.
-func getExcludedUplinkInterfaces() sets.Set[string] {
-	excluded := getDefaultGwInterfaces()
-
+func getExcludedUplinkInterfaces(uplinks sets.Set[string]) sets.Set[string] {
 	links, err := nlwrap.LinkList()
 	if err != nil {
 		klog.Errorf("Failed to list links for uplink child exclusion: %v", err)
-		return excluded
+		if len(uplinks) > 0 {
+			return uplinks.Clone()
+		}
+		return getDefaultGwInterfaces()
+	}
+
+	var excluded sets.Set[string]
+	if len(uplinks) > 0 {
+		// Only names that exist on this host count. The DaemonSet runs the
+		// same flag on every node, so in a cluster with more than one node
+		// shape the list carries the uplink name of each shape and every node
+		// is missing some of them; that is expected and only worth noting.
+		// When none of the names exist the flag is most likely a typo, and
+		// honouring it would switch detection off with nothing in its place,
+		// handing the real uplink to the first Pod that asks for it. Fall back
+		// to detection in that case, so the mistake costs devices rather than
+		// the node's connectivity, and say so.
+		excluded = sets.New[string]()
+		missing := sets.New[string]()
+		names := sets.New[string]()
+		for _, l := range links {
+			names.Insert(l.Attrs().Name)
+		}
+		for name := range uplinks {
+			if names.Has(name) {
+				excluded.Insert(name)
+			} else {
+				missing.Insert(name)
+			}
+		}
+		switch {
+		case len(excluded) == 0:
+			klog.Warningf("None of the interfaces named by --uplink-interfaces (%v) exist on this host; excluding the detected default-gateway uplinks instead so a typo cannot expose the real uplink", sets.List(missing))
+			excluded = getDefaultGwInterfaces()
+		case len(missing) > 0:
+			klog.V(2).Infof("Ignoring the interfaces named by --uplink-interfaces that do not exist on this host: %v", sets.List(missing))
+		}
+	} else {
+		excluded = getDefaultGwInterfaces()
 	}
 
 	// Build a parent-index -> children adjacency map in a single pass so we
