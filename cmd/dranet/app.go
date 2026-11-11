@@ -36,6 +36,7 @@ import (
 	"cel.dev/cel-go/ext"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
+	"sigs.k8s.io/dranet/internal/node"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
@@ -54,6 +55,12 @@ import (
 
 const (
 	driverName = "dra.net"
+
+	// nodeIPsPollInterval and nodeIPsTimeout bound how long we wait for the
+	// kubelet to publish the node addresses before we fall back to excluding
+	// the uplinks of both IP families. Same values kube-proxy uses.
+	nodeIPsPollInterval = time.Second
+	nodeIPsTimeout      = 30 * time.Second
 )
 
 var (
@@ -237,6 +244,7 @@ func main() {
 		inventory.WithRateLimiter(rate.NewLimiter(rate.Every(minPollInterval), pollBurst)),
 		inventory.WithMaxPollInterval(maxPollInterval),
 		inventory.WithMoveIBInterfaces(moveIBInterfaces),
+		inventory.WithIPFamilies(node.DetectIPFamilies(ctx, clientset.CoreV1().Nodes(), nodeName, nodeIPsPollInterval, nodeIPsTimeout)),
 	}
 	if features.DefaultFeatureGate.Enabled(features.DRAListTypeAttributes) {
 		optsDb = append(optsDb, inventory.WithListNUMAAttributes())

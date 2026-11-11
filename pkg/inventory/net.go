@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 	"sigs.k8s.io/dranet/internal/nlwrap"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 )
@@ -33,7 +34,16 @@ import (
 // as active default gateways in the main routing table, respecting route metrics.
 // It identifies defaults as routes where Dst is nil (kernel default) or where
 // Dst is exactly 0.0.0.0/0 (IPv4) or ::/0 (IPv6).
-func getDefaultGwInterfaces() sets.Set[string] {
+//
+// Only the routes of the given IP families are considered. The families
+// come from the node IPs: a dual-stack node has an uplink for each family
+// and pods must not take either of them, so both are excluded. A
+// single-stack node may still have a default route for the other family
+// (for example an RA-learned ::/0 on an RDMA NIC in an IPv4 cluster); that
+// NIC is not used by Kubernetes, so it stays allocatable and the admin can
+// filter it with the --filter CEL expression if needed. An empty set means
+// the families are unknown and the uplinks of both families are excluded.
+func getDefaultGwInterfaces(families sets.Set[v1.IPFamily]) sets.Set[string] {
 	interfaces := make(sets.Set[string])
 
 	filter := &netlink.Route{
@@ -45,6 +55,9 @@ func getDefaultGwInterfaces() sets.Set[string] {
 		return interfaces
 	}
 
+	wantV4 := families.Len() == 0 || families.Has(v1.IPv4Protocol)
+	wantV6 := families.Len() == 0 || families.Has(v1.IPv6Protocol)
+
 	minMetricV4 := math.MaxInt32
 	minMetricV6 := math.MaxInt32
 
@@ -52,7 +65,16 @@ func getDefaultGwInterfaces() sets.Set[string] {
 	v6Interfaces := make(sets.Set[string])
 
 	for _, r := range routes {
-		if r.Family != netlink.FAMILY_V4 && r.Family != netlink.FAMILY_V6 {
+		switch r.Family {
+		case netlink.FAMILY_V4:
+			if !wantV4 {
+				continue
+			}
+		case netlink.FAMILY_V6:
+			if !wantV6 {
+				continue
+			}
+		default:
 			continue
 		}
 
@@ -125,8 +147,11 @@ func getDefaultGwInterfaces() sets.Set[string] {
 // host connectivity. There is no scenario where relocating only the child of
 // a default-gw uplink is correct, so the entire MasterIndex-linked subtree
 // rooted at each uplink should be excluded.
-func getExcludedUplinkInterfaces() sets.Set[string] {
-	excluded := getDefaultGwInterfaces()
+//
+// families selects which address families are considered when looking for
+// the default-gateway uplinks; see getDefaultGwInterfaces.
+func getExcludedUplinkInterfaces(families sets.Set[v1.IPFamily]) sets.Set[string] {
+	excluded := getDefaultGwInterfaces(families)
 
 	links, err := nlwrap.LinkList()
 	if err != nil {
