@@ -175,7 +175,6 @@ func WithProfileProvider(profProv cloudprovider.ProfileProvider) Option {
 
 func New(opts ...Option) *DB {
 	db := &DB{
-
 		deviceStore:       map[string]hostDevice{},
 		deviceConfigStore: map[string]*apis.NetworkConfig{},
 		rateLimiter:       rate.NewLimiter(rate.Every(defaultMinPollInterval), defaultPollBurst),
@@ -237,9 +236,18 @@ func (db *DB) Run(ctx context.Context) error {
 // It discovers PCI, network, and RDMA devices, adds cloud attributes,
 // filters out default interfaces, and updates the device store.
 func (db *DB) scan() []resourceapi.Device {
-	pciInfo, err := ghw.PCI(
-		ghw.WithDisableTools(),
-	)
+	var pciInfo *ghw.PCIInfo
+	var err error
+	if chroot := ghwChroot(); chroot != "" {
+		pciInfo, err = ghw.PCI(
+			ghw.WithDisableTools(),
+			ghw.WithChroot(chroot),
+		)
+	} else {
+		pciInfo, err = ghw.PCI(
+			ghw.WithDisableTools(),
+		)
+	}
 	if err != nil {
 		klog.Errorf("Could not get PCI devices: %v", err)
 	}
