@@ -133,6 +133,11 @@ values from the initial network namespace, subject to `net.core.devconf_inherit_
 The IPv6 values start at the kernel defaults (`accept_ra` is 1) unless that sysctl is 1 or 3.
 DRANET only changes the per-interface value.
 
+DRANET also sets `arp_notify` on an interface that gets an IPv4 address. The kernel then
+announces the address with a gratuitous ARP when the interface comes up in the Pod, so a
+neighbor that learned the address from another interface updates its entry instead of
+sending to the old hardware address until the entry expires.
+
 ##### IPVLAN subinterfaces
 
 An `IPVLAN` subinterface is created inside the Pod network namespace on top of the

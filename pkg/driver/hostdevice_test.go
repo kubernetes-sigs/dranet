@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"bytes"
 	"crypto/rand"
 	"fmt"
 	"net"
@@ -29,8 +30,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mdlayher/packet"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 	"k8s.io/component-helpers/node/util/sysctl"
 	sysctltesting "k8s.io/component-helpers/node/util/sysctl/testing"
 	"k8s.io/utils/ptr"
@@ -402,6 +405,73 @@ func test_nsAttachNetdevRollsBackOnAddressFailure_Namespaced(t *testing.T) {
 	}
 	if returnedDev.Attrs().Flags&net.FlagUp == 0 {
 		t.Error("network device was not brought up after the address setup error")
+	}
+}
+
+func Test_nsAttachNetdevAnnouncesIPv4Address(t *testing.T) {
+	userns.Run(t, test_nsAttachNetdevAnnouncesIPv4Address_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func test_nsAttachNetdevAnnouncesIPv4Address_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, 1500)
+
+	// The peer stays on the host and hears what the rest of the segment would.
+	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "tveth0"}, PeerName: "tpeer0"}
+	if err := netlink.LinkAdd(veth); err != nil {
+		t.Fatalf("Failed to add veth pair: %v", err)
+	}
+	t.Cleanup(func() {
+		if link, err := nlwrap.LinkByName("tpeer0"); err == nil {
+			_ = netlink.LinkDel(link)
+		}
+	})
+	peerLink, err := nlwrap.LinkByName("tpeer0")
+	if err != nil {
+		t.Fatalf("Failed to get veth peer: %v", err)
+	}
+	if err := netlink.LinkSetUp(peerLink); err != nil {
+		t.Fatalf("Failed to set up veth peer: %v", err)
+	}
+	peer, err := net.InterfaceByName("tpeer0")
+	if err != nil {
+		t.Fatalf("Failed to get veth peer interface: %v", err)
+	}
+	conn, err := packet.Listen(peer, packet.Raw, unix.ETH_P_ARP, nil)
+	if err != nil {
+		t.Fatalf("Failed to listen for ARP on the veth peer: %v", err)
+	}
+	defer conn.Close()
+
+	data, err := nsAttachNetdev("tveth0", env.nsPath, apis.InterfaceConfig{Addresses: []string{"192.0.2.10/24"}})
+	if err != nil {
+		t.Fatalf("nsAttachNetdev() error: %v", err)
+	}
+
+	// A gratuitous ARP carries the address as both its sender and its target.
+	address := []byte{192, 0, 2, 10}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("Failed to set the read deadline: %v", err)
+	}
+	frame := make([]byte, 64)
+	for {
+		n, _, err := conn.ReadFrom(frame)
+		if err != nil {
+			t.Fatalf("no gratuitous ARP for 192.0.2.10 reached the veth peer: %v", err)
+		}
+		// The ARP payload follows the 14 byte Ethernet header, with the sender
+		// hardware and protocol addresses at 8 and 14 and the target protocol
+		// address at 24.
+		if n < 42 {
+			continue
+		}
+		arp := frame[14:n]
+		if !bytes.Equal(arp[14:18], address) || !bytes.Equal(arp[24:28], address) {
+			continue
+		}
+		if got := net.HardwareAddr(arp[8:14]).String(); got != data.HardwareAddress {
+			t.Errorf("gratuitous ARP sender hardware address = %s, want %s", got, data.HardwareAddress)
+		}
+		return
 	}
 }
 
