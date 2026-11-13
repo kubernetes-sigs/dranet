@@ -28,8 +28,10 @@ import (
 func inheritParentAttributes(devices []hostDevice) {
 	byIndex := make(map[int]*hostDevice, len(devices))
 	for i := range devices {
-		if devices[i].linkIndex != 0 {
-			byIndex[devices[i].linkIndex] = &devices[i]
+		for _, index := range devices[i].linkIndices {
+			if index != 0 {
+				byIndex[index] = &devices[i]
+			}
 		}
 	}
 	for i := range devices {
@@ -41,7 +43,10 @@ func inheritParentAttributes(devices []hostDevice) {
 		if child.Attributes[apis.AttrPCIAddress].StringValue != nil {
 			continue
 		}
-		seen := map[int]bool{child.linkIndex: true}
+		seen := make(map[int]bool)
+		for _, index := range child.linkIndices {
+			seen[index] = true
+		}
 		for index := child.parentIndex; index != 0; {
 			if seen[index] {
 				break
