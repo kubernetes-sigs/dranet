@@ -27,7 +27,7 @@ import (
 
 func TestInheritParentAttributes(t *testing.T) {
 	makeDevice := func(index, parent int, kind string) hostDevice {
-		return hostDevice{linkIndex: index, parentIndex: parent, Device: resourceapi.Device{
+		return hostDevice{linkIndices: []int{index}, parentIndex: parent, Device: resourceapi.Device{
 			Name: kind, Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 				apis.AttrType:          {StringValue: ptr.To(kind)},
 				apis.AttrInterfaceName: {StringValue: ptr.To(kind)},

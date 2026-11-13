@@ -113,7 +113,7 @@ type DB struct {
 // this package.
 type hostDevice struct {
 	// Link indices are local to this discovery snapshot and are not published.
-	linkIndex   int
+	linkIndices []int
 	parentIndex int
 	resourceapi.Device
 	// pciClass is the PCI base class, pciBaseClassNetwork for a network
@@ -381,7 +381,7 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 				continue
 			}
 			addLinkAttributes(&device.Device, link)
-			device.linkIndex = link.Attrs().Index
+			device.linkIndices = append(device.linkIndices, link.Attrs().Index)
 			device.parentIndex = link.Attrs().ParentIndex
 		} else {
 			// Not a PCI device.
@@ -398,7 +398,7 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 				Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
 			}
 			addLinkAttributes(newDevice, link)
-			otherDevices = append(otherDevices, hostDevice{Device: *newDevice, linkIndex: link.Attrs().Index, parentIndex: link.Attrs().ParentIndex})
+			otherDevices = append(otherDevices, hostDevice{Device: *newDevice, linkIndices: []int{link.Attrs().Index}, parentIndex: link.Attrs().ParentIndex})
 		}
 	}
 
