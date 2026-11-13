@@ -112,6 +112,9 @@ type DB struct {
 // that are not part of the ResourceSlice. Only the embedded Device leaves
 // this package.
 type hostDevice struct {
+	// Link indices are local to this discovery snapshot and are not published.
+	linkIndices []int
+	parentIndex int
 	resourceapi.Device
 	// pciClass is the PCI base class, pciBaseClassNetwork for a network
 	// controller. Empty when the device is not a PCI device or ghw did not
@@ -253,6 +256,7 @@ func (db *DB) scan() []resourceapi.Device {
 	// Phase 2: Enrichment — set derived PCI and RDMA attributes uniformly
 	// for all devices, regardless of which discovery path found them.
 	devices = db.addPCIAttributes(devices, pciInfo)
+	inheritParentAttributes(devices)
 	devices = db.addRDMAAttributes(devices)
 	devices = db.addCloudAttributes(devices)
 
@@ -377,6 +381,8 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 				continue
 			}
 			addLinkAttributes(&device.Device, link)
+			device.linkIndices = append(device.linkIndices, link.Attrs().Index)
+			device.parentIndex = link.Attrs().ParentIndex
 		} else {
 			// Not a PCI device.
 
@@ -392,7 +398,7 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 				Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
 			}
 			addLinkAttributes(newDevice, link)
-			otherDevices = append(otherDevices, hostDevice{Device: *newDevice})
+			otherDevices = append(otherDevices, hostDevice{Device: *newDevice, linkIndices: []int{link.Attrs().Index}, parentIndex: link.Attrs().ParentIndex})
 		}
 	}
 
