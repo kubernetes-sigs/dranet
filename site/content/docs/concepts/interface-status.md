@@ -16,6 +16,7 @@ The `conditions` array provides a timeline of the device's state and indicates w
 * **`Ready` (type `NetworkDeviceReady`)**: Indicates that the network device has been successfully moved into the Pod's network namespace and is configured.
 * **`NetworkReady`**: Signifies that the network interface within the Pod has been successfully configured with its IP addresses and routes.
 * **`RDMALinkReady`**: (Applies only when RDMA is used in exclusive mode) Indicates that the associated RDMA link device has been successfully moved into the Pod's network namespace.
+* **`Ready` (reason `VFIODeviceReady`)**: (Applies only to claims with a `vfio` config) Indicates that the PCI function is bound to `vfio-pci` and its VFIO character devices are added to the Pod's containers. No `NetworkReady` condition or `networkData` is reported, because the Pod gets no network interface. See [VFIO](/docs/concepts/vfio/).
 
 Each condition includes:
 * **`lastTransitionTime`**: The timestamp when the condition last changed.
