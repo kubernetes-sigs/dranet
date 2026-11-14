@@ -39,6 +39,7 @@ args: {}
 #      rdma-child-ipv4-cidr: "10.192.0.0/14"
 #  profileProvider: "cloud"
 #  webhookURL: ""
+#  # For example "VFIODriverRebind=true" to give PCI functions through vfio-pci.
 #  featureGates: ""
 
 # kubeletRootDir is the kubelet data directory (its --root-dir). The driver's
