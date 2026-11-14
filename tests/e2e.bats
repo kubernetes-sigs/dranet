@@ -137,6 +137,21 @@ wait_for_ready_pods() {
   kubectl wait --timeout="$timeout" --for=condition=ready pods -l "$selector"
 }
 
+wait_for_claim_prepare_failure() {
+  local claim="$1"
+  local message="$2"
+  local events=""
+  for _ in $(seq 1 30); do
+    events=$(kubectl get events --field-selector "involvedObject.name=$claim,reason=ClaimPrepareFailed" -o jsonpath='{.items[*].message}')
+    if [[ "$events" == *"$message"* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "no ClaimPrepareFailed event for $claim containing \"$message\", got: $events"
+  return 1
+}
+
 # ---- TESTS ----
 
 @test "dummy interface with IP addresses ResourceClaim" {
@@ -888,4 +903,48 @@ EOF
   run kubectl logs dhcp-server
   assert_success
   assert_output --partial "sending ACK"
+}
+
+@test "vfio claim is refused without the feature gate and for a device that is not a PCI function" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  docker exec "$NODE_NAME" bash -c "ip link add dummy0 type dummy"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev dummy0"
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+
+  # The VFIODriverRebind gate is disabled by default.
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_vfio.yaml
+  run wait_for_claim_prepare_failure dummy-interface-vfio "VFIODriverRebind feature gate"
+  assert_success
+  kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_vfio.yaml --ignore-not-found
+  kubectl wait --for delete pod/pod-vfio --timeout=60s
+
+  local ORIGINAL_ARGS
+  ORIGINAL_ARGS=$(kubectl get daemonset dranet -n kube-system -o jsonpath='{.spec.template.spec.containers[0].args}')
+  kubectl patch daemonset dranet -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--feature-gates=VFIODriverRebind=true"}]'
+  kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
+
+  # A dummy interface is not a PCI function, so it gets no dra.net/vfio attribute.
+  sleep 5
+  run kubectl get resourceslices -o jsonpath="{.items[*].spec.devices[?(@.name=='dummy0')].attributes}"
+  assert_success
+  assert_output --partial "dra.net/type"
+  refute_output --partial "dra.net/vfio"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_vfio.yaml
+  run wait_for_claim_prepare_failure dummy-interface-vfio "vfio requires a PCI device"
+  assert_success
+  kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_vfio.yaml --ignore-not-found
+  kubectl wait --for delete pod/pod-vfio --timeout=60s
+
+  # Claims without vfio are not affected by the gate.
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml
+  wait_for_ready_pods app=pod 30s
+  run kubectl exec pod1 -- ip addr show eth99
+  assert_success
+  assert_output --partial "169.254.169.13"
+  kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim.yaml --ignore-not-found
+  kubectl wait --for delete pod/pod1 --timeout=30s
+
+  kubectl patch daemonset dranet -n kube-system --type='json' -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/args\", \"value\": $ORIGINAL_ARGS}]"
+  kubectl rollout status -n kube-system daemonset/dranet --timeout=90s
 }
