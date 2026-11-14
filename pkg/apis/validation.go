@@ -21,6 +21,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"unicode"
@@ -115,6 +116,35 @@ func (c *NetworkConfig) Validate() []error {
 		allErrors = append(allErrors, validateNeighborConfig(c.Neighbors, "neighbors")...)
 	}
 
+	if c.VFIO != nil {
+		allErrors = append(allErrors, validateVFIOConfig(c, "vfio")...)
+	}
+
+	return allErrors
+}
+
+// validateVFIOConfig rejects every other field when vfio is set: the device is
+// handed to the Pod as a PCI function, so there is no network interface to
+// configure and no profile to resolve addresses for.
+func validateVFIOConfig(c *NetworkConfig, fieldPath string) (allErrors []error) {
+	if c.Profile != "" {
+		allErrors = append(allErrors, fmt.Errorf("%s: profile is not supported together with vfio", fieldPath))
+	}
+	if !reflect.ValueOf(c.Interface).IsZero() {
+		allErrors = append(allErrors, fmt.Errorf("%s: interface configuration is not supported together with vfio", fieldPath))
+	}
+	if len(c.Routes) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s: routes are not supported together with vfio", fieldPath))
+	}
+	if len(c.Rules) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s: rules are not supported together with vfio", fieldPath))
+	}
+	if len(c.Neighbors) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s: neighbors are not supported together with vfio", fieldPath))
+	}
+	if c.Ethtool != nil {
+		allErrors = append(allErrors, fmt.Errorf("%s: ethtool configuration is not supported together with vfio", fieldPath))
+	}
 	return allErrors
 }
 

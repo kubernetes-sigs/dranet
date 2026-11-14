@@ -134,6 +134,10 @@ Enabling it only in DRANET publishes list-valued attributes that a control plane
 without the feature enabled cannot handle, causing ResourceSlice operations to
 fail.
 
+With the `VFIODriverRebind` feature gate, DRANET also publishes
+`resource.kubernetes.io/pciBusID` and `dra.net/vfio` for PCI devices, so a claim
+can receive a whole PCI function through VFIO. See [VFIO](/docs/concepts/vfio/).
+
 Once the resources are available, users can create `DeviceClasses`, `ResourceClaims` and/or `ResourceClaimTemplates` to schedule pods.
 
 Define a `DeviceClass` that selects all the network interfaces that are connected to a `GCP Network`

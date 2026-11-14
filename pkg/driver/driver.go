@@ -24,8 +24,12 @@ import (
 	"time"
 
 	"cel.dev/cel-go/cel"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	metadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
+	metadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"sigs.k8s.io/dranet/pkg/apis"
+	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/inventory"
 
 	"github.com/containerd/nri/pkg/api"
@@ -117,6 +121,9 @@ type NetworkDriver struct {
 	kubeletRootDir string
 
 	clock clock.WithTicker // Injectable clock for testing
+
+	// vfioBinder performs the vfio-pci rebind. Nil means sysfs; tests set a fake.
+	vfioBinder pciBinder
 }
 
 type Option func(*NetworkDriver)
@@ -168,6 +175,14 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		kubeletplugin.RegistrarDirectoryPath(filepath.Join(plugin.kubeletRootDir, "plugins_registry")),
 		kubeletplugin.PluginDataDirectoryPath(driverPluginPath),
 		kubeletplugin.HealthService(false),
+	}
+	if features.DefaultFeatureGate.Enabled(features.VFIODriverRebind) {
+		// KubeVirt and other current consumers read v1alpha1; the library
+		// requires the latest version to be listed as well.
+		kubeletOpts = append(kubeletOpts, kubeletplugin.EnableDeviceMetadata(true, []schema.GroupVersion{
+			metadatav1beta1.SchemeGroupVersion,
+			metadatav1alpha1.SchemeGroupVersion,
+		}))
 	}
 	d, err := kubeletplugin.Start(ctx, plugin, kubeletOpts...)
 	if err != nil {
