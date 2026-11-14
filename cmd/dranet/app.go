@@ -241,6 +241,9 @@ func main() {
 	if features.DefaultFeatureGate.Enabled(features.DRAListTypeAttributes) {
 		optsDb = append(optsDb, inventory.WithListNUMAAttributes())
 	}
+	if features.DefaultFeatureGate.Enabled(features.VFIODriverRebind) {
+		optsDb = append(optsDb, inventory.WithVFIOAttributes(inventory.SysfsRoot))
+	}
 
 	if cloudInst != nil {
 		optsDb = append(optsDb, inventory.WithCloudInstance(cloudInst))
