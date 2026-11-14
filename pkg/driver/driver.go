@@ -117,6 +117,9 @@ type NetworkDriver struct {
 	kubeletRootDir string
 
 	clock clock.WithTicker // Injectable clock for testing
+
+	// vfioBinder performs the vfio-pci rebind. Nil means sysfs; tests set a fake.
+	vfioBinder pciBinder
 }
 
 type Option func(*NetworkDriver)
