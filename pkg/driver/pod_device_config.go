@@ -72,6 +72,9 @@ type DeviceConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+
+	// VFIO is set when the device was given to the Pod through VFIO.
+	VFIO *VFIOState `json:"vfio,omitempty"`
 }
 
 // NetworkInterfaceState is the driver-recorded runtime counterpart of an
