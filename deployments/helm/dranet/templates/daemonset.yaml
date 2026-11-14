@@ -132,6 +132,9 @@ spec:
             - name: infiniband
               mountPath: /dev/infiniband
               mountPropagation: HostToContainer
+            - name: vfio
+              mountPath: /dev/vfio
+              mountPropagation: HostToContainer
             - name: bpf-programs
               mountPath: /sys/fs/bpf
               mountPropagation: HostToContainer
@@ -156,6 +159,9 @@ spec:
         - name: infiniband
           hostPath:
             path: /dev/infiniband
+        - name: vfio
+          hostPath:
+            path: /dev/vfio
         - name: bpf-programs
           hostPath:
             path: /sys/fs/bpf
