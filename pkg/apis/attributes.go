@@ -48,4 +48,8 @@ const (
 	AttrVirtual    = AttrPrefix + "/" + "virtual"
 	AttrRDMA       = AttrPrefix + "/" + "rdma"
 	AttrRDMADevice = AttrPrefix + "/" + "rdmaDevice"
+	// Set only with the VFIODriverRebind feature gate. True when the PCI
+	// function can be bound to vfio-pci without affecting other devices or
+	// the node's own connectivity.
+	AttrVFIO = AttrPrefix + "/" + "vfio"
 )

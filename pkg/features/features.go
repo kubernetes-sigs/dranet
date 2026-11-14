@@ -13,6 +13,12 @@ const (
 	// owner: @purvavj
 	// alpha: v1.4.0
 	PersistentResourceSliceAttributes featuregate.Feature = "PersistentResourceSliceAttributes"
+
+	// VFIODriverRebind lets a claim with a `vfio` config receive the PCI
+	// function through VFIO. DRANET binds the function to vfio-pci during
+	// prepare and binds the original driver back on release.
+	// alpha: v1.6.0
+	VFIODriverRebind featuregate.Feature = "VFIODriverRebind"
 )
 
 // DefaultMutableFeatureGate is a mutable feature gate used only for registration
@@ -32,6 +38,10 @@ func init() {
 			PreRelease: featuregate.Alpha,
 		},
 		PersistentResourceSliceAttributes: {
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+		},
+		VFIODriverRebind: {
 			Default:    false,
 			PreRelease: featuregate.Alpha,
 		},
