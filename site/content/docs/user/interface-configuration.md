@@ -26,8 +26,16 @@ type NetworkConfig struct {
 
 	// Ethtool defines hardware offload features and other settings managed by `ethtool`.
 	Ethtool *EthtoolConfig `json:"ethtool,omitempty"`
+
+	// VFIO hands the whole PCI function to the Pod through VFIO instead of
+	// moving its network interface. It cannot be combined with any other field.
+	// Requires the VFIODriverRebind feature gate.
+	VFIO *VFIOConfig `json:"vfio,omitempty"`
 }
 ```
+
+`vfio` selects a different way of giving the device to the Pod, so it is
+described separately in [VFIO Configuration](#vfio-configuration-vfioconfig).
 
 #### Interface Configuration
 
@@ -245,6 +253,36 @@ type EthtoolConfig struct {
 
 * **features** (map[string]bool, optional): A map of ethtool feature names to their desired state (true for on, false for off). For example, {"tcp-segmentation-offload": true, "rx-checksum": true}.
 * **privateFlags** (map[string]bool, optional): A map of device-specific private flag names to their desired state. For example, {"my-custom-flag": true}.
+
+#### VFIO Configuration (VFIOConfig)
+
+The `vfio` block gives the Pod the whole PCI function through VFIO instead of
+its network interface. DRANET binds the function to `vfio-pci` during prepare,
+adds `/dev/vfio/<group>` and `/dev/vfio/vfio` to the containers, and binds the
+original driver back when the claim is released. A process in the Pod, for
+example a VMM or a DPDK application, then drives the function directly.
+
+```go
+// VFIOConfig selects VFIO for the device. It has no fields yet.
+type VFIOConfig struct{}
+```
+
+* `vfio` requires the `VFIODriverRebind` feature gate.
+* It cannot be combined with `interface`, `routes`, `rules`, `neighbors`,
+  `ethtool` or `profile`, because the Pod gets no network interface.
+* The allocated device must have `dra.net/vfio: true`. Select on it in the
+  DeviceClass or the claim.
+
+```yaml
+config:
+- opaque:
+    driver: dra.net
+    parameters:
+      vfio: {}
+```
+
+See [VFIO](/docs/concepts/vfio/) for how the rebind works, which devices
+qualify and how the workload learns the PCI address.
 
 ### Example: Customizing a Network Interface and Routes
 
