@@ -40,7 +40,18 @@ type NetworkConfig struct {
 
 	// Ethtool defines hardware offload features and other settings managed by `ethtool`.
 	Ethtool *EthtoolConfig `json:"ethtool,omitempty"`
+
+	// VFIO hands the whole PCI function to the Pod through VFIO instead of
+	// moving its network interface. DRANET binds the function to vfio-pci
+	// during prepare, injects the VFIO character devices into the
+	// containers and binds the original driver back on release.
+	// It cannot be combined with any other field.
+	// Requires the VFIODriverRebind feature gate.
+	VFIO *VFIOConfig `json:"vfio,omitempty"`
 }
+
+// VFIOConfig selects VFIO for the device. It has no fields yet.
+type VFIOConfig struct{}
 
 // InterfaceConfig represents the configuration for a single network interface.
 // These are fundamental properties, often managed using `ip link` commands.
