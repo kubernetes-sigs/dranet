@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	goruntime "runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -37,11 +39,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/utils/ptr"
 	userns "sigs.k8s.io/dranet/internal/testutils"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
+	"sigs.k8s.io/dranet/pkg/features"
 )
 
 func TestPublishResourcesPrometheusMetrics(t *testing.T) {
@@ -1375,6 +1379,163 @@ func TestUnprepareResourceClaimRequestsRescan(t *testing.T) {
 	if got := netdb.rescanCalls.Load(); got != 1 {
 		t.Errorf("RequestRescan call count = %d, want 1", got)
 	}
+}
+
+func TestUnprepareRepublishesWithoutSnapshot(t *testing.T) {
+	prev := features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes)
+	if err := features.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=true", features.PersistentResourceSliceAttributes)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = features.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=%t", features.PersistentResourceSliceAttributes, prev))
+	})
+
+	liveDev := resourcev1.Device{Name: "pci-0000-00-04-0"}
+	snapDev := resourcev1.Device{
+		Name: "dummy0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			apis.AttrInterfaceName: {StringValue: ptr.To("dummy0")},
+			apis.AttrIPv4:          {StringValue: ptr.To("192.168.78.10")},
+		},
+	}
+	returnedDev := resourcev1.Device{
+		Name: "dummy0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			apis.AttrInterfaceName: {StringValue: ptr.To("dummy0")},
+		},
+	}
+
+	t.Run("drops deleted snapshot synchronously without blocking on rescan", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		fakeDraPlugin := newFakePluginHelper()
+		fakeNetDB := newFakeInventoryDB()
+		store := mustNewPodConfigStore()
+
+		claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
+		if err := store.SetDeviceConfig("pod-uid-1", "dummy0", DeviceConfig{
+			Claim:          claimName,
+			DeviceSnapshot: &snapDev,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		np := &NetworkDriver{
+			draPlugin:      fakeDraPlugin,
+			netdb:          fakeNetDB,
+			nodeName:       "test-node",
+			podConfigStore: store,
+		}
+		go np.PublishResources(ctx)
+
+		// Initial scan while dummy0 is in the pod namespace (not in live).
+		fakeNetDB.resources <- []resourcev1.Device{liveDev}
+		<-fakeDraPlugin.publishCalled
+
+		if got := fakeDraPlugin.publishedDevices("test-node"); len(got) != 2 {
+			t.Fatalf("published devices while pod runs = %v, want 2 (live + snapshot)", got)
+		}
+
+		// Even before the async inventory rescan delivers returnedDev,
+		// UnprepareResourceClaims drops the deleted snapshot synchronously.
+		if _, err := np.UnprepareResourceClaims(ctx, []kubeletplugin.NamespacedObject{
+			{NamespacedName: claimName, UID: "claim-uid-1"},
+		}); err != nil {
+			t.Fatalf("UnprepareResourceClaims failed: %v", err)
+		}
+
+		if diff := cmp.Diff([]resourcev1.Device{liveDev}, fakeDraPlugin.publishedDevices("test-node")); diff != "" {
+			t.Errorf("published devices right after UnprepareResourceClaims (-want +got):\n%s", diff)
+		}
+		if got := fakeNetDB.rescanCalls.Load(); got != 1 {
+			t.Errorf("RequestRescan call count = %d, want 1", got)
+		}
+
+		// Drain any notification from the synchronous republish, then deliver
+		// the post-detach host scan (returnedDev without ipv4).
+		select {
+		case <-fakeDraPlugin.publishCalled:
+		default:
+		}
+		fakeNetDB.resources <- []resourcev1.Device{liveDev, returnedDev}
+		<-fakeDraPlugin.publishCalled
+
+		if diff := cmp.Diff([]resourcev1.Device{returnedDev, liveDev}, fakeDraPlugin.publishedDevices("test-node")); diff != "" {
+			t.Errorf("published devices after async rescan (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("serializes against an in-flight PublishResources pass", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		fakeDraPlugin := newFakePluginHelper()
+		fakeNetDB := newFakeInventoryDB()
+		store := mustNewPodConfigStore()
+
+		claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
+		if err := store.SetDeviceConfig("pod-uid-1", "dummy0", DeviceConfig{
+			Claim:          claimName,
+			DeviceSnapshot: &snapDev,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		np := &NetworkDriver{
+			draPlugin:      fakeDraPlugin,
+			netdb:          fakeNetDB,
+			nodeName:       "test-node",
+			podConfigStore: store,
+		}
+		go np.PublishResources(ctx)
+
+		fakeNetDB.resources <- []resourcev1.Device{liveDev}
+		<-fakeDraPlugin.publishCalled
+
+		// Pause an unrelated PublishResources pass that started while the
+		// snapshot still existed in store, and start UnprepareResourceClaims
+		// while that pass holds publishMu. UnprepareResourceClaims must wait
+		// for publishMu and overwrite the stale pass before returning.
+		inPublish := make(chan struct{})
+		releasePublish := make(chan struct{})
+		var hookOnce sync.Once
+		fakeDraPlugin.onPublish = func(resourceslice.DriverResources) {
+			hookOnce.Do(func() {
+				close(inPublish)
+				<-releasePublish
+			})
+		}
+
+		fakeNetDB.resources <- []resourcev1.Device{liveDev, returnedDev}
+		<-inPublish
+
+		unprepareDone := make(chan error, 1)
+		go func() {
+			_, err := np.UnprepareResourceClaims(ctx, []kubeletplugin.NamespacedObject{
+				{NamespacedName: claimName, UID: "claim-uid-1"},
+			})
+			unprepareDone <- err
+		}()
+
+		// Wait until UnprepareResourceClaims has deleted the claim and is waiting
+		// on publishMu, then release the stale in-flight publish.
+		for {
+			if _, ok := store.GetPodConfig("pod-uid-1"); !ok {
+				break
+			}
+			goruntime.Gosched()
+		}
+		close(releasePublish)
+		if err := <-unprepareDone; err != nil {
+			t.Fatalf("UnprepareResourceClaims failed: %v", err)
+		}
+
+		// Once UnprepareResourceClaims returns, dummy0 must NOT carry stale ipv4.
+		if diff := cmp.Diff([]resourcev1.Device{returnedDev, liveDev}, fakeDraPlugin.publishedDevices("test-node")); diff != "" {
+			t.Errorf("published devices after concurrent UnprepareResourceClaims (-want +got):\n%s", diff)
+		}
+	})
 }
 
 // TODO: To further improve test coverage, consider constructing and mounting fake
