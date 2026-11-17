@@ -549,3 +549,168 @@ func TestPodConfigStore_GetInUseSubinterfaceIPs(t *testing.T) {
 		})
 	}
 }
+
+// countingCheckpointer records which devices were written to durable storage.
+type countingCheckpointer struct {
+	mu     sync.Mutex
+	stored []string
+}
+
+func (c *countingCheckpointer) GetOrCreate() (map[types.UID]map[string]DeviceConfig, error) {
+	return nil, nil
+}
+
+func (c *countingCheckpointer) Store(_ types.UID, deviceName string, _ DeviceConfig) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stored = append(c.stored, deviceName)
+	return nil
+}
+
+func (c *countingCheckpointer) DeletePod(types.UID) error { return nil }
+func (c *countingCheckpointer) Close() error              { return nil }
+
+func vrfDeviceConfig(vrfName string, table *int) DeviceConfig {
+	return DeviceConfig{
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{VRF: &apis.VRFConfig{Name: vrfName, Table: table}},
+		},
+	}
+}
+
+func TestSetDeviceConfigIfCompatible(t *testing.T) {
+	derived := apis.TableIDForName("blue")
+	tests := []struct {
+		name    string
+		first   DeviceConfig
+		second  DeviceConfig
+		samePod bool
+		wantErr bool
+	}{
+		{
+			name:    "same vrf and table in the same pod",
+			first:   vrfDeviceConfig("blue", ptr.To(100)),
+			second:  vrfDeviceConfig("blue", ptr.To(100)),
+			samePod: true,
+		},
+		{
+			name:    "same vrf with derived tables in the same pod",
+			first:   vrfDeviceConfig("blue", nil),
+			second:  vrfDeviceConfig("blue", ptr.To(derived)),
+			samePod: true,
+		},
+		{
+			name:    "same vrf with different tables in the same pod",
+			first:   vrfDeviceConfig("blue", ptr.To(100)),
+			second:  vrfDeviceConfig("blue", ptr.To(200)),
+			samePod: true,
+			wantErr: true,
+		},
+		{
+			name:    "derived table conflicts with explicit one in the same pod",
+			first:   vrfDeviceConfig("blue", nil),
+			second:  vrfDeviceConfig("blue", ptr.To(derived+1)),
+			samePod: true,
+			wantErr: true,
+		},
+		{
+			name:   "same vrf with different tables in different pods",
+			first:  vrfDeviceConfig("blue", ptr.To(100)),
+			second: vrfDeviceConfig("blue", ptr.To(200)),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cp := &countingCheckpointer{}
+			store, err := newPodConfigStoreWithCheckpointer(cp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondPod := types.UID("pod-2")
+			if tt.samePod {
+				secondPod = "pod-1"
+			}
+			if err := store.SetDeviceConfigIfCompatible("pod-1", "eth1", tt.first); err != nil {
+				t.Fatalf("first SetDeviceConfigIfCompatible() = %v", err)
+			}
+			err = store.SetDeviceConfigIfCompatible(secondPod, "eth2", tt.second)
+			_, stored := store.GetDeviceConfig(secondPod, "eth2")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("second SetDeviceConfigIfCompatible() succeeded, want conflict error")
+				}
+				if stored {
+					t.Error("rejected device config was stored in memory")
+				}
+				if !reflect.DeepEqual(cp.stored, []string{"eth1"}) {
+					t.Errorf("checkpointed devices = %v, want only eth1", cp.stored)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("second SetDeviceConfigIfCompatible() = %v", err)
+			}
+			if !stored {
+				t.Error("accepted device config was not stored")
+			}
+		})
+	}
+}
+
+// Re-storing a device replaces its config, so the old one must not count as a
+// conflict with the new one.
+func TestSetDeviceConfigIfCompatibleReplacesSameDevice(t *testing.T) {
+	store := mustNewPodConfigStore()
+	if err := store.SetDeviceConfigIfCompatible("pod-1", "eth1", vrfDeviceConfig("blue", ptr.To(100))); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetDeviceConfigIfCompatible("pod-1", "eth1", vrfDeviceConfig("blue", ptr.To(200))); err != nil {
+		t.Fatalf("replacing the config of the same device failed: %v", err)
+	}
+}
+
+// SetDeviceConfig keeps its unconditional semantics.
+func TestSetDeviceConfigDoesNotCheckConflicts(t *testing.T) {
+	store := mustNewPodConfigStore()
+	for dev, table := range map[string]int{"eth1": 100, "eth2": 200} {
+		if err := store.SetDeviceConfig("pod-1", dev, vrfDeviceConfig("blue", ptr.To(table))); err != nil {
+			t.Fatalf("SetDeviceConfig(%s) = %v", dev, err)
+		}
+	}
+}
+
+// Concurrent prepares of devices of the same pod that disagree on the table of
+// a VRF must not all succeed: the check and the write are one critical section.
+// With a separate read (GetPodConfig) followed by SetDeviceConfig, all of them
+// can pass the check before any is stored.
+func TestSetDeviceConfigIfCompatibleConcurrent(t *testing.T) {
+	const devices = 32
+	for round := 0; round < 20; round++ {
+		store := mustNewPodConfigStore()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		accepted := 0
+		for i := 0; i < devices; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if err := store.SetDeviceConfigIfCompatible("pod-1", fmt.Sprintf("eth%d", i), vrfDeviceConfig("blue", ptr.To(100+i))); err == nil {
+					mu.Lock()
+					accepted++
+					mu.Unlock()
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if accepted != 1 {
+			t.Fatalf("round %d: %d devices with different tables for the same vrf were accepted, want exactly 1", round, accepted)
+		}
+		podCfg, _ := store.GetPodConfig("pod-1")
+		if len(podCfg.DeviceConfigs) != 1 {
+			t.Fatalf("round %d: %d device configs stored, want 1", round, len(podCfg.DeviceConfigs))
+		}
+	}
+}

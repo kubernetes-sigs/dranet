@@ -282,6 +282,14 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 	}()
 
+	// Fail early, before any slow or side-effecting step such as DHCP, if the final
+	// configuration conflicts with the other devices already prepared for this Pod.
+	// This read is not atomic with the write below, so the store repeats the check
+	// under its lock when the device is persisted.
+	if err := np.validatePodDeviceConfig(podUID, result.Device, &netconf); err != nil {
+		return err
+	}
+
 	klog.V(4).Infof("PrepareResourceClaim %s/%s final Configuration %#v", claim.Namespace, claim.Name, netconf)
 	// Query the local discovery database (netdb) for the card's clean attributes
 	var deviceSnapshot *resourceapi.Device
@@ -322,7 +330,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 			return fmt.Errorf("failed to get RDMA device name for IB-only device %s: %v", result.Device, err)
 		}
 		deviceCfg.RDMADevice = buildRDMAConfig(rdmaDevName)
-		if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
+		if err := np.podConfigStore.SetDeviceConfigIfCompatible(podUID, result.Device, deviceCfg); err != nil {
 			return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 		}
 		deviceCommitted = true
@@ -508,11 +516,30 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 	}
 
-	if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
+	if err := np.podConfigStore.SetDeviceConfigIfCompatible(podUID, result.Device, deviceCfg); err != nil {
 		return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 	}
 	deviceCommitted = true
 	klog.V(4).Infof("Claim Resources for pod %s : %#v", podUID, deviceCfg)
+	return nil
+}
+
+// validatePodDeviceConfig checks that conf, the final merged and defaulted
+// configuration of device, does not conflict with the devices already stored
+// for the Pod. It is an early, best effort check; SetDeviceConfigIfCompatible
+// is the authoritative one.
+func (np *NetworkDriver) validatePodDeviceConfig(podUID types.UID, device string, conf *apis.NetworkConfig) error {
+	configs := map[string]*apis.NetworkConfig{device: conf}
+	if podCfg, ok := np.podConfigStore.GetPodConfig(podUID); ok {
+		for name, existing := range podCfg.DeviceConfigs {
+			if name != device {
+				configs[name] = &existing.NetworkInterfaceConfigInPod
+			}
+		}
+	}
+	if errs := apis.ValidateConfigs(configs); len(errs) > 0 {
+		return fmt.Errorf("device %s conflicts with other devices of pod %s: %w", device, podUID, errors.Join(errs...))
+	}
 	return nil
 }
 

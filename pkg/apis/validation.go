@@ -18,6 +18,7 @@ package apis
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/netip"
@@ -115,6 +116,50 @@ func (c *NetworkConfig) Validate() []error {
 		allErrors = append(allErrors, validateNeighborConfig(c.Neighbors, "neighbors")...)
 	}
 
+	return allErrors
+}
+
+// ValidateConfigs checks the independent device configurations of a single Pod
+// against each other. ValidateConfig and Validate only see one device at a time,
+// so conflicts that exist only between devices can go unnoticed until the
+// configurations are applied in the Pod's network namespace.
+//
+// configs maps a device name to the final merged NetworkConfig of that device,
+// as produced for the Pod. It does not modify the configs: defaults, such as
+// the routing table derived from a VRF name, are applied to copies. Only
+// configurations of the same Pod must be passed together; configurations of
+// different Pods live in different network namespaces and cannot conflict.
+//
+// Currently it rejects a VRF name that resolves to different routing tables on
+// different devices, because all devices of a Pod share one VRF device per name.
+func ValidateConfigs(configs map[string]*NetworkConfig) []error {
+	type vrfTable struct {
+		device string
+		table  int
+	}
+	var allErrors []error
+	seen := map[string]vrfTable{}
+	// Sort the devices so the reported conflicts are deterministic.
+	for _, device := range slices.Sorted(maps.Keys(configs)) {
+		cfg := configs[device]
+		if cfg == nil || cfg.Interface.VRF == nil || cfg.Interface.VRF.Name == "" {
+			continue
+		}
+		vrf := *cfg.Interface.VRF // copy so the caller's config is not defaulted in place
+		vrf.Default()
+		if vrf.Table == nil {
+			continue
+		}
+		first, ok := seen[vrf.Name]
+		if !ok {
+			seen[vrf.Name] = vrfTable{device: device, table: *vrf.Table}
+			continue
+		}
+		if first.table != *vrf.Table {
+			allErrors = append(allErrors, fmt.Errorf("vrf %q resolves to routing table %d for device %s but to table %d for device %s: devices of the same Pod must use the same table for a VRF",
+				vrf.Name, first.table, first.device, *vrf.Table, device))
+		}
+	}
 	return allErrors
 }
 
