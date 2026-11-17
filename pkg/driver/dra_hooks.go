@@ -857,8 +857,10 @@ func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
 	// and the scan reports every attribute it has. An attribute missing from
 	// the live device, such as dra.net/ipv4 on an interface without a global
 	// address, is absent on the host right now, so filling it from the
-	// snapshot taken at prepare time would publish stale data.
-	if _, ok := live.Attributes[apis.AttrInterfaceName]; ok {
+	// snapshot taken at prepare time would publish stale data. Treat the
+	// netdev as present only when dra.net/ifName is set to a non-empty
+	// value; otherwise keep merging the snapshot.
+	if attr, ok := live.Attributes[apis.AttrInterfaceName]; ok && attr.StringValue != nil && *attr.StringValue != "" {
 		return merged
 	}
 

@@ -1159,6 +1159,88 @@ func TestMergeDevices(t *testing.T) {
 			}},
 		},
 		{
+			name: "Snapshot merged when live ifName is empty",
+			live: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr(""),
+					resourcev1.QualifiedName(apis.AttrNUMANode):      stringAttr("1"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
+				},
+			}},
+			snapshot: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-snap"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
+					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("1G"),
+					"other-capacity":    qtyCap("50"),
+				},
+			}},
+			expected: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr(""),
+					resourcev1.QualifiedName(apis.AttrNUMANode):      stringAttr("1"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
+					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
+					"other-capacity":    qtyCap("50"),
+				},
+			}},
+		},
+		{
+			name: "Snapshot merged when live ifName has a nil StringValue",
+			live: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): {},
+					resourcev1.QualifiedName(apis.AttrNUMANode):      stringAttr("1"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
+				},
+			}},
+			snapshot: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): stringAttr("eth-snap"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
+					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("1G"),
+					"other-capacity":    qtyCap("50"),
+				},
+			}},
+			expected: []resourcev1.Device{{
+				Name: "0000:c0:14.0",
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(apis.AttrPCIAddress):    stringAttr("0000:c0:14.0"),
+					resourcev1.QualifiedName(apis.AttrInterfaceName): {},
+					resourcev1.QualifiedName(apis.AttrNUMANode):      stringAttr("1"),
+					resourcev1.QualifiedName(apis.AttrMTU):           stringAttr("1500"),
+					resourcev1.QualifiedName(apis.AttrMac):           stringAttr("aa:bb:cc:dd:ee:ff"),
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"network-bandwidth": qtyCap("10G"),
+					"other-capacity":    qtyCap("50"),
+				},
+			}},
+		},
+		{
 			name: "Snapshot addresses published by a live device are dropped per address",
 			live: []resourcev1.Device{
 				pciDev,
