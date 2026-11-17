@@ -17,6 +17,8 @@ import (
 
 // fakeDraPlugin is a mock implementation of the pluginHelper interface for testing.
 type fakePluginHelper struct {
+	lastResources      atomic.Pointer[resourceslice.DriverResources]
+	onPublish          func(resourceslice.DriverResources)
 	publishErr         error
 	publishCalled      chan struct{}
 	registrationStatus *registerapi.RegistrationStatus
@@ -29,11 +31,30 @@ func newFakePluginHelper() *fakePluginHelper {
 	}
 }
 
-func (m *fakePluginHelper) PublishResources(_ context.Context, _ resourceslice.DriverResources) error {
+func (m *fakePluginHelper) PublishResources(_ context.Context, res resourceslice.DriverResources) error {
+	if m.onPublish != nil {
+		m.onPublish(res)
+	}
+	m.lastResources.Store(&res)
 	if m.publishCalled != nil {
-		m.publishCalled <- struct{}{}
+		select {
+		case m.publishCalled <- struct{}{}:
+		default:
+		}
 	}
 	return m.publishErr
+}
+
+func (m *fakePluginHelper) publishedDevices(node string) []resourcev1.Device {
+	res := m.lastResources.Load()
+	if res == nil {
+		return nil
+	}
+	pool, ok := res.Pools[node]
+	if !ok || len(pool.Slices) == 0 {
+		return nil
+	}
+	return pool.Slices[0].Devices
 }
 
 func (m *fakePluginHelper) Stop() {

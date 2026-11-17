@@ -23,8 +23,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -37,11 +39,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/utils/ptr"
 	userns "sigs.k8s.io/dranet/internal/testutils"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
+	"sigs.k8s.io/dranet/pkg/features"
 )
 
 func TestPublishResourcesPrometheusMetrics(t *testing.T) {
@@ -1375,6 +1379,188 @@ func TestUnprepareResourceClaimRequestsRescan(t *testing.T) {
 	if got := netdb.rescanCalls.Load(); got != 1 {
 		t.Errorf("RequestRescan call count = %d, want 1", got)
 	}
+}
+
+func TestUnprepareRepublishesWithoutSnapshot(t *testing.T) {
+	prev := features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes)
+	if err := features.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=true", features.PersistentResourceSliceAttributes)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = features.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=%t", features.PersistentResourceSliceAttributes, prev))
+	})
+
+	liveDev := resourcev1.Device{Name: "pci-0000-00-04-0"}
+	snapDev := resourcev1.Device{
+		Name: "dummy0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			apis.AttrInterfaceName: {StringValue: ptr.To("dummy0")},
+			apis.AttrIPv4:          {StringValue: ptr.To("192.168.78.10")},
+		},
+	}
+	returnedDev := resourcev1.Device{
+		Name: "dummy0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			apis.AttrInterfaceName: {StringValue: ptr.To("dummy0")},
+		},
+	}
+
+	// waitPublished waits until the devices that the driver published are want.
+	// UnprepareResourceClaims does not wait for the publication.
+	waitPublished := func(t *testing.T, fakeDraPlugin *fakePluginHelper, want []resourcev1.Device) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for cmp.Diff(want, fakeDraPlugin.publishedDevices("test-node")) != "" && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if diff := cmp.Diff(want, fakeDraPlugin.publishedDevices("test-node")); diff != "" {
+			t.Fatalf("published devices (-want +got):\n%s", diff)
+		}
+	}
+
+	t.Run("drops deleted snapshot without waiting for a rescan", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		fakeDraPlugin := newFakePluginHelper()
+		fakeNetDB := newFakeInventoryDB()
+		store := mustNewPodConfigStore()
+
+		claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
+		if err := store.SetDeviceConfig("pod-uid-1", "dummy0", DeviceConfig{
+			Claim:          claimName,
+			DeviceSnapshot: &snapDev,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		np := &NetworkDriver{
+			draPlugin:      fakeDraPlugin,
+			netdb:          fakeNetDB,
+			nodeName:       "test-node",
+			podConfigStore: store,
+			republishCh:    make(chan struct{}, 1),
+		}
+		go np.PublishResources(ctx)
+
+		// Initial scan while dummy0 is in the pod namespace (not in live).
+		fakeNetDB.resources <- []resourcev1.Device{liveDev}
+		waitPublished(t, fakeDraPlugin, []resourcev1.Device{snapDev, liveDev})
+
+		// The inventory rescan did not deliver returnedDev yet, but
+		// UnprepareResourceClaims makes PublishResources drop the snapshot.
+		if _, err := np.UnprepareResourceClaims(ctx, []kubeletplugin.NamespacedObject{
+			{NamespacedName: claimName, UID: "claim-uid-1"},
+		}); err != nil {
+			t.Fatalf("UnprepareResourceClaims failed: %v", err)
+		}
+		waitPublished(t, fakeDraPlugin, []resourcev1.Device{liveDev})
+		if got := fakeNetDB.rescanCalls.Load(); got != 1 {
+			t.Errorf("RequestRescan call count = %d, want 1", got)
+		}
+
+		// Deliver the post-detach host scan (returnedDev without ipv4).
+		fakeNetDB.resources <- []resourcev1.Device{liveDev, returnedDev}
+		waitPublished(t, fakeDraPlugin, []resourcev1.Device{returnedDev, liveDev})
+	})
+
+	t.Run("does not wait for an in-flight PublishResources pass and replaces it", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		fakeDraPlugin := newFakePluginHelper()
+		fakeNetDB := newFakeInventoryDB()
+		store := mustNewPodConfigStore()
+
+		claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
+		if err := store.SetDeviceConfig("pod-uid-1", "dummy0", DeviceConfig{
+			Claim:          claimName,
+			DeviceSnapshot: &snapDev,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		np := &NetworkDriver{
+			draPlugin:      fakeDraPlugin,
+			netdb:          fakeNetDB,
+			nodeName:       "test-node",
+			podConfigStore: store,
+			republishCh:    make(chan struct{}, 1),
+		}
+
+		// Pause the first PublishResources pass. It read the snapshot while it
+		// still existed in the store, so what it publishes becomes stale.
+		inPublish := make(chan struct{})
+		releasePublish := make(chan struct{})
+		var hookOnce sync.Once
+		var inFlight []resourcev1.Device
+		fakeDraPlugin.onPublish = func(res resourceslice.DriverResources) {
+			hookOnce.Do(func() {
+				inFlight = res.Pools["test-node"].Slices[0].Devices
+				close(inPublish)
+				<-releasePublish
+			})
+		}
+		go np.PublishResources(ctx)
+
+		fakeNetDB.resources <- []resourcev1.Device{liveDev}
+		<-inPublish
+		if diff := cmp.Diff([]resourcev1.Device{snapDev, liveDev}, inFlight); diff != "" {
+			t.Fatalf("in-flight pass must publish the snapshot (-want +got):\n%s", diff)
+		}
+
+		// UnprepareResourceClaims returns while that pass is still in flight.
+		unprepareDone := make(chan error, 1)
+		go func() {
+			_, err := np.UnprepareResourceClaims(ctx, []kubeletplugin.NamespacedObject{
+				{NamespacedName: claimName, UID: "claim-uid-1"},
+			})
+			unprepareDone <- err
+		}()
+		select {
+		case err := <-unprepareDone:
+			if err != nil {
+				t.Fatalf("UnprepareResourceClaims failed: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("UnprepareResourceClaims waited for the in-flight PublishResources pass")
+		}
+
+		// The in-flight pass publishes the stale snapshot. The pass that
+		// UnprepareResourceClaims requested must replace it.
+		close(releasePublish)
+		waitPublished(t, fakeDraPlugin, []resourcev1.Device{liveDev})
+	})
+
+	t.Run("does not publish before the first inventory", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		fakeDraPlugin := newFakePluginHelper()
+		fakeNetDB := newFakeInventoryDB()
+		np := &NetworkDriver{
+			draPlugin:      fakeDraPlugin,
+			netdb:          fakeNetDB,
+			nodeName:       "test-node",
+			podConfigStore: mustNewPodConfigStore(),
+			republishCh:    make(chan struct{}, 1),
+		}
+		publications := make(chan struct{}, 2)
+		fakeDraPlugin.onPublish = func(resourceslice.DriverResources) { publications <- struct{}{} }
+		go np.PublishResources(ctx)
+
+		// Without an inventory there is nothing correct to publish: the
+		// ResourceSlice would lose the devices of the node until the first scan.
+		np.requestRepublish()
+		for deadline := time.Now().Add(5 * time.Second); len(np.republishCh) > 0 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+		fakeNetDB.resources <- []resourcev1.Device{liveDev}
+		waitPublished(t, fakeDraPlugin, []resourcev1.Device{liveDev})
+		if got := len(publications); got != 1 {
+			t.Errorf("publications = %d, want 1: the request before the first inventory must not publish", got)
+		}
+	})
 }
 
 // TODO: To further improve test coverage, consider constructing and mounting fake

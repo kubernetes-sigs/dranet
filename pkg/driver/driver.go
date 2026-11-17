@@ -112,6 +112,10 @@ type NetworkDriver struct {
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
 
+	// republishCh carries the requests to PublishResources to publish again
+	// from the last inventory. See requestRepublish.
+	republishCh chan struct{}
+
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.
 	kubeletRootDir string
@@ -145,6 +149,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		clock:          clock.RealClock{},
 		eventRecorder:  eventRecorder,
 		podConfigStore: podConfigStore,
+		republishCh:    make(chan struct{}, 1),
 	}
 
 	for _, o := range opts {
