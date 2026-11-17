@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/dranet/pkg/features"
 )
 
 // TestSmoke covers the basic lifecycle: a link on the node is published, a
@@ -137,15 +138,22 @@ func TestSmoke(t *testing.T) {
 		t.Errorf("claim %s networkData.ips = %v, want it to contain %s", claim.Name, ips, cidr)
 	}
 
-	// A virtual link is not visible on the node while a pod has it, so the
-	// driver must stop publishing it; otherwise a second pod could be
-	// scheduled onto a device the node cannot hand out.
-	err = wait.PollUntilContextTimeout(ctx, pollInterval, sliceTimeout, true, func(ctx context.Context) (bool, error) {
-		_, ok, err := deviceByIfName(ctx, link)
-		return !ok, err
-	})
+	// Without PersistentResourceSliceAttributes, a virtual link moved into a
+	// pod namespace is absent from the host scan and disappears from the
+	// ResourceSlice. With the gate enabled, the driver intentionally keeps
+	// publishing the allocated device from its prepare-time snapshot.
+	persistentSlice, err := featureEnabled(tc.dranetArgs, features.PersistentResourceSliceAttributes)
 	if err != nil {
-		t.Errorf("device for %s is still published while pod %s has the link: %v", link, pod.Name, err)
+		t.Fatal(err)
+	}
+	if !persistentSlice {
+		err = wait.PollUntilContextTimeout(ctx, pollInterval, sliceTimeout, true, func(ctx context.Context) (bool, error) {
+			_, ok, err := deviceByIfName(ctx, link)
+			return !ok, err
+		})
+		if err != nil {
+			t.Errorf("device for %s is still published while pod %s has the link: %v", link, pod.Name, err)
+		}
 	}
 
 	if err := pods.Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
@@ -179,17 +187,21 @@ func TestSmoke(t *testing.T) {
 	}
 
 	// The kernel drops the address when the link changes namespace, so the
-	// republished device must not carry one.
-	var dev resourceapi.Device
+	// republished device must not carry one. Poll until both the device is
+	// present and any snapshot dra.net/ipv4 from the pod's claim is cleared.
+	var lastIP string
 	err = wait.PollUntilContextTimeout(ctx, pollInterval, sliceTimeout, true, func(ctx context.Context) (bool, error) {
-		var ok bool
-		dev, ok, err = deviceByIfName(ctx, link)
-		return ok, err
+		dev, ok, err := deviceByIfName(ctx, link)
+		if err != nil || !ok {
+			return false, err
+		}
+		if ip, hasIP := dev.Attributes["dra.net/ipv4"]; hasIP && ip.StringValue != nil {
+			lastIP = *ip.StringValue
+			return false, nil
+		}
+		return true, nil
 	})
 	if err != nil {
-		t.Fatalf("device for %s was not published again after the pod was removed: %v", link, err)
-	}
-	if ip, ok := dev.Attributes["dra.net/ipv4"]; ok {
-		t.Errorf("device %s advertises dra.net/ipv4=%v after the link returned without an address", dev.Name, *ip.StringValue)
+		t.Fatalf("device for %s did not converge to published without dra.net/ipv4 after pod removal (last ipv4=%q): %v", link, lastIP, err)
 	}
 }

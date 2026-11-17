@@ -58,10 +58,8 @@ const rescheduleBound = 10 * time.Second
 //
 // The scenario runs with PersistentResourceSliceAttributes on and off: the
 // snapshot merge changes what the slice advertises in the window between
-// StopPodSandbox and unprepare. That window is about as long as one
-// inventory scan on a kind node, so with the gate on the stale dra.net/ipv4
-// path is hit on some runs and not on others; the slow reschedule after the
-// address restore is hit on every run.
+// StopPodSandbox (when the link returns to the host without its address) and
+// NodeUnprepareResources (when the claim snapshot is deleted).
 func TestFastReschedule(t *testing.T) {
 	for _, gate := range []string{"false", "true"} {
 		t.Run("PersistentResourceSliceAttributes="+gate, func(t *testing.T) {

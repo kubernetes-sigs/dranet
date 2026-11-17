@@ -19,12 +19,13 @@ limitations under the License.
 package integration
 
 import (
-	"bufio"
 	"context"
+	"debug/buildinfo"
 	"fmt"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
@@ -40,21 +41,34 @@ import (
 // at most 128, hence 3 claims of 32.
 const slowPodDevices = 96
 
+// minNRIVersion is the first github.com/containerd/nri release with
+// FailurePolicy support (containerd/nri#329).
+const minNRIVersion = "v0.12.4"
+
 // TestNRITimeout covers the NRI failure policy from #401. dranet registers
 // with FailRequest and KeepConnected, so when RunPodSandbox exceeds the
 // runtime's plugin_request_timeout the pod must fail to start instead of
 // starting without its network interfaces, and dranet must stay registered
 // so later pods are served.
 //
-// The policy needs containerd with NRI v0.12.4 or newer. On an older
-// runtime the request proceeds without dranet, the pod starts with no
-// interfaces and the plugin is dropped; this test fails there.
+// The policy needs containerd built with NRI v0.12.4 or newer. On an older
+// runtime the option is ignored, so the test skips until the node image
+// carries a runtime with NRI >= v0.12.4.
 func TestNRITimeout(t *testing.T) {
+	checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	disconnectsBefore, err := nriDisconnects(checkCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireContainerdNRIVersion(t, checkCtx, minNRIVersion)
+
 	e := newEnv(t)
 	ctx := e.ctx
 	prefix := e.addDummyLinks(slowPodDevices)
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, sliceTimeout, true, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, pollInterval, sliceTimeout, true, func(ctx context.Context) (bool, error) {
 		slices, err := tc.nodeSlices(ctx)
 		if err != nil {
 			return false, err
@@ -93,11 +107,6 @@ func TestNRITimeout(t *testing.T) {
 		},
 	}
 	if _, err := tc.client.ResourceV1().ResourceClaimTemplates(e.ns).Create(ctx, tmpl, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-
-	disconnectsBefore, err := nriDisconnects(ctx)
-	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -224,21 +233,45 @@ func TestNRITimeout(t *testing.T) {
 	}
 }
 
+// requireContainerdNRIVersion skips t when containerd on the kind node was
+// built with a github.com/containerd/nri version older than minVersion.
+func requireContainerdNRIVersion(t *testing.T, ctx context.Context, minVersion string) {
+	t.Helper()
+
+	out, err := tc.nodeExec(ctx, "sh", "-c", "command -v containerd")
+	if err != nil {
+		t.Fatalf("locate containerd on %s: %v", tc.node, err)
+	}
+	remoteBin := strings.TrimSpace(out)
+	if remoteBin == "" {
+		t.Fatalf("empty containerd path on %s", tc.node)
+	}
+
+	localBin := filepath.Join(t.TempDir(), "containerd")
+	if _, err := run(ctx, "docker", "cp", "-L", tc.node+":"+remoteBin, localBin); err != nil {
+		t.Fatalf("copy containerd from %s: %v", tc.node, err)
+	}
+
+	info, err := buildinfo.ReadFile(localBin)
+	if err != nil {
+		t.Fatalf("read buildinfo of %s:%s: %v", tc.node, remoteBin, err)
+	}
+	nriVer, ok, err := checkNRIVersion(info, minVersion)
+	if err != nil {
+		t.Fatalf("check NRI version of %s:%s: %v", tc.node, remoteBin, err)
+	}
+	if !ok {
+		t.Skipf("containerd on %s uses github.com/containerd/nri %s; FailurePolicy requires >= %s", tc.node, nriVer, minVersion)
+	}
+}
+
 // nriDisconnects scrapes dranet's metrics inside the node and returns how
 // many times the runtime closed the NRI connection.
 func nriDisconnects(ctx context.Context) (int, error) {
 	const metric = "dranet_driver_nri_plugin_disconnects_total"
-	out, err := tc.nodeExec(ctx, "bash", "-c",
-		`exec 3<>/dev/tcp/127.0.0.1/9177; printf 'GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3; cat <&3`)
+	out, err := tc.nodeExec(ctx, "curl", "-fsS", "http://127.0.0.1:9177/metrics")
 	if err != nil {
 		return 0, fmt.Errorf("scrape dranet metrics: %w", err)
 	}
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		if name, value, ok := strings.Cut(sc.Text(), " "); ok && name == metric {
-			n, err := strconv.ParseFloat(value, 64)
-			return int(n), err
-		}
-	}
-	return 0, fmt.Errorf("metric %s not found", metric)
+	return parseMetricInt(out, metric)
 }
