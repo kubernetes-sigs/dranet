@@ -76,6 +76,10 @@ type DB struct {
 	// potential problem or break some use cases.
 	gwInterfaces sets.Set[string]
 
+	// uplinkInterfaces, when set, names the host's uplinks explicitly instead of
+	// detecting them from the default routes.
+	uplinkInterfaces sets.Set[string]
+
 	mu sync.RWMutex
 	// deviceStore is an in-memory cache of the available devices on the node.
 	// It is keyed by the normalized PCI address of the device. The value is a
@@ -143,6 +147,18 @@ func WithRateLimiter(limiter *rate.Limiter) Option {
 func WithMaxPollInterval(d time.Duration) Option {
 	return func(db *DB) {
 		db.maxPollInterval = d
+	}
+}
+
+// WithUplinkInterfaces names the host's uplink interfaces explicitly, instead of
+// detecting them from the default routes. Those interfaces and their children
+// are kept out of the inventory; every other interface stays eligible even if it
+// carries a default route of its own.
+func WithUplinkInterfaces(names []string) Option {
+	return func(o *DB) {
+		if len(names) > 0 {
+			o.uplinkInterfaces = sets.New(names...)
+		}
 	}
 }
 
@@ -223,7 +239,7 @@ func (db *DB) Run(ctx context.Context) error {
 		addrChannel = nil
 	}
 
-	db.gwInterfaces = getExcludedUplinkInterfaces()
+	db.gwInterfaces = getExcludedUplinkInterfaces(db.uplinkInterfaces)
 	klog.V(2).Infof("Excluded uplink interfaces and children: %v", db.gwInterfaces.UnsortedList())
 
 	for {
