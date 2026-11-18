@@ -168,6 +168,57 @@ func getExcludedUplinkInterfaces() sets.Set[string] {
 	return excluded
 }
 
+// resolveParentPCIAddress walks the netlink ParentIndex (IFLA_LINK) chain for
+// stacked virtual interfaces (macvlan, ipvlan, and intermediate 802.1Q vlans)
+// to return the PCI BDF of the underlying physical NIC.
+//
+// Linux RTNetlink exposes three distinct interface indices on netlink.LinkAttrs:
+//   - Index (ifi_index): this interface's own kernel ifindex.
+//   - MasterIndex (IFLA_MASTER): the upper aggregating device (bridge, bond,
+//     vrf) that owns port forwarding state; walked by getExcludedUplinkInterfaces.
+//   - ParentIndex (IFLA_LINK, shown as <name>@<lower> in iproute2): for stacked
+//     sub-interfaces (*netlink.Macvlan, *netlink.IPVlan, *netlink.Vlan), the
+//     ifindex of the lower link whose hardware datapath they transmit through.
+//
+// Two IFLA_LINK subtleties require care:
+//  1. Other link kinds reuse IFLA_LINK for non-parent relationships (for
+//     example, *netlink.Veth stores its peer ifindex, forming a 2-cycle when
+//     both peers share a netns), so only stacked sub-interface types are
+//     traversed.
+//  2. ifindex numbers are scoped per network namespace. When the lower link
+//     lives in another netns, the kernel sets IFLA_LINK_NETNSID
+//     (Attrs().NetNsID >= 0; LinkDeserialize sets -1 for same-netns links), so
+//     ParentIndex must not be looked up in the local namespace's linksByIndex.
+func resolveParentPCIAddress(link netlink.Link, linksByIndex map[int]netlink.Link, pciAddrFn func(string) (*pciAddress, error)) string {
+	switch link.(type) {
+	case *netlink.Macvlan, *netlink.IPVlan:
+	default:
+		return ""
+	}
+
+	// A valid chain cannot visit more links than this snapshot contains.
+	for range len(linksByIndex) {
+		attrs := link.Attrs()
+		if attrs.ParentIndex <= 0 || attrs.NetNsID >= 0 {
+			return ""
+		}
+		parent, ok := linksByIndex[attrs.ParentIndex]
+		if !ok {
+			return ""
+		}
+		if addr, err := pciAddrFn(parent.Attrs().Name); err == nil {
+			return addr.String()
+		}
+		switch parent.(type) {
+		case *netlink.Macvlan, *netlink.IPVlan, *netlink.Vlan:
+			link = parent
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
 func getTcFilters(link netlink.Link) ([]string, bool) {
 	isTcEBPF := false
 	filterNames := sets.Set[string]{}

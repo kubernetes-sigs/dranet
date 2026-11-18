@@ -905,6 +905,109 @@ func TestAddPCIAttributes(t *testing.T) {
 			t.Error("legacy NUMA attribute should require ghw metadata")
 		}
 	})
+
+	t.Run("enriches children of two netdevs sharing one PCI function", func(t *testing.T) {
+		root := t.TempDir()
+		writeTestSysfsFile(t, root, "devices/pci0000:00/0000:00:1f.0/numa_node", "1\n")
+		writeTestSysfsFile(t, root, "devices/system/node/node1/distance", "12 10 12\n")
+		pciBusDir := filepath.Join(root, "bus/pci/devices")
+		if err := os.MkdirAll(pciBusDir, 0o755); err != nil {
+			t.Fatalf("create fake pci bus dir: %v", err)
+		}
+		if err := os.Symlink("../../../devices/pci0000:00/0000:00:1f.0", filepath.Join(pciBusDir, "0000:00:1f.0")); err != nil {
+			t.Fatalf("create fake pci device symlink: %v", err)
+		}
+
+		// Resolve both children through distinct netdev indices sharing one BDF.
+		linksByIndex := map[int]netlink.Link{
+			1: &netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: 1, Name: "eth0", NetNsID: -1}},
+			2: &netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: 2, Name: "eth1", NetNsID: -1}},
+		}
+		children := []netlink.Link{
+			&netlink.Macvlan{LinkAttrs: netlink.LinkAttrs{Index: 10, ParentIndex: 1, NetNsID: -1}},
+			&netlink.IPVlan{LinkAttrs: netlink.LinkAttrs{Index: 11, ParentIndex: 2, NetNsID: -1}},
+		}
+		pciAddrFn := func(name string) (*pciAddress, error) {
+			if name == "eth0" || name == "eth1" {
+				return &pciAddress{domain: "0000", bus: "00", device: "1f", function: "0"}, nil
+			}
+			return nil, fmt.Errorf("no PCI address for %s", name)
+		}
+		devices := []hostDevice{
+			{
+				parentPCIAddress: resolveParentPCIAddress(children[0], linksByIndex, pciAddrFn),
+				Device: resourceapi.Device{
+					Name: "mv0",
+					Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+						apis.AttrInterfaceName: {StringValue: ptr.To("mv0")},
+						apis.AttrType:          {StringValue: ptr.To("macvlan")},
+						apis.AttrMac:           {StringValue: ptr.To("02:00:00:00:00:01")},
+						apis.AttrMTU:           {IntValue: ptr.To(int64(1500))},
+						apis.AttrVirtual:       {BoolValue: ptr.To(true)},
+					},
+				},
+			},
+			{
+				parentPCIAddress: resolveParentPCIAddress(children[1], linksByIndex, pciAddrFn),
+				Device: resourceapi.Device{
+					Name: "iv0",
+					Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+						apis.AttrInterfaceName: {StringValue: ptr.To("iv0")},
+						apis.AttrType:          {StringValue: ptr.To("ipvlan")},
+						apis.AttrVirtual:       {BoolValue: ptr.To(true)},
+					},
+				},
+			},
+		}
+
+		db := &DB{
+			numaAttributeForm: deviceattribute.ListAttribute,
+			deviceAttributeMachineModifiers: []deviceattribute.MachineModifier{
+				deviceattribute.WithFSFromRoot(root),
+			},
+		}
+
+		result := db.addPCIAttributes(devices, pciInfo)
+		if result[0].pciClass != "" {
+			t.Errorf("virtual device pciClass = %q, want empty", result[0].pciClass)
+		}
+		want := resourceapi.Device{
+			Name: "mv0",
+			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				apis.AttrInterfaceName: {StringValue: ptr.To("mv0")},
+				apis.AttrType:          {StringValue: ptr.To("macvlan")},
+				apis.AttrMac:           {StringValue: ptr.To("02:00:00:00:00:01")},
+				apis.AttrMTU:           {IntValue: ptr.To(int64(1500))},
+				apis.AttrVirtual:       {BoolValue: ptr.To(true)},
+				apis.AttrNUMANode:      {IntValue: ptr.To(int64(0))},
+				apis.AttrPCIVendor:     {StringValue: ptr.To("Intel Corp.")},
+				apis.AttrPCIDevice:     {StringValue: ptr.To("Ethernet Controller")},
+				apis.AttrPCISubsystem:  {StringValue: ptr.To("0x5678")},
+				deviceattribute.StandardDeviceAttributeNUMANode: {IntValues: []int64{1, 0, 2}},
+				deviceattribute.StandardDeviceAttributePCIeRoot: {StringValue: ptr.To("pci0000:00")},
+			},
+		}
+		if diff := cmp.Diff(want, result[0].Device); diff != "" {
+			t.Fatalf("virtual device mismatch (-want +got):\n%s", diff)
+		}
+		want.Name = "iv0"
+		want.Attributes[apis.AttrInterfaceName] = resourceapi.DeviceAttribute{StringValue: ptr.To("iv0")}
+		want.Attributes[apis.AttrType] = resourceapi.DeviceAttribute{StringValue: ptr.To("ipvlan")}
+		delete(want.Attributes, apis.AttrMac)
+		delete(want.Attributes, apis.AttrMTU)
+		if diff := cmp.Diff(want, result[1].Device); diff != "" {
+			t.Fatalf("second child mismatch (-want +got):\n%s", diff)
+		}
+		if result[1].pciClass != "" {
+			t.Errorf("second child pciClass = %q, want empty", result[1].pciClass)
+		}
+
+		// Mutating one child's list attribute must not affect a sibling sharing the parent.
+		result[0].Attributes[deviceattribute.StandardDeviceAttributeNUMANode].IntValues[0] = 99
+		if got := result[1].Attributes[deviceattribute.StandardDeviceAttributeNUMANode].IntValues[0]; got != 1 {
+			t.Fatalf("sibling NUMA list aliased: got %d, want 1", got)
+		}
+	})
 }
 
 func writeTestSysfsFile(t *testing.T, root, name, contents string) {

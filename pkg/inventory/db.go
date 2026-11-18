@@ -112,10 +112,10 @@ type DB struct {
 // that are not part of the ResourceSlice. Only the embedded Device leaves
 // this package.
 type hostDevice struct {
-	// Link indices are local to this discovery snapshot and are not published.
-	linkIndices []int
-	parentIndex int
 	resourceapi.Device
+	// parentPCIAddress identifies the underlying NIC for macvlan/ipvlan
+	// topology enrichment without publishing a PCI identity on the child.
+	parentPCIAddress string
 	// pciClass is the PCI base class, pciBaseClassNetwork for a network
 	// controller. Empty when the device is not a PCI device or ghw did not
 	// report it.
@@ -290,7 +290,6 @@ func (db *DB) scan() []resourceapi.Device {
 	// Phase 2: Enrichment — set derived PCI and RDMA attributes uniformly
 	// for all devices, regardless of which discovery path found them.
 	devices = db.addPCIAttributes(devices, pciInfo)
-	inheritParentAttributes(devices)
 	devices = db.addRDMAAttributes(devices)
 	devices = db.addCloudAttributes(devices)
 
@@ -375,6 +374,11 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 		pciDeviceMap[pciDevices[i].Name] = &pciDevices[i]
 	}
 
+	linksByIndex := make(map[int]netlink.Link, len(links))
+	for _, link := range links {
+		linksByIndex[link.Attrs().Index] = link
+	}
+
 	otherDevices := []hostDevice{}
 
 	for _, link := range links {
@@ -415,8 +419,6 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 				continue
 			}
 			addLinkAttributes(&device.Device, link)
-			device.linkIndices = append(device.linkIndices, link.Attrs().Index)
-			device.parentIndex = link.Attrs().ParentIndex
 		} else {
 			// Not a PCI device.
 
@@ -432,7 +434,10 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 				Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
 			}
 			addLinkAttributes(newDevice, link)
-			otherDevices = append(otherDevices, hostDevice{Device: *newDevice, linkIndices: []int{link.Attrs().Index}, parentIndex: link.Attrs().ParentIndex})
+			otherDevices = append(otherDevices, hostDevice{
+				Device:           *newDevice,
+				parentPCIAddress: resolveParentPCIAddress(link, linksByIndex, pciAddressForNetInterface),
+			})
 		}
 	}
 
@@ -908,15 +913,21 @@ func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hos
 	}
 
 	for i := range devices {
-		pciAddrAttr, ok := devices[i].Attributes[apis.AttrPCIAddress]
-		if !ok || pciAddrAttr.StringValue == nil {
+		var pciAddr string
+		isDirectPCI := false
+		if pciAddrAttr, ok := devices[i].Attributes[apis.AttrPCIAddress]; ok && pciAddrAttr.StringValue != nil {
+			pciAddr = *pciAddrAttr.StringValue
+			isDirectPCI = true
+		} else if devices[i].parentPCIAddress != "" {
+			pciAddr = devices[i].parentPCIAddress
+		} else {
 			continue
 		}
-		normalizedAddr := names.NormalizePCIAddress(*pciAddrAttr.StringValue)
+		normalizedAddr := names.NormalizePCIAddress(pciAddr)
 
 		if _, hasAttr := devices[i].Attributes[deviceattribute.StandardDeviceAttributeNUMANode]; !hasAttr {
 			numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(
-				*pciAddrAttr.StringValue,
+				pciAddr,
 				db.numaAttributeForm,
 				db.deviceAttributeMachineModifiers...,
 			)
@@ -928,7 +939,7 @@ func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hos
 		}
 
 		if _, hasAttr := devices[i].Attributes[deviceattribute.StandardDeviceAttributePCIeRoot]; !hasAttr {
-			pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(*pciAddrAttr.StringValue)
+			pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(pciAddr, db.deviceAttributeMachineModifiers...)
 			if err != nil {
 				klog.Errorf("Could not get PCIe root for PCI device %s: %v", normalizedAddr, err)
 			} else {
@@ -940,7 +951,7 @@ func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hos
 		if !inGhw {
 			continue
 		}
-		if pciDev.Class != nil {
+		if isDirectPCI && pciDev.Class != nil {
 			devices[i].pciClass = pciDev.Class.ID
 		}
 
