@@ -86,16 +86,10 @@ Allocation](https://cloud.google.com/kubernetes-engine/docs/how-to/set-up-dra)
 
 ### Installation
 
-Install the latest stable version of DRANET using the provided manifest:
+Install the DRANET v1.5.0 release using the published Helm chart:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/dranet/refs/heads/main/install.yaml
-```
-
-or using the Helm chart:
-
-```sh
-helm install -n kube-system dranet oci://registry.k8s.io/networking/charts/dranet --version v1.4.0
+helm install -n kube-system dranet oci://registry.k8s.io/networking/charts/dranet --version v1.5.0
 ```
 
 For available configuration options, see the [chart README](deployments/helm/dranet/README.md).

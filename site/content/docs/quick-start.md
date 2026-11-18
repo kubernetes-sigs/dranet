@@ -50,10 +50,10 @@ resourceslices                        resource.k8s.io/v1   false        Resource
 
 ## Installation
 
-You can install the latest stable version of `DRANET` using the provided manifest:
+Install the DRANET v1.5.0 release using the published Helm chart:
 
-```
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/dranet/refs/heads/main/install.yaml
+```sh
+helm install -n kube-system dranet oci://registry.k8s.io/networking/charts/dranet --version v1.5.0
 ```
 
 To set options of a cloud provider with `--cloud-provider-options`, see [Cloud provider options](https://github.com/kubernetes-sigs/dranet/blob/main/deployments/helm/dranet/README.md#cloud-provider-options) in the Helm chart README.
