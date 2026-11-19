@@ -132,7 +132,8 @@ DRANET must match the value configured for the Kubernetes control plane. Enable
 it in both Kubernetes and DRANET (`--feature-gates=DRAListTypeAttributes=true`).
 Enabling it only in DRANET publishes list-valued attributes that a control plane
 without the feature enabled cannot handle, causing ResourceSlice operations to
-fail.
+fail. See [Feature Gates](/docs/user/feature-gates/) for all DRANET feature
+gates.
 
 Once the resources are available, users can create `DeviceClasses`, `ResourceClaims` and/or `ResourceClaimTemplates` to schedule pods.
 

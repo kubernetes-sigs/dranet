@@ -50,7 +50,7 @@ The following table lists the configurable parameters and their default values:
 | `args.cloudProviderOptions` | Options per provider, as a map of maps; see [Cloud provider options](#cloud-provider-options) | binary default: no options |
 | `args.profileProvider` | Provider for user profile configuration (`cloud`, `webhook`, `none`) | binary default: `cloud` |
 | `args.webhookURL` | HTTP, HTTPS, or Unix socket URL; required when either provider uses `webhook` | binary default: `""` |
-| `args.featureGates` | Comma-separated feature gate settings in `key=value` format | binary default: `""` |
+| `args.featureGates` | Comma-separated feature gate settings in `key=value` format; see [Feature Gates](https://dranet.sigs.k8s.io/docs/user/feature-gates/) | binary default: `""` |
 
 > **Note:** All `args.*` fields are optional. When omitted, the flag is not passed to the binary and the binary's built-in default applies.
 
@@ -81,6 +81,9 @@ configured with a scrape config that reads `prometheus.io/*` annotations --
 unlike the PodMonitor path, nothing here wires that up automatically. Keep
 `prometheus.io/port` in sync with `metricsPort` if you change it from the
 default.
+
+The metrics that DRANET exports are listed in
+[Metrics and Health Checks](https://dranet.sigs.k8s.io/docs/user/metrics/).
 
 `extraVolumes` and `extraVolumeMounts` add entries after the built-in volumes
 and container mounts. The chart does not change the entries. Do not reuse the
