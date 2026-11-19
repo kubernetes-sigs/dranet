@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -2212,5 +2213,229 @@ func TestClearStaleRouteSources(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestPrepareResourceClaimsVRFTableConflicts checks that devices of one Pod
+// cannot resolve the same VRF name to different routing tables, whether they
+// come from one claim or from several. The VRF comes from a profile merged into
+// the device config, so the test does not need a kernel: the devices are
+// IB-only, which skips every netlink step of prepareDevice.
+func TestPrepareResourceClaimsVRFTableConflicts(t *testing.T) {
+	derived := apis.TableIDForName("blue")
+
+	type claimSpec struct {
+		uid     types.UID
+		podUID  types.UID
+		devices []string
+		wantErr string // substring of the claim's error; empty means success
+	}
+	tests := []struct {
+		name string
+		// vrfs maps a device to the VRF its profile resolves to.
+		vrfs   map[string]*apis.VRFConfig
+		claims []claimSpec
+		// wantStored lists the "pod/device" entries expected in the store after all claims.
+		wantStored []string
+		// wantReleased is the number of profile releases expected.
+		wantReleased int32
+	}{
+		{
+			name: "same claim, same vrf, different tables",
+			vrfs: map[string]*apis.VRFConfig{
+				"dev-1": {Name: "blue", Table: ptr.To(100)},
+				"dev-2": {Name: "blue", Table: ptr.To(200)},
+			},
+			claims:       []claimSpec{{uid: "c1", podUID: "pod-1", devices: []string{"dev-1", "dev-2"}, wantErr: "conflicts"}},
+			wantStored:   []string{"pod-1/dev-1"},
+			wantReleased: 1,
+		},
+		{
+			name: "separate claims of the same pod, same vrf, different tables",
+			vrfs: map[string]*apis.VRFConfig{
+				"dev-1": {Name: "blue", Table: ptr.To(100)},
+				"dev-2": {Name: "blue", Table: ptr.To(200)},
+			},
+			claims: []claimSpec{
+				{uid: "c1", podUID: "pod-1", devices: []string{"dev-1"}},
+				{uid: "c2", podUID: "pod-1", devices: []string{"dev-2"}, wantErr: "conflicts"},
+			},
+			wantStored:   []string{"pod-1/dev-1"},
+			wantReleased: 1,
+		},
+		{
+			name: "explicit table differs from the one derived from the name",
+			vrfs: map[string]*apis.VRFConfig{
+				"dev-1": {Name: "blue"},
+				"dev-2": {Name: "blue", Table: ptr.To(derived + 1)},
+			},
+			claims: []claimSpec{
+				{uid: "c1", podUID: "pod-1", devices: []string{"dev-1"}},
+				{uid: "c2", podUID: "pod-1", devices: []string{"dev-2"}, wantErr: "conflicts"},
+			},
+			wantStored:   []string{"pod-1/dev-1"},
+			wantReleased: 1,
+		},
+		{
+			name: "different pods may use different tables for the same vrf name",
+			vrfs: map[string]*apis.VRFConfig{
+				"dev-1": {Name: "blue", Table: ptr.To(100)},
+				"dev-2": {Name: "blue", Table: ptr.To(200)},
+			},
+			claims: []claimSpec{
+				{uid: "c1", podUID: "pod-1", devices: []string{"dev-1"}},
+				{uid: "c2", podUID: "pod-2", devices: []string{"dev-2"}},
+			},
+			wantStored: []string{"pod-1/dev-1", "pod-2/dev-2"},
+		},
+		{
+			name: "shared vrf with the same explicit table",
+			vrfs: map[string]*apis.VRFConfig{
+				"dev-1": {Name: "blue", Table: ptr.To(100)},
+				"dev-2": {Name: "blue", Table: ptr.To(100)},
+			},
+			claims:     []claimSpec{{uid: "c1", podUID: "pod-1", devices: []string{"dev-1", "dev-2"}}},
+			wantStored: []string{"pod-1/dev-1", "pod-1/dev-2"},
+		},
+		{
+			name: "shared vrf with tables derived from the name",
+			vrfs: map[string]*apis.VRFConfig{
+				"dev-1": {Name: "blue"},
+				"dev-2": {Name: "blue"},
+			},
+			claims: []claimSpec{
+				{uid: "c1", podUID: "pod-1", devices: []string{"dev-1"}},
+				{uid: "c2", podUID: "pod-1", devices: []string{"dev-2"}},
+			},
+			wantStored: []string{"pod-1/dev-1", "pod-1/dev-2"},
+		},
+		{
+			name: "different vrf names with different tables",
+			vrfs: map[string]*apis.VRFConfig{
+				"dev-1": {Name: "blue", Table: ptr.To(100)},
+				"dev-2": {Name: "red", Table: ptr.To(200)},
+			},
+			claims:     []claimSpec{{uid: "c1", podUID: "pod-1", devices: []string{"dev-1", "dev-2"}}},
+			wantStored: []string{"pod-1/dev-1", "pod-1/dev-2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeDB := newFakeInventoryDB()
+			fakeDB.GetDeviceConfigFunc = func(string) (*apis.NetworkConfig, bool) {
+				return &apis.NetworkConfig{Profile: "vrf-profile"}, true
+			}
+			fakeDB.GetProfileConfigFunc = func(device string, _ *resourcev1.ResourceClaim, _ *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				vrf := *tt.vrfs[device] // the driver must not rely on the profile's config staying untouched
+				return &apis.NetworkConfig{Interface: apis.InterfaceConfig{VRF: &vrf}}, nil
+			}
+			fakeDB.IsIBOnlyDeviceFunc = func(string) bool { return true }
+
+			np := &NetworkDriver{
+				netdb:          fakeDB,
+				driverName:     "test.driver",
+				podConfigStore: mustNewPodConfigStore(),
+				eventRecorder:  record.NewFakeRecorder(100),
+			}
+
+			for _, spec := range tt.claims {
+				var results []resourcev1.DeviceRequestAllocationResult
+				for _, dev := range spec.devices {
+					results = append(results, resourcev1.DeviceRequestAllocationResult{Driver: "test.driver", Device: dev, Request: "req"})
+				}
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{UID: spec.uid, Namespace: "default", Name: string(spec.uid)},
+					Status: resourcev1.ResourceClaimStatus{
+						ReservedFor: []resourcev1.ResourceClaimConsumerReference{{Resource: "pods", Name: string(spec.podUID), UID: spec.podUID}},
+						Allocation:  &resourcev1.AllocationResult{Devices: resourcev1.DeviceAllocationResult{Results: results}},
+					},
+				}
+				res, err := np.PrepareResourceClaims(context.Background(), []*resourcev1.ResourceClaim{claim})
+				if err != nil {
+					t.Fatalf("PrepareResourceClaims(%s) = %v", spec.uid, err)
+				}
+				gotErr := res[spec.uid].Err
+				switch {
+				case spec.wantErr == "" && gotErr != nil:
+					t.Fatalf("claim %s: unexpected error: %v", spec.uid, gotErr)
+				case spec.wantErr != "" && gotErr == nil:
+					t.Fatalf("claim %s succeeded, want an error mentioning %q", spec.uid, spec.wantErr)
+				case spec.wantErr != "" && !strings.Contains(gotErr.Error(), spec.wantErr):
+					t.Fatalf("claim %s error = %q, want it to mention %q", spec.uid, gotErr, spec.wantErr)
+				case spec.wantErr != "" && !strings.Contains(gotErr.Error(), `vrf "blue"`):
+					t.Errorf("claim %s error = %q, want it to name the vrf", spec.uid, gotErr)
+				}
+			}
+
+			var gotStored []string
+			for _, podUID := range np.podConfigStore.ListPods() {
+				podCfg, _ := np.podConfigStore.GetPodConfig(podUID)
+				for dev := range podCfg.DeviceConfigs {
+					gotStored = append(gotStored, fmt.Sprintf("%s/%s", podUID, dev))
+				}
+			}
+			slices.Sort(gotStored)
+			if diff := cmp.Diff(tt.wantStored, gotStored, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("stored devices mismatch (-want +got):\n%s", diff)
+			}
+			if got := fakeDB.releaseProfileCalls.Load(); got != tt.wantReleased {
+				t.Errorf("profile releases = %d, want %d", got, tt.wantReleased)
+			}
+		})
+	}
+}
+
+// A conflicting device must keep being rejected when kubelet retries the claim,
+// and an already prepared device must still be reused without a second profile
+// allocation.
+func TestPrepareResourceClaimsVRFConflictRetry(t *testing.T) {
+	fakeDB := newFakeInventoryDB()
+	fakeDB.GetDeviceConfigFunc = func(string) (*apis.NetworkConfig, bool) {
+		return &apis.NetworkConfig{Profile: "vrf-profile"}, true
+	}
+	tables := map[string]int{"dev-1": 100, "dev-2": 200}
+	fakeDB.GetProfileConfigFunc = func(device string, _ *resourcev1.ResourceClaim, _ *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+		return &apis.NetworkConfig{Interface: apis.InterfaceConfig{VRF: &apis.VRFConfig{Name: "blue", Table: ptr.To(tables[device])}}}, nil
+	}
+	fakeDB.IsIBOnlyDeviceFunc = func(string) bool { return true }
+	np := &NetworkDriver{
+		netdb:          fakeDB,
+		driverName:     "test.driver",
+		podConfigStore: mustNewPodConfigStore(),
+		eventRecorder:  record.NewFakeRecorder(100),
+	}
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{UID: "c1", Namespace: "default", Name: "c1"},
+		Status: resourcev1.ResourceClaimStatus{
+			ReservedFor: []resourcev1.ResourceClaimConsumerReference{{Resource: "pods", Name: "pod-1", UID: "pod-1"}},
+			Allocation: &resourcev1.AllocationResult{Devices: resourcev1.DeviceAllocationResult{Results: []resourcev1.DeviceRequestAllocationResult{
+				{Driver: "test.driver", Device: "dev-1", Request: "req"},
+				{Driver: "test.driver", Device: "dev-2", Request: "req"},
+			}}},
+		},
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		res, err := np.PrepareResourceClaims(context.Background(), []*resourcev1.ResourceClaim{claim})
+		if err != nil {
+			t.Fatalf("attempt %d: PrepareResourceClaims() = %v", attempt, err)
+		}
+		if res["c1"].Err == nil {
+			t.Fatalf("attempt %d: claim with conflicting vrf tables succeeded", attempt)
+		}
+		podCfg, _ := np.podConfigStore.GetPodConfig("pod-1")
+		if len(podCfg.DeviceConfigs) != 1 {
+			t.Fatalf("attempt %d: %d devices stored, want only dev-1", attempt, len(podCfg.DeviceConfigs))
+		}
+		if _, ok := podCfg.DeviceConfigs["dev-1"]; !ok {
+			t.Fatalf("attempt %d: dev-1 is not stored", attempt)
+		}
+		// dev-1 is allocated once and then reused; dev-2 allocates and releases on every attempt.
+		if got, want := fakeDB.profileCalls.Load(), int32(1+attempt); got != want {
+			t.Errorf("attempt %d: profile allocations = %d, want %d", attempt, got, want)
+		}
+		if got, want := fakeDB.releaseProfileCalls.Load(), int32(attempt); got != want {
+			t.Errorf("attempt %d: profile releases = %d, want %d", attempt, got, want)
+		}
 	}
 }
