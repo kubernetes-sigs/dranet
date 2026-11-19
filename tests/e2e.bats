@@ -9,6 +9,9 @@ teardown() {
   if [[ -z "$BATS_TEST_COMPLETED" || "$BATS_TEST_COMPLETED" -ne 1 ]] && [[ -z "$BATS_TEST_SKIPPED" ]]; then
     dump_debug_info_on_failure
   fi
+  if [[ -f "$BATS_TEST_TMPDIR/pci-original-spec.json" ]]; then
+    cleanup_pci_topology_test
+  fi
   cleanup_k8s_resources
   cleanup_dummy_interfaces
   cleanup_veth_interfaces
@@ -86,6 +89,42 @@ cleanup_bpf_programs() {
 
 # ---- SETUP HELPERS ----
 
+# Restore the deployment even when preparation or an assertion fails. Only the
+# selected worker was restarted with synthetic sysfs; the host sysfs is untouched.
+cleanup_pci_topology_test() {
+  local patch
+  patch=$(jq '[{op: "replace", path: "/spec", value: .}]' "$BATS_TEST_TMPDIR/pci-original-spec.json")
+  kubectl patch daemonset dranet -n kube-system --type=json -p "$patch" || return 1
+  kubectl delete pods -n kube-system -l k8s-app=dranet --field-selector "spec.nodeName=$PCI_TEST_NODE" --wait=true || return 1
+  kubectl rollout status daemonset/dranet -n kube-system --timeout=120s || return 1
+  docker exec "$PCI_TEST_NODE" bash -ec '
+    for name in pci261p0 pci261p1; do
+      if ip link show "$name" >/dev/null 2>&1; then ip link delete "$name"; fi
+    done
+    case "$1" in /var/tmp/dranet-pci261.*) rm -rf -- "$1" ;; esac
+  ' bash "${PCI_TEST_ROOT:-}" || return 1
+}
+
+pci_topology_devices() {
+  kubectl get resourceslices --field-selector "spec.nodeName=$PCI_TEST_NODE" -o json |
+    jq '[.items[] | select(.spec.driver == "dra.net") | .spec.devices[]]'
+}
+
+# Discovery and ResourceSlice publication are asynchronous. Retry the assertion,
+# retaining the last output so a timeout explains which device or field differed.
+wait_for_pci_topology() {
+  local expression="$1"
+  local attempt devices
+  for attempt in $(seq 1 30); do
+    if devices=$(pci_topology_devices) && jq -e "$expression" <<<"$devices" >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  printf 'ResourceSlice assertion timed out: %s\n%s\n' "$expression" "${devices:-}" >&2
+  return 1
+}
+
 setup_bpf_device() {
   docker cp "$BATS_TEST_DIRNAME"/dummy_bpf.o "$CLUSTER_NAME"-worker2:/dummy_bpf.o
   docker exec "$CLUSTER_NAME"-worker2 bash -c "ip link add dummy0 type dummy"
@@ -138,6 +177,122 @@ wait_for_ready_pods() {
 }
 
 # ---- TESTS ----
+
+@test "macvlan and ipvlan publish hardware topology from shared PCI parents" {
+  PCI_TEST_NODE="$CLUSTER_NAME-worker"
+  kubectl get daemonset dranet -n kube-system -o json |
+    jq '.spec' > "$BATS_TEST_TMPDIR/pci-original-spec.json"
+  PCI_TEST_ROOT=$(docker exec "$PCI_TEST_NODE" mktemp -d /var/tmp/dranet-pci261.XXXXXX)
+
+  # Two real netdevs share one synthetic PCI function. Keep all other netdev
+  # symlinks visible, and mount the fixture only inside the driver container.
+  docker exec -i "$PCI_TEST_NODE" bash -es -- "$PCI_TEST_ROOT" <<'EOF'
+root=$1
+for name in pci261p0 pci261p1; do
+  ip link add "$name" type dummy
+  ip link set "$name" up
+done
+ip addr add 192.0.2.1/32 dev pci261p0
+ip addr add 192.0.2.2/32 dev pci261p1
+ip link add link pci261p0 name pci261mv type macvlan mode bridge
+ip link add link pci261p1 name pci261iv type ipvlan mode l2
+ip link add link pci261p0 name pci261vlan type vlan id 261
+ip link add link pci261vlan name pci261nested type macvlan mode bridge
+for name in pci261mv pci261iv pci261vlan pci261nested; do
+  ip link set "$name" up
+done
+ip link set pci261mv mtu 1401
+ip link set pci261iv mtu 1402
+ip link set pci261nested mtu 1403
+
+mkdir -p "$root/net" "$root/pci" "$root/devices/pci0000:ee/0000:ee:00.0/net" "$root/driver/dummy"
+cp -a /sys/class/net/. "$root/net/"
+# Kind's runtime hook bind-mounts these DMI files when starting a container.
+mkdir -p "$root/devices/virtual/dmi/id"
+touch "$root/devices/virtual/dmi/id/product_name" "$root/devices/virtual/dmi/id/product_uuid"
+printf 'pci:v00001234d00005678sv00001234sd00000001bc02sc00i00\n' > "$root/devices/pci0000:ee/0000:ee:00.0/modalias"
+printf '0\n' > "$root/devices/pci0000:ee/0000:ee:00.0/numa_node"
+# ghw reports legacy NUMA attributes only on a multi-node topology. Supply
+# two minimal nodes so the assertion also works on single-NUMA CI runners.
+for node in 0 1; do
+  mkdir -p "$root/devices/system/node/node$node/hugepages"
+  printf 'Node %s MemTotal: 1024 kB\n' "$node" > "$root/devices/system/node/node$node/meminfo"
+done
+printf '10 20\n' > "$root/devices/system/node/node0/distance"
+printf '20 10\n' > "$root/devices/system/node/node1/distance"
+printf '0-1\n' > "$root/devices/system/node/online"
+ln -s /run/dranet-pci261/driver/dummy "$root/devices/pci0000:ee/0000:ee:00.0/driver"
+ln -s ../../../devices/pci0000:ee/0000:ee:00.0 "$root/pci/0000:ee:00.0"
+for name in pci261p0 pci261p1; do
+  mkdir -p "$root/devices/pci0000:ee/0000:ee:00.0/net/$name"
+  ln -sfn "/sys/devices/pci0000:ee/0000:ee:00.0/net/$name" "$root/net/$name"
+done
+# A tiny local pci.ids avoids depending on the runner's hardware database.
+printf '1234  DRANET Test Vendor\n\t5678  DRANET Test NIC\n\t\t1234 0001  DRANET Test Subsystem\n\nC 02  Network controller\n\t00  Ethernet controller\n' > "$root/pci.ids"
+EOF
+
+  # OnDelete prevents other nodes from rolling to this test-only template.
+  local patch
+  patch=$(jq -n --arg root "$PCI_TEST_ROOT" '
+    [
+      {op: "replace", path: "/spec/updateStrategy", value: {type: "OnDelete"}},
+      {op: "add", path: "/spec/template/spec/volumes/-",
+       value: {name: "pci261-fixture", hostPath: {path: $root, type: "Directory"}}},
+      {op: "add", path: "/spec/template/spec/containers/0/env/-",
+       value: {name: "PCIDB_PATH", value: "/run/dranet-pci261/pci.ids"}}
+    ] + ([
+      {mountPath: "/run/dranet-pci261", subPath: ""},
+      {mountPath: "/sys/class/net", subPath: "net"},
+      {mountPath: "/sys/bus/pci/devices", subPath: "pci"},
+      {mountPath: "/sys/devices", subPath: "devices"}
+    ] | map({op: "add", path: "/spec/template/spec/containers/0/volumeMounts/-",
+             value: (. + {name: "pci261-fixture", readOnly: true})}))')
+  kubectl patch daemonset dranet -n kube-system --type=json -p "$patch"
+  kubectl delete pods -n kube-system -l k8s-app=dranet --field-selector "spec.nodeName=$PCI_TEST_NODE" --wait=true
+
+  # Require every attribute explicitly: absent values on both parent and child
+  # must not accidentally satisfy an equality assertion.
+  local hardware='
+    .attributes["dra.net/numaNode"].int == 0 and
+    .attributes["resource.kubernetes.io/numaNode"].int == 0 and
+    .attributes["resource.kubernetes.io/pcieRoot"].string == "pci0000:ee" and
+    .attributes["dra.net/pciVendor"].string == "DRANET Test Vendor" and
+    .attributes["dra.net/pciDevice"].string == "DRANET Test NIC" and
+    .attributes["dra.net/pciSubsystem"].string == "0001"'
+  run wait_for_pci_topology "
+    [.[] | select(.name == \"pci-0000-ee-00-0\")] as \$parents |
+    [.[] | select(.name == \"pci261mv\" or .name == \"pci261iv\" or .name == \"pci261nested\")] as \$children |
+    (\$parents | length) == 1 and (\$children | length) == 3 and
+    all(\$parents[], \$children[]; $hardware)"
+  assert_success
+
+  local name expected_type link mac mtu state
+  for name in pci261mv pci261iv pci261nested; do
+    expected_type=macvlan
+    [[ "$name" != pci261iv ]] || expected_type=ipvlan
+    link=$(docker exec "$PCI_TEST_NODE" ip -j link show "$name")
+    mac=$(jq -r '.[0].address' <<<"$link")
+    mtu=$(jq -r '.[0].mtu' <<<"$link")
+    state=$(jq -r '.[0].operstate | ascii_downcase' <<<"$link")
+    run wait_for_pci_topology "
+      [.[] | select(.name == \"$name\")] | length == 1 and all(.[];
+        .attributes[\"dra.net/ifName\"].string == \"$name\" and
+        .attributes[\"dra.net/type\"].string == \"$expected_type\" and
+        .attributes[\"dra.net/virtual\"].bool == true and
+        .attributes[\"dra.net/mac\"].string == \"$mac\" and
+        .attributes[\"dra.net/mtu\"].int == $mtu and
+        .attributes[\"dra.net/state\"].string == \"$state\" and
+        (.attributes | has(\"dra.net/pciAddress\") | not) and
+        (.attributes | has(\"dra.net/ipv4\") | not) and
+        .attributes[\"dra.net/rdma\"].bool == false and
+        (.attributes | has(\"dra.net/rdmaDevice\") | not))"
+    assert_success
+  done
+
+  docker exec "$PCI_TEST_NODE" bash -ec 'ip link delete pci261p0; ip link delete pci261p1'
+  run wait_for_pci_topology '[.[] | select(.name == "pci261mv" or .name == "pci261iv" or .name == "pci261nested")] | length == 0'
+  assert_success
+}
 
 @test "dummy interface with IP addresses ResourceClaim" {
   docker exec "$CLUSTER_NAME"-worker bash -c "ip link add dummy0 type dummy"
