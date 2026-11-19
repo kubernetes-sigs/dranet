@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -95,12 +96,16 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 }
 
 func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	// Containers only care about the RDMA char devices.
+	// Containers only care about the RDMA and VFIO char devices.
 	devPaths := set.Set[string]{}
 	adjust := &api.ContainerAdjustment{}
 
 	for _, config := range podConfig.DeviceConfigs {
-		for _, dev := range config.RDMADevice.DevChars {
+		devChars := config.RDMADevice.DevChars
+		if config.VFIO != nil {
+			devChars = append(slices.Clone(devChars), config.VFIO.DevChars...)
+		}
+		for _, dev := range devChars {
 			// do not insert the same path multiple times
 			if devPaths.Has(dev.Path) {
 				continue
@@ -210,6 +215,18 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 				metav1apply.Condition().
 					WithType("Ready").
 					WithReason("RDMAOnlyDeviceReady").
+					WithStatus(metav1.ConditionTrue).
+					WithLastTransitionTime(metav1.Now()),
+			)
+		}
+
+		// Block 4: VFIO devices have no netdev; the char devices are injected
+		// in CreateContainer.
+		if config.VFIO != nil && config.VFIO.Bound {
+			resourceClaimStatusDevice.WithConditions(
+				metav1apply.Condition().
+					WithType("Ready").
+					WithReason("VFIODeviceReady").
 					WithStatus(metav1.ConditionTrue).
 					WithLastTransitionTime(metav1.Now()),
 			)

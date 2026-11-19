@@ -1434,3 +1434,133 @@ func TestValidateConfigDelegatesToValidate(t *testing.T) {
 		t.Errorf("ValidateConfig() ipvlan = %+v, want mode %s flag %s", cfg.Interface.IPVlan, IPVlanModeL2, IPVlanFlagBridge)
 	}
 }
+
+func TestValidateConfigVFIO(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		expectErr   bool
+		errContains []string
+	}{
+		{
+			name: "vfio alone",
+			raw:  `{"vfio": {}}`,
+		},
+		{
+			name:        "vfio with an unknown field",
+			raw:         `{"vfio": {"iommufd": true}}`,
+			expectErr:   true,
+			errContains: []string{"unknown field"},
+		},
+		{
+			name:        "vfio with profile",
+			raw:         `{"vfio": {}, "profile": "default"}`,
+			expectErr:   true,
+			errContains: []string{"vfio: profile is not supported together with vfio"},
+		},
+		{
+			name:        "vfio with interface name",
+			raw:         `{"vfio": {}, "interface": {"name": "net0"}}`,
+			expectErr:   true,
+			errContains: []string{"vfio: interface configuration is not supported together with vfio"},
+		},
+		{
+			name:        "vfio with routes",
+			raw:         `{"vfio": {}, "routes": [{"destination": "10.0.0.0/8", "gateway": "10.0.0.1"}]}`,
+			expectErr:   true,
+			errContains: []string{"vfio: routes are not supported together with vfio"},
+		},
+		{
+			name:        "vfio with rules",
+			raw:         `{"vfio": {}, "rules": [{"source": "10.0.0.0/8", "table": 100}]}`,
+			expectErr:   true,
+			errContains: []string{"vfio: rules are not supported together with vfio"},
+		},
+		{
+			name:        "vfio with neighbors",
+			raw:         `{"vfio": {}, "neighbors": [{"destination": "10.0.0.1", "hardwareAddress": "00:11:22:33:44:55"}]}`,
+			expectErr:   true,
+			errContains: []string{"vfio: neighbors are not supported together with vfio"},
+		},
+		{
+			name:        "vfio with ethtool",
+			raw:         `{"vfio": {}, "ethtool": {"features": {"tso": true}}}`,
+			expectErr:   true,
+			errContains: []string{"vfio: ethtool configuration is not supported together with vfio"},
+		},
+		{
+			name:      "netdev config without vfio is unaffected",
+			raw:       `{"interface": {"name": "net0"}}`,
+			expectErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, errs := ValidateConfig(newRawExtensionFromString(t, tt.raw))
+			if (len(errs) > 0) != tt.expectErr {
+				t.Fatalf("ValidateConfig() errors = %v, expectErr %v", errs, tt.expectErr)
+			}
+			for _, want := range tt.errContains {
+				found := false
+				for _, err := range errs {
+					if strings.Contains(err.Error(), want) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("ValidateConfig() errors %v do not contain %q", errs, want)
+				}
+			}
+			if !tt.expectErr && strings.Contains(tt.raw, "vfio") && (cfg == nil || cfg.VFIO == nil) {
+				t.Errorf("ValidateConfig() dropped the vfio block: %+v", cfg)
+			}
+		})
+	}
+}
+
+func TestValidateVFIORejectsEveryInterfaceField(t *testing.T) {
+	sample := func(t *testing.T, field reflect.StructField) reflect.Value {
+		t.Helper()
+		typ := field.Type
+		switch typ.Kind() {
+		case reflect.String:
+			return reflect.ValueOf("x").Convert(typ)
+		case reflect.Slice:
+			return reflect.MakeSlice(typ, 1, 1)
+		case reflect.Ptr:
+			value := reflect.New(typ.Elem())
+			switch typ.Elem().Kind() {
+			case reflect.Bool:
+				value.Elem().SetBool(true)
+			case reflect.Int32:
+				value.Elem().SetInt(1)
+			case reflect.String:
+				value.Elem().SetString("x")
+			case reflect.Struct:
+			default:
+				t.Fatalf("field %s: unsupported pointer element kind %s", field.Name, typ.Elem().Kind())
+			}
+			return value
+		}
+		t.Fatalf("field %s: unsupported kind %s", field.Name, typ.Kind())
+		return reflect.Value{}
+	}
+	ifaceType := reflect.TypeFor[InterfaceConfig]()
+	for i := 0; i < ifaceType.NumField(); i++ {
+		field := ifaceType.Field(i)
+		t.Run(field.Name, func(t *testing.T) {
+			config := NetworkConfig{VFIO: &VFIOConfig{}}
+			reflect.ValueOf(&config.Interface).Elem().Field(i).Set(sample(t, field))
+			found := false
+			for _, err := range config.Validate() {
+				if strings.Contains(err.Error(), "interface configuration is not supported together with vfio") {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("Validate() did not reject interface field %s together with vfio", field.Name)
+			}
+		})
+	}
+}

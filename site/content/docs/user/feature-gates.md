@@ -26,6 +26,7 @@ DRANET stops at startup if the list names an unknown feature gate.
 |--------------|---------|-------|-------|
 | [`DRAListTypeAttributes`](#dralisttypeattributes) | `false` | Alpha | v1.5.0 |
 | [`PersistentResourceSliceAttributes`](#persistentresourcesliceattributes) | `false` | Alpha | v1.4.0 |
+| [`VFIODriverRebind`](#vfiodriverrebind) | `false` | Alpha | v1.6.0 |
 
 ## DRAListTypeAttributes
 
@@ -71,3 +72,16 @@ devices.
 DRANET keeps the snapshots in the database set with `--db-path`, so they
 survive a restart of DRANET. If `--db-path` is empty, DRANET keeps them in
 memory and they are lost when DRANET restarts.
+
+## VFIODriverRebind
+
+Lets a claim with a `vfio` config get the whole PCI function instead of its
+network interface. DRANET binds the function to `vfio-pci` when it prepares the
+claim, adds the VFIO character devices to the pod's containers, and binds the
+original driver back when it unprepares the claim. PCI devices get the
+`dra.net/vfio` and `resource.kubernetes.io/pciBusID` attributes.
+
+The feature gate requires `--db-path`, so the original driver of each function
+survives a restart of DRANET. DRANET stops at startup if the feature gate is
+enabled and `--db-path` is empty. See [VFIO](/docs/concepts/vfio/) for the
+requirements and which functions qualify.
