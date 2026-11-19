@@ -113,6 +113,9 @@ type DB struct {
 // this package.
 type hostDevice struct {
 	resourceapi.Device
+	// parentPCIAddress identifies the underlying NIC for macvlan/ipvlan
+	// topology enrichment without publishing a PCI identity on the child.
+	parentPCIAddress string
 	// pciClass is the PCI base class, pciBaseClassNetwork for a network
 	// controller. Empty when the device is not a PCI device or ghw did not
 	// report it.
@@ -371,6 +374,11 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 		pciDeviceMap[pciDevices[i].Name] = &pciDevices[i]
 	}
 
+	linksByIndex := make(map[int]netlink.Link, len(links))
+	for _, link := range links {
+		linksByIndex[link.Attrs().Index] = link
+	}
+
 	otherDevices := []hostDevice{}
 
 	for _, link := range links {
@@ -426,7 +434,10 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 				Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
 			}
 			addLinkAttributes(newDevice, link)
-			otherDevices = append(otherDevices, hostDevice{Device: *newDevice})
+			otherDevices = append(otherDevices, hostDevice{
+				Device:           *newDevice,
+				parentPCIAddress: resolveParentPCIAddress(link, linksByIndex, pciAddressForNetInterface),
+			})
 		}
 	}
 
@@ -902,15 +913,21 @@ func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hos
 	}
 
 	for i := range devices {
-		pciAddrAttr, ok := devices[i].Attributes[apis.AttrPCIAddress]
-		if !ok || pciAddrAttr.StringValue == nil {
+		var pciAddr string
+		isDirectPCI := false
+		if pciAddrAttr, ok := devices[i].Attributes[apis.AttrPCIAddress]; ok && pciAddrAttr.StringValue != nil {
+			pciAddr = *pciAddrAttr.StringValue
+			isDirectPCI = true
+		} else if devices[i].parentPCIAddress != "" {
+			pciAddr = devices[i].parentPCIAddress
+		} else {
 			continue
 		}
-		normalizedAddr := names.NormalizePCIAddress(*pciAddrAttr.StringValue)
+		normalizedAddr := names.NormalizePCIAddress(pciAddr)
 
 		if _, hasAttr := devices[i].Attributes[deviceattribute.StandardDeviceAttributeNUMANode]; !hasAttr {
 			numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(
-				*pciAddrAttr.StringValue,
+				pciAddr,
 				db.numaAttributeForm,
 				db.deviceAttributeMachineModifiers...,
 			)
@@ -922,7 +939,7 @@ func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hos
 		}
 
 		if _, hasAttr := devices[i].Attributes[deviceattribute.StandardDeviceAttributePCIeRoot]; !hasAttr {
-			pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(*pciAddrAttr.StringValue)
+			pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(pciAddr, db.deviceAttributeMachineModifiers...)
 			if err != nil {
 				klog.Errorf("Could not get PCIe root for PCI device %s: %v", normalizedAddr, err)
 			} else {
@@ -934,7 +951,7 @@ func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hos
 		if !inGhw {
 			continue
 		}
-		if pciDev.Class != nil {
+		if isDirectPCI && pciDev.Class != nil {
 			devices[i].pciClass = pciDev.Class.ID
 		}
 

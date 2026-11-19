@@ -17,6 +17,7 @@ limitations under the License.
 package inventory
 
 import (
+	"fmt"
 	"net"
 	"syscall"
 	"testing"
@@ -560,4 +561,198 @@ func addChildBond(t *testing.T, name string, masterIndex int) netlink.Link {
 		t.Fatalf("failed to set %s up: %v", name, err)
 	}
 	return link
+}
+
+func TestResolveParentPCIAddress(t *testing.T) {
+	newAttrs := func(index, parent int, name string) netlink.LinkAttrs {
+		attrs := netlink.NewLinkAttrs()
+		attrs.Index = index
+		attrs.ParentIndex = parent
+		attrs.Name = name
+		return attrs
+	}
+
+	linksByIndex := map[int]netlink.Link{
+		1: &netlink.Device{LinkAttrs: newAttrs(1, 0, "eth0")},
+		2: &netlink.Device{LinkAttrs: newAttrs(2, 0, "eth1")}, // shares PCI function with eth0
+		3: &netlink.Macvlan{LinkAttrs: newAttrs(3, 1, "mv-parent")},
+		4: &netlink.Vlan{LinkAttrs: newAttrs(4, 1, "eth0.100")},
+		5: &netlink.IPVlan{LinkAttrs: newAttrs(5, 6, "cycle-a")},
+		6: &netlink.Macvlan{LinkAttrs: newAttrs(6, 5, "cycle-b")},
+		7: &netlink.Veth{LinkAttrs: newAttrs(7, 1, "veth0")},
+	}
+
+	pciAddrs := map[string]*pciAddress{
+		"eth0": {domain: "0000", bus: "01", device: "00", function: "0"},
+		"eth1": {domain: "0000", bus: "01", device: "00", function: "0"},
+	}
+	pciAddrFn := func(ifName string) (*pciAddress, error) {
+		if addr, ok := pciAddrs[ifName]; ok {
+			return addr, nil
+		}
+		return nil, fmt.Errorf("no PCI address for %s", ifName)
+	}
+
+	crossNetnsAttrs := newAttrs(10, 1, "mv-foreign")
+	crossNetnsAttrs.NetNsID = 0
+	foreignVLAN := newAttrs(8, 1, "foreign-vlan")
+	foreignVLAN.NetNsID = 0
+	linksByIndex[8] = &netlink.Vlan{LinkAttrs: foreignVLAN}
+
+	tests := []struct {
+		name string
+		link netlink.Link
+		want string
+	}{
+		{
+			name: "macvlan on first port of shared PCI function",
+			link: &netlink.Macvlan{LinkAttrs: newAttrs(10, 1, "mv0")},
+			want: "0000:01:00.0",
+		},
+		{
+			name: "ipvlan on second port of shared PCI function",
+			link: &netlink.IPVlan{LinkAttrs: newAttrs(11, 2, "iv0")},
+			want: "0000:01:00.0",
+		},
+		{
+			name: "nested ipvlan over macvlan",
+			link: &netlink.IPVlan{LinkAttrs: newAttrs(10, 3, "iv-nested")},
+			want: "0000:01:00.0",
+		},
+		{
+			name: "macvlan over vlan subinterface",
+			link: &netlink.Macvlan{LinkAttrs: newAttrs(10, 4, "mv-vlan")},
+			want: "0000:01:00.0",
+		},
+		{
+			name: "missing parent index",
+			link: &netlink.IPVlan{LinkAttrs: newAttrs(10, 99, "iv-missing")},
+			want: "",
+		},
+		{
+			name: "zero parent index",
+			link: &netlink.Macvlan{LinkAttrs: newAttrs(10, 0, "mv-noparent")},
+			want: "",
+		},
+		{
+			name: "cross-netns parent index is ignored",
+			link: &netlink.Macvlan{LinkAttrs: crossNetnsAttrs},
+			want: "",
+		},
+		{
+			name: "cross-netns intermediate parent is ignored",
+			link: &netlink.IPVlan{LinkAttrs: newAttrs(10, 8, "iv-foreign")},
+			want: "",
+		},
+		{
+			name: "parent cycle terminates",
+			link: &netlink.IPVlan{LinkAttrs: newAttrs(10, 5, "iv-cycle")},
+			want: "",
+		},
+		{
+			name: "self cycle terminates",
+			link: func() netlink.Link {
+				self := &netlink.Macvlan{LinkAttrs: newAttrs(20, 20, "mv-self")}
+				linksByIndex[20] = self
+				return self
+			}(),
+			want: "",
+		},
+		{
+			name: "veth peer is not treated as stacked child",
+			link: &netlink.Veth{LinkAttrs: newAttrs(10, 1, "veth-peer")},
+			want: "",
+		},
+		{
+			name: "macvlan on veth does not traverse veth peer",
+			link: &netlink.Macvlan{LinkAttrs: newAttrs(10, 7, "mv-on-veth")},
+			want: "",
+		},
+		{
+			name: "standalone vlan does not inherit directly",
+			link: &netlink.Vlan{LinkAttrs: newAttrs(10, 1, "eth0.200")},
+			want: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveParentPCIAddress(tc.link, linksByIndex, pciAddrFn); got != tc.want {
+				t.Errorf("resolveParentPCIAddress() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveParentPCIAddress_Namespaced(t *testing.T) {
+	userns.Run(t, testResolveParentPCIAddress_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testResolveParentPCIAddress_Namespaced(t *testing.T) {
+	for _, name := range []string{"eth0", "eth1"} {
+		if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}); err != nil {
+			t.Fatalf("LinkAdd(%s): %v", name, err)
+		}
+	}
+	eth0, err := netlink.LinkByName("eth0")
+	if err != nil {
+		t.Fatalf("LinkByName(eth0): %v", err)
+	}
+	eth1, err := netlink.LinkByName("eth1")
+	if err != nil {
+		t.Fatalf("LinkByName(eth1): %v", err)
+	}
+
+	vlan := &netlink.Vlan{
+		LinkAttrs: netlink.LinkAttrs{Name: "eth0.100", ParentIndex: eth0.Attrs().Index},
+		VlanId:    100,
+	}
+	if err := netlink.LinkAdd(vlan); err != nil {
+		t.Fatalf("LinkAdd(eth0.100): %v", err)
+	}
+	vlanLink, err := netlink.LinkByName("eth0.100")
+	if err != nil {
+		t.Fatalf("LinkByName(eth0.100): %v", err)
+	}
+	addMacvlanChild(t, "mv0", vlanLink.Attrs().Index)
+	addIPVlanChild(t, "iv0", eth1.Attrs().Index)
+
+	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "veth0"}, PeerName: "veth1"}
+	if err := netlink.LinkAdd(veth); err != nil {
+		t.Fatalf("LinkAdd(veth0): %v", err)
+	}
+	veth0, err := netlink.LinkByName("veth0")
+	if err != nil {
+		t.Fatalf("LinkByName(veth0): %v", err)
+	}
+	addMacvlanChild(t, "mv-veth", veth0.Attrs().Index)
+
+	links, err := netlink.LinkList()
+	if err != nil {
+		t.Fatalf("LinkList: %v", err)
+	}
+	linksByIndex := make(map[int]netlink.Link, len(links))
+	linksByName := make(map[string]netlink.Link, len(links))
+	for _, l := range links {
+		linksByIndex[l.Attrs().Index] = l
+		linksByName[l.Attrs().Name] = l
+	}
+
+	pciAddrFn := func(ifName string) (*pciAddress, error) {
+		if ifName == "eth0" || ifName == "eth1" {
+			return &pciAddress{domain: "0000", bus: "01", device: "00", function: "0"}, nil
+		}
+		return nil, fmt.Errorf("virtual %s", ifName)
+	}
+
+	for name, want := range map[string]string{
+		"mv0":     "0000:01:00.0",
+		"iv0":     "0000:01:00.0",
+		"mv-veth": "",
+		"veth0":   "",
+	} {
+		if got := resolveParentPCIAddress(linksByName[name], linksByIndex, pciAddrFn); got != want {
+			t.Errorf("resolveParentPCIAddress(%s) = %q, want %q", name, got, want)
+		}
+	}
 }
