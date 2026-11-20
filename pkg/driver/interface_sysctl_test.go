@@ -95,9 +95,19 @@ func TestHasInterfaceSysctlConfig(t *testing.T) {
 			want:            true,
 		},
 		{
-			name:            "an IPv4 address",
-			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}},
+			name:            "arp notify only",
+			interfaceConfig: apis.InterfaceConfig{ARPNotify: ptr.To(true)},
 			want:            true,
+		},
+		{
+			name:            "arp notify false is still requested",
+			interfaceConfig: apis.InterfaceConfig{ARPNotify: ptr.To(false)},
+			want:            true,
+		},
+		{
+			name:            "an IPv4 address without arp notify",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}},
+			want:            false,
 		},
 		{
 			name:            "an IPv6 address without a vrf",
@@ -125,11 +135,13 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 			interfaceConfig: apis.InterfaceConfig{
 				ARPIgnore:   ptr.To[int32](1),
 				ARPAnnounce: ptr.To[int32](2),
+				ARPNotify:   ptr.To(true),
 				AcceptRA:    ptr.To[int32](0),
 			},
 			want: map[string]int{
 				"net/ipv4/conf/rdma0/arp_ignore":   1,
 				"net/ipv4/conf/rdma0/arp_announce": 2,
+				"net/ipv4/conf/rdma0/arp_notify":   1,
 				"net/ipv6/conf/rdma0/accept_ra":    0,
 			},
 		},
@@ -164,20 +176,27 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 				Addresses: []string{"192.0.2.1/24", "2001:db8::1/64"},
 				VRF:       &apis.VRFConfig{Name: "vrf0"},
 			},
-			want: map[string]int{
-				"net/ipv4/conf/rdma0/arp_notify":        1,
-				"net/ipv6/conf/rdma0/keep_addr_on_down": 1,
-			},
+			want: map[string]int{"net/ipv6/conf/rdma0/keep_addr_on_down": 1},
 		},
 		{
-			name:            "an IPv4 address is announced",
-			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}},
+			name:            "arp_notify is written",
+			interfaceConfig: apis.InterfaceConfig{ARPNotify: ptr.To(true)},
 			want:            map[string]int{"net/ipv4/conf/rdma0/arp_notify": 1},
+		},
+		{
+			name:            "arp_notify false is written",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}, ARPNotify: ptr.To(false)},
+			want:            map[string]int{"net/ipv4/conf/rdma0/arp_notify": 0},
+		},
+		{
+			name:            "an IPv4 address alone sets nothing",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}},
+			want:            map[string]int{},
 		},
 		{
 			name:            "vrf with only IPv4 addresses keeps nothing on down",
 			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}, VRF: &apis.VRFConfig{Name: "vrf0"}},
-			want:            map[string]int{"net/ipv4/conf/rdma0/arp_notify": 1},
+			want:            map[string]int{},
 		},
 		{
 			name:            "an IPv6 address alone sets nothing",

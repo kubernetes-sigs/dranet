@@ -91,6 +91,15 @@ type InterfaceConfig struct {
 	// must be requested explicitly.
 	ARPAnnounce *int32 `json:"arpAnnounce,omitempty"`
 
+	// ARPNotify, if true, makes the kernel announce the IPv4 addresses of the
+	// interface with a gratuitous ARP when it comes up in the Pod, through
+	// /proc/sys/net/ipv4/conf/<iface>/arp_notify. Neighbors that learned an
+	// address from its previous owner then update their entry instead of
+	// sending to the old hardware address until it expires.
+	// Linux uses max(conf/all, conf/<iface>) as the effective value.
+	// When unset, the kernel setting is unchanged.
+	ARPNotify *bool `json:"arpNotify,omitempty"`
+
 	// AcceptRA controls IPv6 router advertisement acceptance through
 	// /proc/sys/net/ipv6/conf/<iface>/accept_ra. Valid values are 0-2.
 	// Moving the interface resets it to the destination namespace default, so it
@@ -110,6 +119,7 @@ type InterfaceConfig struct {
 * **groIPv4MaxSize** (int32, optional): The maximum Generic Receive Offload size for IPv4.
 * **arpIgnore** (int32, optional): Which ARP requests the interface answers. Valid values are 0, 1, 2, 3, and 8. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_ignore`.
 * **arpAnnounce** (int32, optional): The source address the interface uses in ARP requests, from 0 to 2. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_announce`.
+* **arpNotify** (bool, optional): Whether the kernel announces the IPv4 addresses of the interface with a gratuitous ARP when it comes up in the Pod. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_notify`. When omitted, DRANET does not change the setting, and the kernel default is off.
 * **acceptRA** (int32, optional): Whether the interface accepts IPv6 router advertisements. `0` rejects them, `1` accepts them when forwarding is off, and `2` accepts them also when forwarding is on. Sets `/proc/sys/net/ipv6/conf/<iface>/accept_ra`.
 
 The kernel resets both ARP settings to the network namespace default when an interface
@@ -133,15 +143,18 @@ values from the initial network namespace, subject to `net.core.devconf_inherit_
 The IPv6 values start at the kernel defaults (`accept_ra` is 1) unless that sysctl is 1 or 3.
 DRANET only changes the per-interface value.
 
-DRANET also sets `arp_notify` on an interface that gets an IPv4 address. The kernel then
-announces the address with a gratuitous ARP when the interface comes up in the Pod, so a
-neighbor that learned the address from another interface updates its entry instead of
-sending to the old hardware address until the entry expires.
+Set `arpNotify: true` when an address can move between interfaces, for example when a DHCP
+server hands a released address to the next Pod. The kernel then announces the IPv4
+addresses with a gratuitous ARP when the interface comes up in the Pod, so a neighbor that
+learned an address from another interface updates its entry instead of sending to the old
+hardware address until the entry expires. The effective value is also the maximum of
+`conf/all` and the per-interface value, so `arpNotify: false` cannot turn off announcements
+that `conf/all` enables.
 
 ##### IPVLAN subinterfaces
 
 An `IPVLAN` subinterface is created inside the Pod network namespace on top of the
-host device. The `mtu`, GSO and GRO sizes, `arpIgnore`, `arpAnnounce`, and `acceptRA` settings
+host device. The `mtu`, GSO and GRO sizes, `arpIgnore`, `arpAnnounce`, `arpNotify`, and `acceptRA` settings
 apply to the child. They work the same way as on a passthrough interface. The child inherits
 the TSO maximum of its parent. The kernel rejects a GSO size above that maximum. It also
 rejects a GRO size above the global kernel maximum. A later change of the parent MTU

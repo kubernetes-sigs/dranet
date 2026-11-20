@@ -442,7 +442,7 @@ func test_nsAttachNetdevAnnouncesIPv4Address_Namespaced(t *testing.T) {
 	}
 	defer conn.Close()
 
-	data, err := nsAttachNetdev("tveth0", env.nsPath, apis.InterfaceConfig{Addresses: []string{"192.0.2.10/24"}})
+	data, err := nsAttachNetdev("tveth0", env.nsPath, apis.InterfaceConfig{Addresses: []string{"192.0.2.10/24"}, ARPNotify: ptr.To(true)})
 	if err != nil {
 		t.Fatalf("nsAttachNetdev() error: %v", err)
 	}

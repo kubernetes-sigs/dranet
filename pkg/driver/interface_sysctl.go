@@ -36,20 +36,8 @@ var sysctlProvider = sysctl.New
 
 // hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
-	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil ||
-		keepsIPv6AddressesInVRF(interfaceConfig) || announcesIPv4Addresses(interfaceConfig)
-}
-
-// announcesIPv4Addresses reports whether the interface gets an IPv4 address.
-// A neighbor that learned the address from its previous owner keeps sending to
-// that hardware address until the entry expires, so the kernel announces the
-// addresses with a gratuitous ARP when the link comes up. They are added
-// before that for this reason.
-func announcesIPv4Addresses(interfaceConfig apis.InterfaceConfig) bool {
-	return slices.ContainsFunc(interfaceConfig.Addresses, func(address string) bool {
-		prefix, err := netip.ParsePrefix(address)
-		return err == nil && prefix.Addr().Is4()
-	})
+	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.ARPNotify != nil ||
+		interfaceConfig.AcceptRA != nil || keepsIPv6AddressesInVRF(interfaceConfig)
 }
 
 // keepsIPv6AddressesInVRF reports whether the interface joins a VRF with IPv6
@@ -78,8 +66,14 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 	if interfaceConfig.ARPAnnounce != nil {
 		set("ipv4", "arp_announce", *interfaceConfig.ARPAnnounce)
 	}
-	if announcesIPv4Addresses(interfaceConfig) {
-		set("ipv4", "arp_notify", 1)
+	if interfaceConfig.ARPNotify != nil {
+		// The kernel announces the addresses the interface has when the link
+		// comes up, so they are added before that.
+		var value int32
+		if *interfaceConfig.ARPNotify {
+			value = 1
+		}
+		set("ipv4", "arp_notify", value)
 	}
 	if interfaceConfig.AcceptRA != nil {
 		name := fmt.Sprintf("net/ipv6/conf/%s/accept_ra", ifName)

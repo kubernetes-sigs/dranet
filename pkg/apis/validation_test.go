@@ -802,6 +802,12 @@ func TestValidateRDMAOnlyConfigRejectsInterfaceSettings(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			name:      "arpNotify is rejected",
+			raw:       `{"interface":{"arpNotify":true}}`,
+			expectErr: true,
+			wantErr:   "interface configuration is not supported",
+		},
+		{
 			name:      "acceptRA is rejected",
 			raw:       `{"interface":{"acceptRA":2}}`,
 			expectErr: true,
