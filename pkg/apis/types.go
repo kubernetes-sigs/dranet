@@ -123,6 +123,15 @@ type InterfaceConfig struct {
 	// must be requested explicitly.
 	ARPAnnounce *int32 `json:"arpAnnounce,omitempty"`
 
+	// ARPNotify, if true, makes the kernel announce the IPv4 addresses of the
+	// interface with a gratuitous ARP when it comes up in the Pod, through
+	// /proc/sys/net/ipv4/conf/<iface>/arp_notify. Neighbors that learned an
+	// address from its previous owner then update their entry instead of
+	// sending to the old hardware address until it expires.
+	// Linux uses max(conf/all, conf/<iface>) as the effective value.
+	// When unset, the kernel setting is unchanged.
+	ARPNotify *bool `json:"arpNotify,omitempty"`
+
 	// AddrGenMode controls automatic IPv6 address generation (ip link addrgenmode):
 	// 0 = EUI64, 1 = none, 2 = stable privacy, 3 = random.
 	// When unset, the kernel setting is unchanged. Applied before bringing the
