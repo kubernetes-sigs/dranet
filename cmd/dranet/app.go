@@ -36,6 +36,7 @@ import (
 	"cel.dev/cel-go/ext"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
+	"sigs.k8s.io/dranet/internal/node"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
@@ -250,6 +251,11 @@ func main() {
 	}
 
 	db := inventory.New(optsDb...)
+	go func() {
+		if families := node.DetectIPFamilies(ctx, clientset.CoreV1().Nodes(), nodeName); families.Len() > 0 {
+			db.SetIPFamilies(families)
+		}
+	}()
 	opts = append(opts, driver.WithInventory(db))
 	dranet, err := driver.Start(ctx, driverName, clientset, nodeName, store, opts...)
 	if err != nil {

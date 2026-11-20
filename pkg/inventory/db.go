@@ -35,6 +35,7 @@ import (
 	"github.com/jaypipes/ghw"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/time/rate"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -71,12 +72,17 @@ var (
 type DB struct {
 	instance cloudprovider.CloudInstance
 	profProv cloudprovider.ProfileProvider
+
+	mu sync.RWMutex
 	// TODO: it is not common but may happen in edge cases that the default
 	// gateway changes revisit once we have more evidence this can be a
 	// potential problem or break some use cases.
 	gwInterfaces sets.Set[string]
-
-	mu sync.RWMutex
+	// ipFamilies is the set of IP families used by the cluster on this node,
+	// derived from the node addresses. Only the default-gateway uplinks of
+	// these families are excluded from the inventory. Empty means unknown,
+	// in which case the uplinks of both families are excluded.
+	ipFamilies sets.Set[v1.IPFamily]
 	// deviceStore is an in-memory cache of the available devices on the node.
 	// It is keyed by the normalized PCI address of the device. The value is a
 	// hostDevice that contains the device's attributes and node-local facts.
@@ -193,6 +199,44 @@ func New(opts ...Option) *DB {
 	return db
 }
 
+// SetIPFamilies restricts the default-gateway uplink exclusion to the given IP
+// families (typically the families of the node IPs), recomputes the excluded
+// uplink interfaces, and queues an inventory rescan if the inventory has
+// already initialized its excluded uplink set.
+func (db *DB) SetIPFamilies(families sets.Set[v1.IPFamily]) {
+	db.mu.Lock()
+	if db.ipFamilies.Equal(families) && db.gwInterfaces != nil {
+		db.mu.Unlock()
+		return
+	}
+	wasInitialized := db.gwInterfaces != nil
+	db.ipFamilies = families.Clone()
+	db.gwInterfaces = getExcludedUplinkInterfaces(db.ipFamilies)
+	klog.V(2).Infof("Excluded uplink interfaces and children for IP families %v: %v", sets.List(db.ipFamilies), db.gwInterfaces.UnsortedList())
+	db.mu.Unlock()
+
+	if wasInitialized {
+		db.RequestRescan()
+	}
+}
+
+func (db *DB) getGwInterfaces() sets.Set[string] {
+	db.mu.RLock()
+	gw := db.gwInterfaces
+	db.mu.RUnlock()
+	if gw != nil {
+		return gw
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.gwInterfaces == nil {
+		db.gwInterfaces = getExcludedUplinkInterfaces(db.ipFamilies)
+		klog.V(2).Infof("Excluded uplink interfaces and children for IP families %v: %v", sets.List(db.ipFamilies), db.gwInterfaces.UnsortedList())
+	}
+	return db.gwInterfaces
+}
+
 func (db *DB) Run(ctx context.Context) error {
 	defer close(db.notifications)
 
@@ -226,8 +270,7 @@ func (db *DB) Run(ctx context.Context) error {
 		addrChannel = nil
 	}
 
-	db.gwInterfaces = getExcludedUplinkInterfaces()
-	klog.V(2).Infof("Excluded uplink interfaces and children: %v", db.gwInterfaces.UnsortedList())
+	_ = db.getGwInterfaces()
 
 	for {
 		err := db.rateLimiter.Wait(ctx)
@@ -294,10 +337,11 @@ func (db *DB) scan() []resourceapi.Device {
 	devices = db.addCloudAttributes(devices)
 
 	// Remove default interface.
+	gwInterfaces := db.getGwInterfaces()
 	filteredDevices := []hostDevice{}
 	for _, device := range devices {
 		ifName := device.Attributes[apis.AttrInterfaceName].StringValue
-		if ifName != nil && db.gwInterfaces.Has(string(*ifName)) {
+		if ifName != nil && gwInterfaces.Has(string(*ifName)) {
 			klog.V(4).Infof("Ignoring interface %s from discovery since it is an uplink interface or a child of one", *ifName)
 			continue
 		}

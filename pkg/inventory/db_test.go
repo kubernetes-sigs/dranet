@@ -19,9 +19,11 @@ package inventory
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -31,7 +33,9 @@ import (
 	"github.com/jaypipes/ghw"
 	"github.com/jaypipes/pcidb"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -1301,4 +1305,166 @@ func findDevice(devices []resourceapi.Device, ifName string) *resourceapi.Device
 		}
 	}
 	return nil
+}
+
+func TestSetIPFamilies(t *testing.T) {
+	userns.Run(t, testSetIPFamilies_Namespaced, syscall.CLONE_NEWNET)
+}
+
+func testSetIPFamilies_Namespaced(t *testing.T) {
+	if err := netlink.LinkSetUp(&netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: "lo"}}); err != nil {
+		t.Fatalf("failed to bring lo up: %v", err)
+	}
+
+	ipv4Subnet, _ := netlink.ParseAddr("192.168.10.2/24")
+	ipv6Subnet, _ := netlink.ParseAddr("fd00:10::2/64")
+	ipv6Subnet.Flags = unix.IFA_F_NODAD
+	links := make(map[string]netlink.Link)
+	for _, name := range []string{"eth0", "eth1", "rdma0"} {
+		dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}
+		if err := netlink.LinkAdd(dummy); err != nil {
+			t.Fatalf("failed to add dummy %s: %v", name, err)
+		}
+		if err := netlink.LinkSetUp(dummy); err != nil {
+			t.Fatalf("failed to set %s up: %v", name, err)
+		}
+		link, err := netlink.LinkByName(name)
+		if err != nil {
+			t.Fatalf("failed to look up %s: %v", name, err)
+		}
+		if err := netlink.AddrAdd(link, ipv4Subnet); err != nil {
+			t.Fatalf("failed to add IPv4 addr to %s: %v", name, err)
+		}
+		if err := netlink.AddrAdd(link, ipv6Subnet); err != nil {
+			t.Fatalf("failed to add IPv6 addr to %s: %v", name, err)
+		}
+		links[name] = link
+	}
+
+	_, defaultIPv4, _ := net.ParseCIDR("0.0.0.0/0")
+	_, defaultIPv6, _ := net.ParseCIDR("::/0")
+	if err := netlink.RouteAdd(&netlink.Route{
+		Family:    netlink.FAMILY_V4,
+		Dst:       defaultIPv4,
+		Gw:        net.ParseIP("192.168.10.1"),
+		LinkIndex: links["eth0"].Attrs().Index,
+		Priority:  100,
+		Table:     unix.RT_TABLE_MAIN,
+	}); err != nil {
+		t.Fatalf("failed to add IPv4 default route: %v", err)
+	}
+	if err := netlink.RouteAdd(&netlink.Route{
+		Family:    netlink.FAMILY_V6,
+		Dst:       defaultIPv6,
+		Gw:        net.ParseIP("fd00:10::1"),
+		LinkIndex: links["rdma0"].Attrs().Index,
+		Priority:  100,
+		Table:     unix.RT_TABLE_MAIN,
+	}); err != nil {
+		t.Fatalf("failed to add IPv6 default route: %v", err)
+	}
+
+	t.Run("before Run initializes without queuing redundant rescan", func(t *testing.T) {
+		db := New()
+		db.SetIPFamilies(sets.New(v1.IPv4Protocol))
+		if len(db.rescanCh) != 0 {
+			t.Errorf("SetIPFamilies before first scan queued rescan (%d), want 0", len(db.rescanCh))
+		}
+		if diff := cmp.Diff(sets.New("eth0"), db.getGwInterfaces()); diff != "" {
+			t.Errorf("getGwInterfaces() mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("async update during Run un-excludes unused family uplink", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		db := New(
+			WithRateLimiter(rate.NewLimiter(rate.Every(10*time.Millisecond), 5)),
+			WithMaxPollInterval(time.Hour),
+		)
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- db.Run(ctx)
+		}()
+		updates := db.GetResources(ctx)
+		defer func() {
+			cancel()
+			for range updates {
+			}
+			<-errCh
+		}()
+
+		ifNames := func(devices []resourceapi.Device) sets.Set[string] {
+			out := sets.New[string]()
+			for _, d := range devices {
+				if attr, ok := d.Attributes[apis.AttrInterfaceName]; ok && attr.StringValue != nil {
+					out.Insert(*attr.StringValue)
+				}
+			}
+			return out
+		}
+
+		timeout := time.After(5 * time.Second)
+		waitFor := func(what string, pred func(sets.Set[string]) bool) {
+			t.Helper()
+			for {
+				select {
+				case devices, ok := <-updates:
+					if !ok {
+						t.Fatalf("Run stopped while waiting for %s", what)
+					}
+					got := ifNames(devices)
+					if got.Has("eth0") {
+						t.Fatalf("IPv4 uplink eth0 must never be published, got: %v", sets.List(got))
+					}
+					if pred(got) {
+						return
+					}
+				case <-timeout:
+					t.Fatalf("timed out waiting for %s", what)
+				}
+			}
+		}
+
+		// Initial scan has unknown IP families -> excludes both eth0 (v4) and rdma0 (v6).
+		waitFor("initial scan excluding both uplinks", func(got sets.Set[string]) bool {
+			return got.Has("eth1") && !got.Has("rdma0")
+		})
+
+		// Node addresses arrive asynchronously for an IPv4-only cluster.
+		db.SetIPFamilies(sets.New(v1.IPv4Protocol))
+
+		// Subsequent scan publishes rdma0 while keeping eth0 excluded.
+		waitFor("rescan publishing rdma0 after SetIPFamilies(IPv4)", func(got sets.Set[string]) bool {
+			return got.Has("eth1") && got.Has("rdma0")
+		})
+
+		// Duplicate call with identical families is a no-op.
+		db.SetIPFamilies(sets.New(v1.IPv4Protocol))
+		if len(db.rescanCh) != 0 {
+			t.Errorf("duplicate SetIPFamilies queued rescan (%d), want 0", len(db.rescanCh))
+		}
+	})
+
+	t.Run("concurrent SetIPFamilies and scan are race-free", func(t *testing.T) {
+		db := New()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				if i%2 == 0 {
+					db.SetIPFamilies(sets.New(v1.IPv4Protocol))
+				} else {
+					db.SetIPFamilies(sets.New(v1.IPv4Protocol, v1.IPv6Protocol))
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				_, _ = db.GetNetInterfaceName("absent-device")
+			}
+		}()
+		wg.Wait()
+	})
 }
