@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"cel.dev/cel-go/cel"
@@ -111,6 +112,14 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+
+	// publishMu serializes ResourceSlice publication and guards lastLive and
+	// hasLive so UnprepareResourceClaims can synchronously drop deleted claim
+	// snapshots without waiting on an inventory scan or racing an in-flight
+	// PublishResources pass.
+	publishMu sync.Mutex
+	lastLive  []resourceapi.Device
+	hasLive   bool
 
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.
