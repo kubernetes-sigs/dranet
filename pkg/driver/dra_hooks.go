@@ -161,6 +161,9 @@ func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*re
 	if len(claims) == 0 {
 		return nil, nil
 	}
+	if !np.nriConnected.Load() {
+		return nil, fmt.Errorf("NRI plugin %s is not connected to container runtime", np.driverName)
+	}
 	result := make(map[types.UID]kubeletplugin.PrepareResult)
 
 	for _, claim := range claims {

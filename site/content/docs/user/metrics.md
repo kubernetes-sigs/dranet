@@ -15,7 +15,9 @@ endpoints are reachable on port `9177` of each node's IP address.
 
 | Path | Description |
 |------|-------------|
-| `/healthz` | Returns `503 Service Unavailable` until the kubelet has registered the DRA plugin and the driver has started, and `200 OK` after that. The startup and readiness probes of the DaemonSet use it. It does not report later failures; see [Connection loops](#connection-loops) for those. |
+| `/healthz` | Evaluates the logical AND of the DRA (`dra`) and NRI (`nri`) checks, returning `200 OK` (`ok`) only when both are healthy and `503 Service Unavailable` with per-check details otherwise. Supports `?verbose` and `?exclude=<check>` like Kubernetes apiserver healthz endpoints. The startup and readiness probes of the DaemonSet use it. |
+| `/healthz/dra` | Returns `200 OK` when the DRA kubelet plugin is started and registered with kubelet, and `503 Service Unavailable` otherwise. |
+| `/healthz/nri` | Returns `200 OK` when the NRI plugin is connected and synchronized with the container runtime, and `503 Service Unavailable` otherwise. |
 | `/metrics` | Prometheus metrics in the text exposition format. |
 
 DRANET binds the address before it starts the driver. If the port is already in
@@ -103,10 +105,11 @@ well. On a node where DRANET has never found a device,
 ### Connection loops
 
 DRANET runs its NRI plugin connection and its device inventory in loops that
-DRANET restarts when they stop. When either loop has stopped 5 times, the
-DRANET process exits and the kubelet restarts the container. These counters
-reset when the process restarts, so a value that approaches 5 warns that the
-process is about to exit.
+DRANET restarts when they stop. When either loop fails 5 consecutive times, the
+DRANET process exits and the kubelet restarts the container (for NRI, the
+consecutive failure counter resets after each synchronized session so routine
+container runtime restarts do not crash DRANET). These counters reset when the
+process restarts.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
