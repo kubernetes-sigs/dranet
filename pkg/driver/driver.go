@@ -18,9 +18,11 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"cel.dev/cel-go/cel"
@@ -49,6 +51,11 @@ import (
 const (
 	// maxAttempts indicates the number of times the driver will try to recover itself before failing
 	maxAttempts = 5
+
+	// The driver waits before each new connection of the NRI plugin. The wait
+	// starts at nriInitialBackoff and doubles up to nriMaxBackoff.
+	nriInitialBackoff = time.Second
+	nriMaxBackoff     = 16 * time.Second
 )
 
 // This interface is our internal contract for the behavior we need from a *kubeletplugin.Helper, created specifically so we can fake it in tests.
@@ -121,11 +128,20 @@ type NetworkDriver struct {
 	kubeletRootDir string
 
 	clock clock.WithTicker // Injectable clock for testing
+
+	// draRegistered is true from the registration of the DRA plugin in the
+	// kubelet until Stop.
+	draRegistered atomic.Bool
+	// nriConnected is true while the NRI plugin has a connection to the
+	// container runtime. Only runNRI changes it.
+	nriConnected atomic.Bool
 }
 
 type Option func(*NetworkDriver)
 
-func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interface, nodeName string, podConfigStore *PodConfigStore, opts ...Option) (*NetworkDriver, error) {
+// New returns a driver that is not started. The caller can use CheckDRA and
+// CheckNRI before Start.
+func New(driverName string, kubeClient kubernetes.Interface, nodeName string, podConfigStore *PodConfigStore, opts ...Option) *NetworkDriver {
 	registerMetrics()
 
 	rdmaNetnsMode, err := nlwrap.RdmaSystemGetNetnsMode()
@@ -156,43 +172,15 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		o(plugin)
 	}
 
-	driverPluginPath := filepath.Join(plugin.kubeletRootDir, "plugins", driverName)
-	err = os.MkdirAll(driverPluginPath, 0750)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create plugin path %s: %v", driverPluginPath, err)
-	}
+	return plugin
+}
 
-	// Derive the registration and plugin data directories from the kubelet root
-	// dir so they are correct when the kubelet uses a non-default --root-dir. At
-	// the default this matches the kubeletplugin defaults, so existing deployments
-	// are unaffected.
-	kubeletOpts := []kubeletplugin.Option{
-		kubeletplugin.DriverName(driverName),
-		kubeletplugin.NodeName(nodeName),
-		kubeletplugin.KubeClient(kubeClient),
-		kubeletplugin.RegistrarDirectoryPath(filepath.Join(plugin.kubeletRootDir, "plugins_registry")),
-		kubeletplugin.PluginDataDirectoryPath(driverPluginPath),
-		kubeletplugin.HealthService(false),
-	}
-	d, err := kubeletplugin.Start(ctx, plugin, kubeletOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("start kubelet plugin: %w", err)
-	}
-	plugin.draPlugin = d
-	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(context.Context) (bool, error) {
-		status := plugin.draPlugin.RegistrationStatus()
-		if status == nil {
-			return false, nil
-		}
-		return status.PluginRegistered, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
+// Start starts the NRI plugin, the DRA plugin, the inventory and the
+// publication of the resources.
+func (np *NetworkDriver) Start(ctx context.Context) error {
 	// register the NRI plugin
 	nriOpts := []stub.Option{
-		stub.WithPluginName(driverName),
+		stub.WithPluginName(np.driverName),
 		stub.WithPluginIdx("00"),
 		// https://github.com/containerd/nri/pull/329
 		// Fail the pod or container request if the plugin times out or
@@ -207,39 +195,77 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		// Otherwise it silently exits the program
 		stub.WithOnClose(func() {
 			nriPluginDisconnectsTotal.Inc()
-			klog.Infof("%s NRI plugin closed", driverName)
+			klog.Infof("%s NRI plugin closed", np.driverName)
 		}),
 	}
-	stub, err := stub.New(plugin, nriOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create plugin stub: %v", err)
+	if np.nriPlugin == nil {
+		stub, err := stub.New(np, nriOpts...)
+		if err != nil {
+			return fmt.Errorf("failed to create plugin stub: %v", err)
+		}
+		np.nriPlugin = stub
 	}
-	plugin.nriPlugin = stub
 
 	go func() {
-		for i := 0; i < maxAttempts; i++ {
-			err = plugin.nriPlugin.Run(ctx)
-			if err != nil {
-				klog.Infof("NRI plugin failed with error %v", err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				nriPluginReconnectAttemptsTotal.Inc()
-				klog.Infof("Restarting NRI plugin %d out of %d", i+1, maxAttempts)
-			}
+		if err := np.runNRI(ctx); err != nil {
+			klog.Fatalf("%v", err)
 		}
-		klog.Fatalf("NRI plugin failed for %d times to be restarted", maxAttempts)
 	}()
 
+	// Connect the NRI plugin before the DRA plugin starts. When the DRA plugin
+	// is registered, the kubelet can create the sandbox of a pod without a new
+	// NodePrepareResources call, if the claims of the pod are already
+	// prepared. The runtime must have the NRI plugin at that time, or the pod
+	// starts without its network interfaces.
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(context.Context) (bool, error) {
+		return np.nriConnected.Load(), nil
+	})
+	if err != nil {
+		return fmt.Errorf("NRI plugin is not connected: %w", err)
+	}
+
+	driverPluginPath := filepath.Join(np.kubeletRootDir, "plugins", np.driverName)
+	err = os.MkdirAll(driverPluginPath, 0750)
+	if err != nil {
+		return fmt.Errorf("failed to create plugin path %s: %v", driverPluginPath, err)
+	}
+
+	// Derive the registration and plugin data directories from the kubelet root
+	// dir so they are correct when the kubelet uses a non-default --root-dir. At
+	// the default this matches the kubeletplugin defaults, so existing deployments
+	// are unaffected.
+	kubeletOpts := []kubeletplugin.Option{
+		kubeletplugin.DriverName(np.driverName),
+		kubeletplugin.NodeName(np.nodeName),
+		kubeletplugin.KubeClient(np.kubeClient),
+		kubeletplugin.RegistrarDirectoryPath(filepath.Join(np.kubeletRootDir, "plugins_registry")),
+		kubeletplugin.PluginDataDirectoryPath(driverPluginPath),
+		kubeletplugin.HealthService(false),
+	}
+	d, err := kubeletplugin.Start(ctx, np, kubeletOpts...)
+	if err != nil {
+		return fmt.Errorf("start kubelet plugin: %w", err)
+	}
+	np.draPlugin = d
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(context.Context) (bool, error) {
+		status := np.draPlugin.RegistrationStatus()
+		if status == nil {
+			return false, nil
+		}
+		return status.PluginRegistered, nil
+	})
+	if err != nil {
+		return err
+	}
+	np.draRegistered.Store(true)
+
 	// register the host network interfaces
-	if plugin.netdb == nil {
-		plugin.netdb = inventory.New()
+	if np.netdb == nil {
+		np.netdb = inventory.New()
 	}
 	go func() {
 		for i := 0; i < maxAttempts; i++ {
-			err = plugin.netdb.Run(ctx)
+			err = np.netdb.Run(ctx)
 			if err != nil {
 				klog.Infof("Network Device DB failed with error %v", err)
 			}
@@ -255,9 +281,62 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	}()
 
 	// publish available resources
-	go plugin.PublishResources(ctx)
+	go np.PublishResources(ctx)
 
-	return plugin, nil
+	return nil
+}
+
+// runNRI keeps the NRI plugin connected to the container runtime until ctx is
+// done. It waits before each new connection. It returns an error after
+// maxAttempts failures in sequence, and then the caller must exit: the stub of
+// containerd/nri v0.12.5 cannot connect again after a failed registration.
+func (np *NetworkDriver) runNRI(ctx context.Context) error {
+	failures := 0
+	backoff := nriInitialBackoff
+	for {
+		err := np.nriPlugin.Start(ctx)
+		if err == nil {
+			np.nriConnected.Store(true)
+			// Wait returns when the connection closes.
+			np.nriPlugin.Wait()
+			np.nriConnected.Store(false)
+			failures, backoff = 0, nriInitialBackoff
+		} else {
+			failures++
+			klog.Infof("NRI plugin failed with error %v", err)
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if failures >= maxAttempts {
+			return fmt.Errorf("NRI plugin failed for %d times to be restarted: %w", maxAttempts, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-np.clock.After(backoff):
+		}
+		backoff = min(backoff*2, nriMaxBackoff)
+		nriPluginReconnectAttemptsTotal.Inc()
+		klog.Infof("Restarting NRI plugin, %d failures in sequence out of %d", failures, maxAttempts)
+	}
+}
+
+// CheckDRA returns an error if the DRA plugin is not registered in the kubelet.
+func (np *NetworkDriver) CheckDRA() error {
+	if !np.draRegistered.Load() {
+		return errors.New("DRA plugin is not registered with kubelet")
+	}
+	return nil
+}
+
+// CheckNRI returns an error if the NRI plugin has no connection to the
+// container runtime.
+func (np *NetworkDriver) CheckNRI() error {
+	if !np.nriConnected.Load() {
+		return errors.New("NRI plugin is not connected to the container runtime")
+	}
+	return nil
 }
 
 // Stop handles the graceful termination of the Network Driver by coordinating
@@ -287,6 +366,7 @@ func (np *NetworkDriver) Stop(ctxCancel context.CancelFunc) {
 	// Step 1: Halt the DRA plugin.
 	// This stops the driver from handling new NodePrepareResources requests,
 	// stabilizing the set of pods that require NRI processing.
+	np.draRegistered.Store(false)
 	np.draPlugin.Stop()
 
 	// Step 2: Wait for prepared pods to finish NRI initialization.
