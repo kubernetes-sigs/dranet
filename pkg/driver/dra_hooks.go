@@ -64,38 +64,58 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 	for {
 		select {
 		// Wait for updates from the host-discovered (live) device inventory
-		case live := <-np.netdb.GetResources(ctx):
+		case live, ok := <-np.netdb.GetResources(ctx):
+			if !ok {
+				return
+			}
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(live), formatDeviceNames(live, 15))
-
-			// Fetch device snapshots from BoltDB store and merge
-			merged := live
-			if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
-				snapshots := np.podConfigStore.GetAllocatedDeviceSnapshots()
-				merged = mergeDevices(live, snapshots)
-			}
-
-			// Apply filtering on the merged set of devices
-			filtered := filter.FilterDevices(np.celProgram, merged)
-
-			klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
-
-			np.publishResourcesPrometheusMetrics(filtered)
-
-			resources := resourceslice.DriverResources{
-				Pools: map[string]resourceslice.Pool{
-					np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
-				},
-			}
-			err := np.draPlugin.PublishResources(ctx, resources)
-			if err != nil {
-				klog.Error(err, "unexpected error trying to publish resources")
-			} else {
-				lastPublishedTime.SetToCurrentTime()
-			}
+			np.publishMu.Lock()
+			np.lastLive = live
+			np.hasLive = true
+			np.publishResourcesLocked(ctx)
+			np.publishMu.Unlock()
 		case <-ctx.Done():
 			klog.Error(ctx.Err(), "context canceled")
 			return
 		}
+	}
+}
+
+// publishResourcesLocked merges the latest live inventory with current
+// allocated device snapshots, applies the CEL filter, and hands the result to
+// draPlugin. Caller must hold np.publishMu.
+//
+// Lock ordering: publishMu -> podConfigStore.mu (RLock). Never call into netdb
+// or NRI hooks while holding publishMu.
+func (np *NetworkDriver) publishResourcesLocked(ctx context.Context) {
+	if !np.hasLive || np.draPlugin == nil {
+		return
+	}
+
+	// Fetch device snapshots from BoltDB store and merge
+	merged := np.lastLive
+	if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
+		snapshots := np.podConfigStore.GetAllocatedDeviceSnapshots()
+		merged = mergeDevices(np.lastLive, snapshots)
+	}
+
+	// Apply filtering on the merged set of devices
+	filtered := filter.FilterDevices(np.celProgram, merged)
+
+	klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
+
+	np.publishResourcesPrometheusMetrics(filtered)
+
+	resources := resourceslice.DriverResources{
+		Pools: map[string]resourceslice.Pool{
+			np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
+		},
+	}
+	err := np.draPlugin.PublishResources(ctx, resources)
+	if err != nil {
+		klog.Error(err, "unexpected error trying to publish resources")
+	} else {
+		lastPublishedTime.SetToCurrentTime()
 	}
 }
 
@@ -140,6 +160,9 @@ func (np *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*re
 func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
 	if len(claims) == 0 {
 		return nil, nil
+	}
+	if !np.nriConnected.Load() {
+		return nil, fmt.Errorf("NRI plugin %s is not connected to container runtime", np.driverName)
 	}
 	result := make(map[types.UID]kubeletplugin.PrepareResult)
 
@@ -556,6 +579,20 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 			klog.Infof("error unpreparing ressources for claim %s/%s : %v", claim.Namespace, claim.Name, err)
 		}
 	}
+
+	// The claims' device snapshots are gone. When PersistentResourceSliceAttributes
+	// is enabled, synchronously republish from the cached live inventory under
+	// publishMu before returning to kubelet so the ResourceSlice drops the
+	// deleted snapshots immediately (and cannot be overwritten by a concurrent
+	// PublishResources pass) without blocking on an inventory scan. Also queue
+	// an async rescan for devices that returned without a netlink event.
+	if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
+		np.publishMu.Lock()
+		np.publishResourcesLocked(ctx)
+		np.publishMu.Unlock()
+	}
+	np.netdb.RequestRescan()
+
 	return result, nil
 }
 
@@ -591,10 +628,6 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 	}
 
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
-	// The claim's device snapshots are gone, so republish now instead of on
-	// the next periodic poll. Otherwise attributes merged from the snapshots
-	// stay in the ResourceSlice after the device becomes allocatable again.
-	np.netdb.RequestRescan()
 	return nil
 }
 
