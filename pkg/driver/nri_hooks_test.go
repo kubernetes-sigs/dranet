@@ -20,12 +20,15 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/vishvananda/netlink"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	userns "sigs.k8s.io/dranet/internal/testutils"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
 )
@@ -302,6 +305,77 @@ func TestSynchronizeStoresNetNSOnlyForConfiguredPods(t *testing.T) {
 	_, found3 := store.GetPodConfig("unconfigured-pod")
 	if found3 {
 		t.Error("unconfigured-pod should NOT have any PodConfig in the store")
+	}
+}
+
+func TestSynchronizeReportsMissingDevices(t *testing.T) {
+	userns.Run(t, testSynchronizeReportsMissingDevices, syscall.CLONE_NEWNET)
+}
+
+// testSynchronizeReportsMissingDevices runs in a new network namespace and
+// uses it as the network namespace of the pod.
+func testSynchronizeReportsMissingDevices(t *testing.T) {
+	const ifName = "eth1"
+	store := mustNewPodConfigStore()
+	netdev := DeviceConfig{}
+	netdev.NetworkInterfaceConfigInHost.Interface.Name = "dummy0"
+	netdev.NetworkInterfaceConfigInPod.Interface.Name = ifName
+	if err := store.SetDeviceConfig("pod-uid", "dev-net", netdev); err != nil {
+		t.Fatal(err)
+	}
+	// A device with no network interface, for example an RDMA only device,
+	// has no link in the namespace of the pod.
+	if err := store.SetDeviceConfig("pod-uid", "dev-rdma", DeviceConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := record.NewFakeRecorder(10)
+	np := &NetworkDriver{podConfigStore: store, eventRecorder: recorder}
+	pod := &api.PodSandbox{
+		Id:        "sandbox-1",
+		Uid:       "pod-uid",
+		Name:      "pod",
+		Namespace: "default",
+		Linux: &api.LinuxPodSandbox{
+			Namespaces: []*api.LinuxNamespace{{Type: "network", Path: "/proc/self/ns/net"}},
+		},
+	}
+	// synchronize returns the events and the increase of the metric.
+	synchronize := func(state api.ContainerState) ([]string, float64) {
+		t.Helper()
+		before := testutil.ToFloat64(podsMissingDevicesTotal)
+		containers := []*api.Container{{Id: "ctr-1", PodSandboxId: pod.Id, State: state}}
+		if _, err := np.Synchronize(context.Background(), []*api.PodSandbox{pod}, containers); err != nil {
+			t.Fatalf("Synchronize() error: %v", err)
+		}
+		var events []string
+		for len(recorder.Events) > 0 {
+			events = append(events, <-recorder.Events)
+		}
+		return events, testutil.ToFloat64(podsMissingDevicesTotal) - before
+	}
+
+	// A sandbox with no running container can be in creation or in teardown.
+	if events, reported := synchronize(api.ContainerState_CONTAINER_CREATED); len(events) != 0 || reported != 0 {
+		t.Errorf("no running container: events = %v, metric increase = %v, want none", events, reported)
+	}
+
+	// The pod runs and the claimed interface is not in its namespace.
+	events, reported := synchronize(api.ContainerState_CONTAINER_RUNNING)
+	if len(events) != 1 || !strings.Contains(events[0], "Warning NetworkDeviceMissing") ||
+		!strings.Contains(events[0], "dev-net") || strings.Contains(events[0], "dev-rdma") {
+		t.Errorf("interface missing: events = %v, want one NetworkDeviceMissing event for dev-net only", events)
+	}
+	if reported != 1 {
+		t.Errorf("interface missing: metric increase = %v, want 1", reported)
+	}
+
+	// The pod runs and the claimed interface is in its namespace.
+	if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: ifName}}); err != nil {
+		t.Fatalf("failed to add link %s: %v", ifName, err)
+	}
+	if events, reported := synchronize(api.ContainerState_CONTAINER_RUNNING); len(events) != 0 || reported != 0 {
+		t.Errorf("interface present: events = %v, metric increase = %v, want none", events, reported)
 	}
 }
 

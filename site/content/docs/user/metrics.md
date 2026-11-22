@@ -123,6 +123,32 @@ attempts that failed to connect or register. A disconnect can happen after
 DRANET has already handled a request successfully, so it does not show up in
 `dranet_driver_nri_plugin_requests_total{status="failed"}`.
 
+### Pods without their devices
+
+A pod can start without the network devices that it claims if the container
+runtime creates its sandbox while the runtime does not have the DRANET NRI
+plugin. That needs a fault on the node at that moment: DRANET is killed or
+panics, or the container runtime restarts. A graceful stop of DRANET, for
+example an update, is safe. The kubelet does not prepare the claims again for
+such a pod, so nothing attaches the devices later.
+
+DRANET cannot prevent this, because it is not connected when it happens. Each
+time DRANET connects to the container runtime, it looks at the running pods that
+it prepared, and it reports the ones that do not have a claimed network
+interface in their network namespace:
+
+- a `Warning` event with the reason `NetworkDeviceMissing` on the Pod;
+- an error in the DRANET log;
+- the metric below.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `dranet_driver_pods_missing_devices_total` | Counter | none | Number of times DRANET found a running pod without a network device that the pod claims. |
+
+Delete the pod to create it again with its devices. DRANET does not check the
+devices that have no network interface in the pod, for example RDMA only
+devices.
+
 ## Example queries
 
 Failed NRI requests per second, by method:
@@ -152,4 +178,11 @@ Nodes where a DRANET loop has stopped, so the process may exit soon:
 ```promql
 dranet_driver_nri_plugin_reconnect_attempts_total > 0
   or dranet_driver_netdb_reconnect_attempts_total > 0
+```
+
+Nodes where DRANET found a pod that runs without a claimed network device in
+the last hour:
+
+```promql
+increase(dranet_driver_pods_missing_devices_total[1h]) > 0
 ```

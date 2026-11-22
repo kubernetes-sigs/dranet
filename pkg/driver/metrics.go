@@ -50,6 +50,7 @@ func registerMetrics() {
 		prometheus.MustRegister(nriPluginDisconnectsTotal)
 		prometheus.MustRegister(nriPluginReconnectAttemptsTotal)
 		prometheus.MustRegister(netdbReconnectAttemptsTotal)
+		prometheus.MustRegister(podsMissingDevicesTotal)
 	})
 }
 
@@ -127,5 +128,14 @@ var (
 		Subsystem: "driver",
 		Name:      "netdb_reconnect_attempts_total",
 		Help:      "Total number of times the host network device database's connection loop has been restarted. Resets on process restart; approaches maxAttempts before the process exits.",
+	})
+	// podsMissingDevicesTotal counts the running pods that dranet found without
+	// a network device that they claim, each time it synchronizes with the
+	// runtime. See reportMissingDevices.
+	podsMissingDevicesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "pods_missing_devices_total",
+		Help:      "Total number of times dranet found a running pod without a network device that the pod claims.",
 	})
 )

@@ -272,3 +272,26 @@ func nsDetachNetdevFromNS(containerNs netns.NsHandle, containerNsPath string, de
 	}
 	return nil
 }
+
+// nsHasLink reports whether the network namespace has a link with this name.
+func nsHasLink(containerNsPath string, name string) (bool, error) {
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return false, fmt.Errorf("could not get network namespace from path %s: %w", containerNsPath, err)
+	}
+	defer containerNs.Close()
+
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		return false, fmt.Errorf("could not get network namespace handle: %w", err)
+	}
+	defer nhNs.Close()
+
+	if _, err := nhNs.LinkByName(name); err != nil {
+		if _, ok := err.(netlink.LinkNotFoundError); ok {
+			return false, nil
+		}
+		return false, fmt.Errorf("could not get link %s on namespace %s: %w", name, containerNsPath, err)
+	}
+	return true, nil
+}
