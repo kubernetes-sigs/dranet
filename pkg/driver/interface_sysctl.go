@@ -36,8 +36,8 @@ var sysctlProvider = sysctl.New
 
 // hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
-	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil ||
-		keepsIPv6AddressesInVRF(interfaceConfig)
+	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.ARPNotify != nil ||
+		interfaceConfig.AcceptRA != nil || keepsIPv6AddressesInVRF(interfaceConfig)
 }
 
 // keepsIPv6AddressesInVRF reports whether the interface joins a VRF with IPv6
@@ -65,6 +65,15 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 	}
 	if interfaceConfig.ARPAnnounce != nil {
 		set("ipv4", "arp_announce", *interfaceConfig.ARPAnnounce)
+	}
+	if interfaceConfig.ARPNotify != nil {
+		// The kernel announces the addresses the interface has when the link
+		// comes up, so they are added before that.
+		var value int32
+		if *interfaceConfig.ARPNotify {
+			value = 1
+		}
+		set("ipv4", "arp_notify", value)
 	}
 	if interfaceConfig.AcceptRA != nil {
 		name := fmt.Sprintf("net/ipv6/conf/%s/accept_ra", ifName)

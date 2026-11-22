@@ -453,7 +453,8 @@ func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
 		config.Interface.GROMaxSize != nil || config.Interface.GSOIPv4MaxSize != nil ||
 		config.Interface.GROIPv4MaxSize != nil || config.Interface.DisableEBPFPrograms != nil ||
 		config.Interface.Forwarding != nil || config.Interface.ARPIgnore != nil ||
-		config.Interface.ARPAnnounce != nil || config.Interface.AcceptRA != nil || config.Interface.AddrGenMode != nil ||
+		config.Interface.ARPAnnounce != nil || config.Interface.ARPNotify != nil ||
+		config.Interface.AcceptRA != nil || config.Interface.AddrGenMode != nil ||
 		config.Interface.VRF != nil || config.Interface.IPVlan != nil {
 		allErrors = append(allErrors, fmt.Errorf("interface configuration is not supported for RDMA-only devices (no network interface present)"))
 	}
