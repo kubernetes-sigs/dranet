@@ -240,6 +240,21 @@ func (db *DB) Run(ctx context.Context) error {
 			klog.Error(err, "unexpected rate limited error trying to get system interfaces")
 		}
 
+		// The scan that follows shows the result of all the events that are
+		// in the channels now. Remove them, so a burst that has link events,
+		// address events and a manual request triggers a single scan.
+		for len(nlChannel) > 0 {
+			<-nlChannel
+		}
+		for len(addrChannel) > 0 {
+			<-addrChannel
+		}
+		select {
+		case <-db.rescanCh:
+			rescanRequested = true
+		default:
+		}
+
 		filteredDevices := db.scan()
 		if len(filteredDevices) > 0 || db.hasDevices || rescanRequested {
 			select {
@@ -253,10 +268,14 @@ func (db *DB) Run(ctx context.Context) error {
 
 		select {
 		// trigger a reconcile
-		case <-nlChannel:
-			// drain the channel so we only sync once
-			for len(nlChannel) > 0 {
-				<-nlChannel
+		case _, ok := <-nlChannel:
+			if !ok {
+				// The subscription stopped after a receive error, for example
+				// when the socket buffer overflowed because Run did not read
+				// the events. Stop selecting on the closed channel so it does
+				// not trigger a scan on every iteration.
+				klog.Errorf("netlink link subscription closed, link changes are only synced periodically every %s", db.maxPollInterval)
+				nlChannel = nil
 			}
 		case _, ok := <-addrChannel:
 			if !ok {
@@ -265,11 +284,6 @@ func (db *DB) Run(ctx context.Context) error {
 				// scan on every iteration.
 				klog.Errorf("netlink address subscription closed, address changes are only synced periodically every %s", db.maxPollInterval)
 				addrChannel = nil
-				break
-			}
-			// drain the channel so we only sync once
-			for len(addrChannel) > 0 {
-				<-addrChannel
 			}
 		case <-db.rescanCh:
 			klog.V(3).Infof("Triggering inventory rescan due to manual request")

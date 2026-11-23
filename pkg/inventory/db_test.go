@@ -1409,3 +1409,160 @@ func testRunCanRestartAndCancelWithoutConsumer(t *testing.T) {
 		return ipv4 != nil && *ipv4 == "192.0.2.20/24"
 	})
 }
+
+const (
+	// runSettleTime is the time that the tests below give to Run to reach the
+	// point where it blocks, and to netlink to deliver the events to Run.
+	runSettleTime = 500 * time.Millisecond
+	// runQuietPeriod is the time without a scan after which the tests below
+	// conclude that Run waits for the next event. It is much longer than a scan.
+	runQuietPeriod = 2 * time.Second
+)
+
+// startRunOnVeth creates a veth pair that stays down, so it gives no events
+// that the test does not make. It starts Run with no rate limit and no
+// periodic poll, so only an event triggers a scan, and returns after the
+// initial scan.
+func startRunOnVeth(t *testing.T) (*DB, netlink.Link, <-chan []resourceapi.Device) {
+	t.Helper()
+	la := netlink.NewLinkAttrs()
+	la.Name = "veth0"
+	link := &netlink.Veth{LinkAttrs: la, PeerName: "veth1"}
+	if err := netlink.LinkAdd(link); err != nil {
+		t.Fatalf("failed to add veth pair %s: %v", la.Name, err)
+	}
+
+	db := New(
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithMaxPollInterval(time.Hour),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- db.Run(ctx) }()
+	updates := db.GetResources(ctx)
+	t.Cleanup(func() {
+		cancel()
+		if err := <-runErr; err != context.Canceled {
+			t.Errorf("Run() = %v, want %v", err, context.Canceled)
+		}
+	})
+
+	select {
+	case <-updates:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the initial scan")
+	}
+	return db, link, updates
+}
+
+// blockRunInPublish makes Run do a scan and stay blocked while it publishes
+// the result, as it is while PublishResources is busy. Run reads no events
+// until the test receives from the updates channel.
+func blockRunInPublish(t *testing.T, link netlink.Link) {
+	t.Helper()
+	if err := netlink.LinkSetMTU(link, 1400); err != nil {
+		t.Fatalf("failed to set the MTU: %v", err)
+	}
+	time.Sleep(runSettleTime)
+}
+
+// scansUntilQuiet returns the scans that Run publishes until it publishes
+// none for runQuietPeriod.
+func scansUntilQuiet(t *testing.T, updates <-chan []resourceapi.Device) [][]resourceapi.Device {
+	t.Helper()
+	var scans [][]resourceapi.Device
+	timeout := time.After(30 * time.Second)
+	for {
+		select {
+		case devices, ok := <-updates:
+			if !ok {
+				t.Fatal("Run stopped")
+			}
+			scans = append(scans, devices)
+		case <-time.After(runQuietPeriod):
+			return scans
+		case <-timeout:
+			t.Fatalf("Run did not stop scanning: %d scans with no new event", len(scans))
+		}
+	}
+}
+
+func TestRunScansOnceForEventsOnAllChannels(t *testing.T) {
+	userns.Run(t, testRunScansOnceForEventsOnAllChannels, syscall.CLONE_NEWNET)
+}
+
+// testRunScansOnceForEventsOnAllChannels runs inside a fresh network
+// namespace. A pod teardown gives link events, address events and a manual
+// rescan request at almost the same time. Each scan uses a token of the rate
+// limiter, so one scan must be sufficient for all of them.
+func testRunScansOnceForEventsOnAllChannels(t *testing.T) {
+	db, link, updates := startRunOnVeth(t)
+	blockRunInPublish(t, link)
+
+	for _, mtu := range []int{1401, 1402, 1403} {
+		if err := netlink.LinkSetMTU(link, mtu); err != nil {
+			t.Fatalf("failed to set the MTU: %v", err)
+		}
+	}
+	addr, err := netlink.ParseAddr("192.0.2.10/24")
+	if err != nil {
+		t.Fatalf("failed to parse address: %v", err)
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		t.Fatalf("failed to add address: %v", err)
+	}
+	db.RequestRescan()
+	time.Sleep(runSettleTime)
+
+	// The first scan is the one that Run could not publish. It is older than
+	// the events.
+	select {
+	case <-updates:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the scan that was blocked")
+	}
+	scans := scansUntilQuiet(t, updates)
+	if len(scans) != 1 {
+		t.Fatalf("Run did %d scans for one burst of events, want 1", len(scans))
+	}
+	device := findDevice(scans[0], "veth0")
+	if device == nil {
+		t.Fatal("the scan does not have veth0")
+	}
+	if ipv4 := device.Attributes[apis.AttrIPv4].StringValue; ipv4 == nil || *ipv4 != "192.0.2.10/24" {
+		t.Errorf("the scan does not have the address that the burst added, ipv4 = %v", ptr.Deref(ipv4, "<nil>"))
+	}
+}
+
+func TestRunStopsSelectingOnClosedLinkSubscription(t *testing.T) {
+	userns.Run(t, testRunStopsSelectingOnClosedLinkSubscription, syscall.CLONE_NEWNET)
+}
+
+// testRunStopsSelectingOnClosedLinkSubscription runs inside a fresh network
+// namespace. netlink closes the channel of a subscription when a receive
+// fails, and a receive fails when the socket buffer overflows because Run did
+// not read the events. A receive from a closed channel does not block, so Run
+// must stop selecting on it.
+func testRunStopsSelectingOnClosedLinkSubscription(t *testing.T) {
+	db, link, updates := startRunOnVeth(t)
+	blockRunInPublish(t, link)
+
+	// More link events than the channel and the socket buffer can hold.
+	for i := 0; i < 2000; i++ {
+		if err := netlink.LinkSetMTU(link, 1400+i%2); err != nil {
+			t.Fatalf("failed to set the MTU: %v", err)
+		}
+	}
+	time.Sleep(runSettleTime)
+
+	// This fails if Run scans in a loop.
+	scansUntilQuiet(t, updates)
+
+	// Run continues to operate: a rescan request triggers a scan.
+	db.RequestRescan()
+	select {
+	case <-updates:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the scan of a rescan request after the link subscription closed")
+	}
+}
