@@ -30,35 +30,108 @@ import (
 )
 
 const (
+	// sysfsRootEnv names the environment variable that relocates sysfs
+	// discovery. It exists for testing and device simulation (see
+	// pkg/mockpci) and is not a supported configuration surface and may
+	// change or disappear without notice. The value is the path that plays
+	// the role of /sys, e.g. /var/run/dranet/sysfs/sys.
+	sysfsRootEnv = "DRANET_EXPERIMENTAL_SYSFS_ROOT"
+
+	defaultSysfsRoot         = "/sys"
+	defaultSysnetPath        = "/sys/class/net/"
+	defaultSysdevPath        = "/sys/devices"
+	defaultSysInfinibandPath = "/sys/class/infiniband/"
+)
+
+var (
+	sysfsRoot = defaultSysfsRoot
+
 	// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-class-net
-	sysnetPath = "/sys/class/net/"
+	sysnetPath = defaultSysnetPath
+
 	// Each of the entries in this directory is a symbolic link
 	// representing one of the real or virtual networking devices
 	// that are visible in the network namespace of the process
 	// that is accessing the directory.  Each of these symbolic
 	// links refers to entries in the /sys/devices directory.
 	// https://man7.org/linux/man-pages/man5/sysfs.5.html
-	sysdevPath = "/sys/devices"
+	sysdevPath = defaultSysdevPath
+
+	sysInfinibandPath = defaultSysInfinibandPath
 )
+
+func init() {
+	if root := os.Getenv(sysfsRootEnv); root != "" {
+		klog.Warningf("%s=%q: sysfs discovery relocated, this is for testing and device simulation only", sysfsRootEnv, root)
+		setSysfsRoot(root)
+	}
+}
+
+// setSysfsRoot configures the base path for sysfs discovery.
+func setSysfsRoot(root string) {
+	if root == "" {
+		root = defaultSysfsRoot
+	}
+	sysfsRoot = root
+	sysnetPath = filepath.Join(root, "class", "net")
+	sysdevPath = filepath.Join(root, "devices")
+	sysInfinibandPath = filepath.Join(root, "class", "infiniband")
+}
 
 // pciAddressRegex is used to identify a PCI address within a string.
 // It matches patterns like "0000:00:04.0" or "00:04.0".
 var pciAddressRegex = regexp.MustCompile(`^(?:([0-9a-fA-F]{4}):)?([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-9a-fA-F])$`)
 
-func realpath(ifName string, syspath string) string {
+// isCustomSysfsRoot returns true if a custom non-default sysfs root is configured
+// (e.g. during testing or device simulation).
+func isCustomSysfsRoot() bool {
+	clean := filepath.Clean(sysfsRoot)
+	return clean != "" && clean != "." && clean != defaultSysfsRoot && clean != "/"
+}
+
+// ghwChroot returns the chroot path for ghw discovery, or an empty string if using the default host sysfs.
+func ghwChroot() string {
+	if !isCustomSysfsRoot() {
+		return ""
+	}
+	clean := filepath.Clean(sysfsRoot)
+	return strings.TrimSuffix(clean, "/sys")
+}
+
+func resolveLinkTarget(linkPath, target string) string {
+	if filepath.IsAbs(target) {
+		return target
+	}
+	return filepath.Join(filepath.Dir(linkPath), target)
+}
+
+// readNetSysfsLink reads a network interface symlink from the configured syspath.
+// When a custom sysfs root is configured (e.g. in tests), if the interface is not
+// found in the custom path, it falls back to the real host /sys/class/net so real
+// host and pod interfaces (like veth pairs) remain fully discoverable.
+func readNetSysfsLink(ifName, syspath string) (string, error) {
 	linkPath := filepath.Join(syspath, ifName)
 	dst, err := os.Readlink(linkPath)
+	if err == nil {
+		return resolveLinkTarget(linkPath, dst), nil
+	}
+
+	if isCustomSysfsRoot() {
+		realLinkPath := filepath.Join(defaultSysnetPath, ifName)
+		if dstReal, errReal := os.Readlink(realLinkPath); errReal == nil {
+			return resolveLinkTarget(realLinkPath, dstReal), nil
+		}
+	}
+
+	return "", err
+}
+
+func realpath(ifName string, syspath string) string {
+	target, err := readNetSysfsLink(ifName, syspath)
 	if err != nil {
-		klog.Error(err, "unexpected error trying reading link", "link", linkPath)
+		klog.Error(err, "unexpected error trying reading link", "link", filepath.Join(syspath, ifName))
 	}
-	var dstAbs string
-	if filepath.IsAbs(dst) {
-		dstAbs = dst
-	} else {
-		// Symlink targets are relative to the directory containing the link.
-		dstAbs = filepath.Join(filepath.Dir(linkPath), dst)
-	}
-	return dstAbs
+	return target
 }
 
 // $ realpath /sys/class/net/cilium_host
@@ -66,7 +139,13 @@ func realpath(ifName string, syspath string) string {
 func isVirtual(name string, syspath string) bool {
 	sysfsPath := realpath(name, syspath)
 	prefix := filepath.Join(sysdevPath, "virtual")
-	return strings.HasPrefix(sysfsPath, prefix)
+	if strings.HasPrefix(sysfsPath, prefix) {
+		return true
+	}
+	if isCustomSysfsRoot() && strings.HasPrefix(sysfsPath, filepath.Join(defaultSysdevPath, "virtual")) {
+		return true
+	}
+	return false
 }
 
 func sriovTotalVFs(name string) int {
@@ -274,7 +353,6 @@ func pciAddressForNetInterface(ifName string) (*pciAddress, error) {
 }
 
 const (
-	sysInfinibandPath = "/sys/class/infiniband/"
 	// linkLayerEthernet is what an RDMA device reports when its transport rides
 	// a netdev (RoCE, iWARP). A real InfiniBand port reports "InfiniBand".
 	linkLayerEthernet = "Ethernet"
