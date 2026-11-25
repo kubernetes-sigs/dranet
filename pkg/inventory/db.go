@@ -193,9 +193,11 @@ func New(opts ...Option) *DB {
 	return db
 }
 
+// Run discovers devices and publishes updates to the notifications channel
+// until ctx is canceled. It does not close the notifications channel, so a
+// caller can retry Run on the same DB without panicking on a closed channel
+// or terminating consumers.
 func (db *DB) Run(ctx context.Context) error {
-	defer close(db.notifications)
-
 	// Resources are published periodically or if there is a netlink notification
 	// indicating a new interface was added or changed. Buffer both channels so a
 	// burst of link or address events is drained below and triggers a single scan.
@@ -231,15 +233,21 @@ func (db *DB) Run(ctx context.Context) error {
 
 	rescanRequested := false
 	for {
-		err := db.rateLimiter.Wait(ctx)
-		if err != nil {
+		if err := db.rateLimiter.Wait(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			klog.Error(err, "unexpected rate limited error trying to get system interfaces")
 		}
 
 		filteredDevices := db.scan()
 		if len(filteredDevices) > 0 || db.hasDevices || rescanRequested {
-			db.hasDevices = len(filteredDevices) > 0
-			db.notifications <- filteredDevices
+			select {
+			case db.notifications <- filteredDevices:
+				db.hasDevices = len(filteredDevices) > 0
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		rescanRequested = false
 

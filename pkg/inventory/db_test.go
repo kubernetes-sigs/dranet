@@ -1246,10 +1246,6 @@ func testRunRescansOnAddressChange(t *testing.T) {
 	updates := db.GetResources(ctx)
 	defer func() {
 		cancel()
-		// Run may be blocked publishing a scan; drain until it closes the
-		// channel on return.
-		for range updates {
-		}
 		if err := <-runErr; err != context.Canceled {
 			t.Errorf("Run() = %v, want %v", err, context.Canceled)
 		}
@@ -1301,4 +1297,115 @@ func findDevice(devices []resourceapi.Device, ifName string) *resourceapi.Device
 		}
 	}
 	return nil
+}
+
+func TestRunCanRestartAndCancelWithoutConsumer(t *testing.T) {
+	userns.Run(t, testRunCanRestartAndCancelWithoutConsumer, syscall.CLONE_NEWNET)
+}
+
+// testRunCanRestartAndCancelWithoutConsumer verifies that DB.Run exits cleanly
+// when ctx is canceled even with no consumer reading GetResources, leaves the
+// notifications channel open, and can be invoked again on the same DB without
+// panicking on a closed channel.
+func testRunCanRestartAndCancelWithoutConsumer(t *testing.T) {
+	const ifName = "veth0"
+	la := netlink.NewLinkAttrs()
+	la.Name = ifName
+	link := &netlink.Veth{LinkAttrs: la, PeerName: "veth1"}
+	if err := netlink.LinkAdd(link); err != nil {
+		t.Fatalf("failed to add veth pair %s: %v", ifName, err)
+	}
+
+	db := New(
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithMaxPollInterval(time.Hour),
+	)
+	updates := db.GetResources(context.Background())
+
+	// Attempt 1: run without reading updates so Run blocks attempting to send
+	// its initial scan. Canceling ctx must let Run return promptly without
+	// draining or closing the notifications channel.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	runErr1 := make(chan error, 1)
+	go func() { runErr1 <- db.Run(ctx1) }()
+
+	scanDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, ok := db.GetDevice(ifName); ok {
+			break
+		}
+		if time.Now().After(scanDeadline) {
+			cancel1()
+			t.Fatalf("timed out waiting for initial scan to populate %s", ifName)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel1()
+
+	select {
+	case err := <-runErr1:
+		if err != context.Canceled {
+			t.Fatalf("first Run() = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Run() blocked after context cancellation with no consumer")
+	}
+
+	select {
+	case _, ok := <-updates:
+		if !ok {
+			t.Fatal("notifications channel was closed when Run returned")
+		}
+	default:
+	}
+
+	// Attempt 2: retry Run on the same DB. If Run closed db.notifications,
+	// this would panic with "send on closed channel" on its first scan.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	runErr2 := make(chan error, 1)
+	go func() { runErr2 <- db.Run(ctx2) }()
+	defer func() {
+		cancel2()
+		select {
+		case err := <-runErr2:
+			if err != context.Canceled {
+				t.Errorf("second Run() = %v, want %v", err, context.Canceled)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("second Run() blocked after context cancellation")
+		}
+	}()
+
+	timeout := time.After(10 * time.Second)
+	waitFor := func(what string, pred func(ipv4 *string) bool) {
+		t.Helper()
+		for {
+			select {
+			case devices, ok := <-updates:
+				if !ok {
+					t.Fatalf("notifications channel closed while waiting for %s", what)
+				}
+				if dev := findDevice(devices, ifName); dev != nil && pred(dev.Attributes[apis.AttrIPv4].StringValue) {
+					return
+				}
+			case err := <-runErr2:
+				t.Fatalf("second Run() exited early while waiting for %s: %v", what, err)
+			case <-timeout:
+				t.Fatalf("timed out waiting for %s", what)
+			}
+		}
+	}
+
+	waitFor("the initial scan after restart", func(ipv4 *string) bool { return ipv4 == nil })
+
+	addr, err := netlink.ParseAddr("192.0.2.20/24")
+	if err != nil {
+		t.Fatalf("failed to parse address: %v", err)
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		t.Fatalf("failed to add address to %s: %v", ifName, err)
+	}
+	waitFor("the address update after restart", func(ipv4 *string) bool {
+		return ipv4 != nil && *ipv4 == "192.0.2.20/24"
+	})
 }
