@@ -17,6 +17,7 @@ package apis
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -1438,5 +1439,157 @@ func TestValidateConfigDelegatesToValidate(t *testing.T) {
 	}
 	if cfg.Interface.IPVlan.Mode != IPVlanModeL2 || cfg.Interface.IPVlan.Flag != IPVlanFlagBridge {
 		t.Errorf("ValidateConfig() ipvlan = %+v, want mode %s flag %s", cfg.Interface.IPVlan, IPVlanModeL2, IPVlanFlagBridge)
+	}
+}
+
+func TestValidateConfigs(t *testing.T) {
+	vrf := func(name string, table *int) *NetworkConfig {
+		return &NetworkConfig{Interface: InterfaceConfig{VRF: &VRFConfig{Name: name, Table: table}}}
+	}
+	derived := TableIDForName("blue")
+
+	tests := []struct {
+		name    string
+		configs map[string]*NetworkConfig
+		// wantErr lists substrings expected in the single returned error;
+		// empty means no error.
+		wantErr []string
+	}{
+		{
+			name: "no configs",
+		},
+		{
+			name: "devices without vrf",
+			configs: map[string]*NetworkConfig{
+				"eth1": {},
+				"eth2": {Interface: InterfaceConfig{Name: "net2"}},
+			},
+		},
+		{
+			name: "nil config is ignored",
+			configs: map[string]*NetworkConfig{
+				"eth1": nil,
+				"eth2": vrf("blue", ptr.To(100)),
+			},
+		},
+		{
+			name: "same vrf and same explicit table",
+			configs: map[string]*NetworkConfig{
+				"eth1": vrf("blue", ptr.To(100)),
+				"eth2": vrf("blue", ptr.To(100)),
+			},
+		},
+		{
+			name: "same vrf and both tables derived from the name",
+			configs: map[string]*NetworkConfig{
+				"eth1": vrf("blue", nil),
+				"eth2": vrf("blue", nil),
+			},
+		},
+		{
+			name: "same vrf with explicit table equal to the derived one",
+			configs: map[string]*NetworkConfig{
+				"eth1": vrf("blue", nil),
+				"eth2": vrf("blue", ptr.To(derived)),
+			},
+		},
+		{
+			name: "different vrfs with different tables",
+			configs: map[string]*NetworkConfig{
+				"eth1": vrf("blue", ptr.To(100)),
+				"eth2": vrf("red", ptr.To(200)),
+			},
+		},
+		{
+			name: "vrf names are case sensitive",
+			configs: map[string]*NetworkConfig{
+				"eth1": vrf("blue", ptr.To(100)),
+				"eth2": vrf("Blue", ptr.To(200)),
+			},
+		},
+		{
+			name: "same vrf with different explicit tables",
+			configs: map[string]*NetworkConfig{
+				"eth1": vrf("blue", ptr.To(100)),
+				"eth2": vrf("blue", ptr.To(200)),
+			},
+			wantErr: []string{`"blue"`, "table 100", "eth1", "table 200", "eth2"},
+		},
+		{
+			name: "same vrf with explicit table different from the derived one",
+			configs: map[string]*NetworkConfig{
+				"eth1": vrf("blue", nil),
+				"eth2": vrf("blue", ptr.To(derived+1)),
+			},
+			wantErr: []string{`"blue"`, fmt.Sprintf("table %d", derived), fmt.Sprintf("table %d", derived+1)},
+		},
+		{
+			name: "conflict is found among unrelated devices",
+			configs: map[string]*NetworkConfig{
+				"eth0": {},
+				"eth1": vrf("blue", ptr.To(100)),
+				"eth2": vrf("red", ptr.To(300)),
+				"eth3": vrf("blue", ptr.To(200)),
+			},
+			wantErr: []string{`"blue"`, "eth1", "eth3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := ValidateConfigs(tt.configs)
+			if len(tt.wantErr) == 0 {
+				if len(errs) != 0 {
+					t.Fatalf("ValidateConfigs() = %v, want no errors", errs)
+				}
+				return
+			}
+			if len(errs) != 1 {
+				t.Fatalf("ValidateConfigs() returned %d errors %v, want 1", len(errs), errs)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(errs[0].Error(), want) {
+					t.Errorf("ValidateConfigs() error = %q, want it to mention %q", errs[0], want)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateConfigsDoesNotModifyConfigs(t *testing.T) {
+	configs := map[string]*NetworkConfig{
+		"eth1": {Interface: InterfaceConfig{VRF: &VRFConfig{Name: "blue"}}},
+		"eth2": {Interface: InterfaceConfig{VRF: &VRFConfig{Name: "blue"}}},
+	}
+	if errs := ValidateConfigs(configs); len(errs) != 0 {
+		t.Fatalf("ValidateConfigs() = %v, want no errors", errs)
+	}
+	for device, cfg := range configs {
+		if cfg.Interface.VRF.Table != nil {
+			t.Errorf("ValidateConfigs() defaulted the table of %s in place to %d", device, *cfg.Interface.VRF.Table)
+		}
+	}
+}
+
+func TestValidateConfigsIsDeterministic(t *testing.T) {
+	configs := map[string]*NetworkConfig{}
+	for i := 0; i < 8; i++ {
+		configs[fmt.Sprintf("eth%d", i)] = &NetworkConfig{Interface: InterfaceConfig{VRF: &VRFConfig{Name: "blue", Table: ptr.To(100 + i)}}}
+	}
+	want := fmt.Sprint(ValidateConfigs(configs))
+	for i := 0; i < 20; i++ {
+		if got := fmt.Sprint(ValidateConfigs(configs)); got != want {
+			t.Fatalf("ValidateConfigs() is not deterministic:\n%s\nvs\n%s", got, want)
+		}
+	}
+}
+
+// ValidateConfig only sees one device, so it must keep accepting configurations
+// that only conflict with another device's: that is ValidateConfigs' job.
+func TestValidateConfigAcceptsVRFTableOfAnotherDevice(t *testing.T) {
+	for _, table := range []int{100, 200} {
+		raw := newRawExtension(t, NetworkConfig{Interface: InterfaceConfig{VRF: &VRFConfig{Name: "blue", Table: ptr.To(table)}}})
+		if _, errs := ValidateConfig(raw); len(errs) != 0 {
+			t.Errorf("ValidateConfig() with vrf table %d = %v, want no errors", table, errs)
+		}
 	}
 }

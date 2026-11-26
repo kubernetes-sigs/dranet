@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -244,7 +245,36 @@ func (s *PodConfigStore) GetPodNRIActivities() map[types.UID]time.Time {
 func (s *PodConfigStore) SetDeviceConfig(podUID types.UID, deviceName string, config DeviceConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.setDeviceConfigLocked(podUID, deviceName, config)
+}
 
+// SetDeviceConfigIfCompatible is SetDeviceConfig for a device that is being
+// added to a Pod: it first checks, with apis.ValidateConfigs, that the new
+// configuration does not conflict with the other devices already stored for
+// the Pod, and stores nothing if it does. The check and the write happen under
+// one lock, so concurrent prepares of devices of the same Pod, whether from the
+// same or from different claims, cannot both pass the check against a store
+// that does not yet hold the other one. An existing configuration of the same
+// device is being replaced and is therefore not part of the comparison.
+func (s *PodConfigStore) SetDeviceConfigIfCompatible(podUID types.UID, deviceName string, config DeviceConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	configs := map[string]*apis.NetworkConfig{}
+	for name, existing := range s.configs[podUID].DeviceConfigs {
+		if name != deviceName {
+			configs[name] = &existing.NetworkInterfaceConfigInPod
+		}
+	}
+	configs[deviceName] = &config.NetworkInterfaceConfigInPod
+	if errs := apis.ValidateConfigs(configs); len(errs) > 0 {
+		return fmt.Errorf("device %s conflicts with other devices of pod %s: %w", deviceName, podUID, errors.Join(errs...))
+	}
+	return s.setDeviceConfigLocked(podUID, deviceName, config)
+}
+
+// setDeviceConfigLocked implements SetDeviceConfig; s.mu must be held for writing.
+func (s *PodConfigStore) setDeviceConfigLocked(podUID types.UID, deviceName string, config DeviceConfig) error {
 	if s.checkpointer != nil {
 		if err := s.checkpointer.Store(podUID, deviceName, config); err != nil {
 			klog.Errorf("failed to checkpoint device config for pod %s device %s: %v", podUID, deviceName, err)
