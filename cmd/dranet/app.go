@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -73,8 +72,6 @@ var (
 	cloudProviderOptions stringList
 
 	kubeletRootDir string
-
-	ready atomic.Bool
 )
 
 func init() {
@@ -126,25 +123,6 @@ func main() {
 		if err := cloudOptions.CheckHint(discovery.CloudProviderHint(cloudProviderHint)); err != nil {
 			klog.Fatal(err)
 		}
-	}
-
-	mux := http.NewServeMux()
-	// Add healthz handler
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if !ready.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		} else {
-			w.WriteHeader(http.StatusOK)
-		}
-	})
-	// Add metrics handler
-	mux.Handle("/metrics", promhttp.Handler())
-	// Bind before the driver starts, so a port still held by the previous pod
-	// stops this process before it accepts any claim; kubelet restarts it.
-	if _, err := startMetricsServer(bindAddress, mux, func(err error) {
-		klog.Fatalf("metrics/healthz server on %s stopped: %v", bindAddress, err)
-	}); err != nil {
-		klog.Fatalf("Failed to start the metrics/healthz server: %v", err)
 	}
 
 	if err := pcidb.Setup(); err != nil {
@@ -251,13 +229,27 @@ func main() {
 
 	db := inventory.New(optsDb...)
 	opts = append(opts, driver.WithInventory(db))
-	dranet, err := driver.Start(ctx, driverName, clientset, nodeName, store, opts...)
-	if err != nil {
+	dranet := driver.New(driverName, clientset, nodeName, store, opts...)
+
+	mux := http.NewServeMux()
+	registerHealthz(mux,
+		healthChecker{name: "dra", check: dranet.CheckDRA},
+		healthChecker{name: "nri", check: dranet.CheckNRI},
+	)
+	mux.Handle("/metrics", promhttp.Handler())
+	// Bind before the driver starts, so a port still held by the previous pod
+	// stops this process before it accepts any claim; kubelet restarts it.
+	if _, err := startMetricsServer(bindAddress, mux, func(err error) {
+		klog.Fatalf("metrics/healthz server on %s stopped: %v", bindAddress, err)
+	}); err != nil {
+		klog.Fatalf("Failed to start the metrics/healthz server: %v", err)
+	}
+
+	if err := dranet.Start(ctx); err != nil {
 		klog.Fatalf("driver failed to start: %v", err)
 	}
 	defer dranet.Stop(cancel)
 
-	ready.Store(true)
 	klog.Info("driver started")
 
 	select {

@@ -112,17 +112,15 @@ var (
 	})
 	// nriPluginReconnectAttemptsTotal and netdbReconnectAttemptsTotal count
 	// every retry of each subsystem's loop in Start(), regardless of cause --
-	// a superset of nriPluginDisconnectsTotal above. Both loops cap at
-	// maxAttempts before klog.Fatalf, so either value approaching maxAttempts
-	// warns of an imminent exit before the container restart itself is
-	// visible (kube_pod_container_status_restarts_total). Counters, not
-	// Gauges: within a process's life they only increase, resetting on
-	// process restart like a Gauge would anyway.
+	// a superset of nriPluginDisconnectsTotal above. Consecutive failures are
+	// capped at maxAttempts before klog.Fatalf; for NRI, the failure streak
+	// resets after each successful connection so routine runtime restarts do
+	// not crash the driver.
 	nriPluginReconnectAttemptsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",
 		Name:      "nri_plugin_reconnect_attempts_total",
-		Help:      "Total number of times the NRI plugin connection loop has been restarted. Resets on process restart; approaches maxAttempts before the process exits.",
+		Help:      "Total number of times the NRI plugin connection loop has been retried.",
 	})
 	netdbReconnectAttemptsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "dranet",
