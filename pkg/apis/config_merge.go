@@ -18,15 +18,57 @@ package apis
 
 import (
 	"maps"
+	"net/netip"
 	"slices"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/utils/ptr"
 )
+
+// MergeNetworkConfigs folds layers ordered from highest precedence to lowest
+// precedence (for example: ResourceClaim, DeviceClass, Cloud DeviceConfig).
+//
+// Layers are folded bottom-up (right to left) so dependent-field and unit rules
+// (VRF replacement, IPVlan drop on Interface.Type change) evaluate against the
+// accumulated lower-precedence baseline rather than leaking fields across
+// intermediate layers.
+//
+// Callers must normalize inputs first (via Normalize or ValidateIntake) so
+// deprecated aliases such as Interface.DHCP are already folded into canonical
+// fields before merging.
+func MergeNetworkConfigs(layers ...*NetworkConfig) *NetworkConfig {
+	switch len(layers) {
+	case 0:
+		return &NetworkConfig{}
+	case 1:
+		return MergeNetworkConfig(layers[0], nil)
+	}
+	merged := layers[len(layers)-1]
+	for i := len(layers) - 2; i >= 0; i-- {
+		merged = MergeNetworkConfig(layers[i], merged)
+	}
+	return merged
+}
 
 // MergeNetworkConfig combines a provider configuration with a user configuration.
 // A nil input is treated as an empty configuration.
 // User values, including explicit pointer zero values, override provider values.
-// Slices are combined, duplicates keep user values, and neither input is changed.
+// Slices are combined with canonical deduplication so user entries win on
+// duplicates, and neither input is changed.
+//
+// Callers must normalize inputs first (via Normalize or ValidateIntake) so
+// deprecated aliases such as Interface.DHCP are already folded into canonical
+// fields before merging. When merging three or more static layers, use
+// MergeNetworkConfigs so layers fold bottom-up.
+//
+// Unit and dependent-field rules:
+//   - VRF is a unit keyed by Name: when both sides set different non-empty VRF
+//     names, the user VRF replaces the provider VRF wholesale so a foreign
+//     routing table is never inherited.
+//   - IPVlan depends on Interface.Type == IPVLAN: if the user explicitly changes
+//     a provider IPVLAN interface to another type, the provider IPVlan block is
+//     dropped. An IPVlan block set without an IPVLAN type is preserved so final
+//     validation rejects the misconfiguration.
 //
 // Every field is merged by name on purpose. The coverage tests in
 // config_merge_coverage_test.go fail when a field is not merged or is aliased.
@@ -38,31 +80,70 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 		cloud = &NetworkConfig{}
 	}
 
+	mergedInterface := mergeInterfaceConfig(&user.Interface, &cloud.Interface)
 	// Provider entries come first and user entries last, so the dedupe
 	// functions, which keep the last occurrence, keep the user entry.
-	merged := &NetworkConfig{
+	return &NetworkConfig{
 		Profile:   firstNonEmpty(user.Profile, cloud.Profile),
-		Interface: mergeInterfaceConfig(&user.Interface, &cloud.Interface),
-		Routes:    deduplicateRoutes(append(slices.Clone(cloud.Routes), user.Routes...)),
+		Interface: mergedInterface,
+		Routes:    deduplicateRoutes(append(slices.Clone(cloud.Routes), user.Routes...), mergedInterface.VRF != nil),
 		Rules:     deduplicateRules(append(slices.Clone(cloud.Rules), user.Rules...)),
 		Neighbors: deduplicateNeighbors(append(slices.Clone(cloud.Neighbors), user.Neighbors...)),
 		Ethtool:   mergeEthtool(user.Ethtool, cloud.Ethtool),
 	}
+}
 
-	// Drop the meaningless IPVLAN config if the resolved type is not ipvlan.
-	if merged.Interface.Type != InterfaceTypeIPVLAN {
-		merged.Interface.IPVlan = nil
+// Clone returns a deep copy of c that shares no pointers, slices, or maps with
+// c, preserving slices verbatim without deduplicating entries.
+func (c *NetworkConfig) Clone() *NetworkConfig {
+	if c == nil {
+		return nil
 	}
+	return &NetworkConfig{
+		Profile:   c.Profile,
+		Interface: cloneInterfaceConfig(&c.Interface),
+		Routes:    slices.Clone(c.Routes),
+		Rules:     slices.Clone(c.Rules),
+		Neighbors: slices.Clone(c.Neighbors),
+		Ethtool:   mergeEthtool(c.Ethtool, nil),
+	}
+}
 
-	return merged
+func cloneInterfaceConfig(in *InterfaceConfig) InterfaceConfig {
+	return InterfaceConfig{
+		Name:                in.Name,
+		Type:                in.Type,
+		Addressing:          in.Addressing,
+		Addresses:           slices.Clone(in.Addresses),
+		DHCP:                overridePtr(in.DHCP, nil),
+		MTU:                 overridePtr(in.MTU, nil),
+		HardwareAddr:        overridePtr(in.HardwareAddr, nil),
+		GSOMaxSize:          overridePtr(in.GSOMaxSize, nil),
+		GROMaxSize:          overridePtr(in.GROMaxSize, nil),
+		GSOIPv4MaxSize:      overridePtr(in.GSOIPv4MaxSize, nil),
+		GROIPv4MaxSize:      overridePtr(in.GROIPv4MaxSize, nil),
+		DisableEBPFPrograms: overridePtr(in.DisableEBPFPrograms, nil),
+		Forwarding:          overridePtr(in.Forwarding, nil),
+		ARPIgnore:           overridePtr(in.ARPIgnore, nil),
+		ARPAnnounce:         overridePtr(in.ARPAnnounce, nil),
+		ARPNotify:           overridePtr(in.ARPNotify, nil),
+		AddrGenMode:         overridePtr(in.AddrGenMode, nil),
+		AcceptRA:            overridePtr(in.AcceptRA, nil),
+		VRF:                 mergeVRF(in.VRF, nil),
+		IPVlan:              mergeIPVlan(in.IPVlan, nil),
+	}
 }
 
 func mergeInterfaceConfig(user, cloud *InterfaceConfig) InterfaceConfig {
+	cloudIPVlan := cloud.IPVlan
+	if cloud.Type == InterfaceTypeIPVLAN && user.Type != "" && user.Type != InterfaceTypeIPVLAN {
+		cloudIPVlan = nil
+	}
 	return InterfaceConfig{
 		Name:                firstNonEmpty(user.Name, cloud.Name),
 		Type:                firstNonEmpty(user.Type, cloud.Type),
 		Addressing:          firstNonEmpty(user.Addressing, cloud.Addressing),
-		Addresses:           deduplicateStrings(append(slices.Clone(cloud.Addresses), user.Addresses...)),
+		Addresses:           deduplicateAddresses(append(slices.Clone(cloud.Addresses), user.Addresses...)),
 		DHCP:                overridePtr(user.DHCP, cloud.DHCP),
 		MTU:                 overridePtr(user.MTU, cloud.MTU),
 		HardwareAddr:        overridePtr(user.HardwareAddr, cloud.HardwareAddr),
@@ -78,13 +159,23 @@ func mergeInterfaceConfig(user, cloud *InterfaceConfig) InterfaceConfig {
 		AddrGenMode:         overridePtr(user.AddrGenMode, cloud.AddrGenMode),
 		AcceptRA:            overridePtr(user.AcceptRA, cloud.AcceptRA),
 		VRF:                 mergeVRF(user.VRF, cloud.VRF),
-		IPVlan:              mergeIPVlan(user.IPVlan, cloud.IPVlan),
+		IPVlan:              mergeIPVlan(user.IPVlan, cloudIPVlan),
 	}
 }
 
+// mergeVRF treats VRFConfig as a unit keyed by Name: when both sides name
+// different VRFs, the user VRF replaces the provider VRF wholesale so it never
+// inherits a foreign routing table. When names match or only one side sets a
+// name, fields merge normally.
 func mergeVRF(user, cloud *VRFConfig) *VRFConfig {
 	if user == nil && cloud == nil {
 		return nil
+	}
+	if user != nil && cloud != nil && user.Name != "" && cloud.Name != "" && user.Name != cloud.Name {
+		return &VRFConfig{
+			Name:  user.Name,
+			Table: overridePtr(user.Table, nil),
+		}
 	}
 	if user == nil {
 		user = &VRFConfig{}
@@ -162,59 +253,156 @@ func firstNonEmpty[T ~string](user, cloud T) T {
 	return cloud
 }
 
-// deduplicateStrings compacts a slice of strings keeping the last occurrence
-func deduplicateStrings(s []string) []string {
-	seen := make(map[string]bool)
-	var res []string
+type addressKey struct {
+	valid  bool
+	prefix netip.Prefix
+	raw    string
+}
+
+// canonicalAddressKey matches validateInterfaceConfig and Linux kernel address
+// uniqueness: IPv6 addresses collide regardless of prefix length, while IPv4
+// addresses collide on the same IP and prefix length. Unparseable strings fall
+// back to raw string equality so validation still reports them.
+func canonicalAddressKey(addr string) addressKey {
+	prefix, err := netip.ParsePrefix(addr)
+	if err != nil {
+		return addressKey{raw: addr}
+	}
+	if prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+		prefix = netip.PrefixFrom(prefix.Addr(), 128)
+	}
+	return addressKey{valid: true, prefix: prefix}
+}
+
+type cidrKey struct {
+	valid  bool
+	prefix netip.Prefix
+	raw    string
+}
+
+// canonicalCIDRKey matches net.ParseCIDR masking used by netlink route and rule
+// programming. Unparseable or empty strings fall back to raw equality.
+func canonicalCIDRKey(cidr string) cidrKey {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return cidrKey{raw: cidr}
+	}
+	return cidrKey{valid: true, prefix: prefix.Masked()}
+}
+
+type ipKey struct {
+	valid bool
+	addr  netip.Addr
+	raw   string
+}
+
+// canonicalIPKey matches net.ParseIP used by netlink neighbor programming.
+func canonicalIPKey(ip string) ipKey {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ipKey{raw: ip}
+	}
+	return ipKey{valid: true, addr: addr.Unmap()}
+}
+
+// deduplicateAddresses compacts a slice of CIDR strings keeping the last
+// occurrence for each canonical kernel address key.
+func deduplicateAddresses(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	seen := make(map[addressKey]bool, len(s))
+	res := make([]string, 0, len(s))
 	for i := len(s) - 1; i >= 0; i-- {
-		if !seen[s[i]] {
-			seen[s[i]] = true
-			res = append([]string{s[i]}, res...)
+		key := canonicalAddressKey(s[i])
+		if !seen[key] {
+			seen[key] = true
+			res = append(res, s[i])
 		}
 	}
+	slices.Reverse(res)
 	return res
 }
 
-func deduplicateRoutes(routes []RouteConfig) []RouteConfig {
-	// A route is identified by its destination and table: the same destination in
-	// different tables is a distinct route (policy routing) and must be kept.
+func deduplicateRoutes(routes []RouteConfig, hasVRF bool) []RouteConfig {
+	if len(routes) == 0 {
+		return nil
+	}
+	// A route is identified by its canonical masked destination CIDR and
+	// effective routing table. Table 0 defaults to the main table (254) in Linux.
+	// When VRF is enabled on the interface, all routes are programmed into the
+	// VRF table, so distinct table values collapse into the same destination key.
 	type routeKey struct {
-		destination string
+		destination cidrKey
 		table       int
 	}
-	seen := make(map[routeKey]bool)
-	var res []RouteConfig
+	seen := make(map[routeKey]bool, len(routes))
+	res := make([]RouteConfig, 0, len(routes))
 	for i := len(routes) - 1; i >= 0; i-- {
-		key := routeKey{destination: routes[i].Destination, table: routes[i].Table}
+		table := routes[i].Table
+		if hasVRF {
+			table = 0
+		} else if table == 0 {
+			table = unix.RT_TABLE_MAIN
+		}
+		key := routeKey{destination: canonicalCIDRKey(routes[i].Destination), table: table}
 		if !seen[key] {
 			seen[key] = true
-			res = append([]RouteConfig{routes[i]}, res...)
+			res = append(res, routes[i])
 		}
 	}
+	slices.Reverse(res)
 	return res
 }
 
 func deduplicateRules(rules []RuleConfig) []RuleConfig {
-	seen := make(map[RuleConfig]bool)
-	var res []RuleConfig
+	if len(rules) == 0 {
+		return nil
+	}
+	// Key explicitly by canonical field values rather than using RuleConfig
+	// directly as a map key so adding a pointer field to RuleConfig can never
+	// silently switch deduplication to pointer-identity comparison.
+	type ruleKey struct {
+		priority    int
+		source      cidrKey
+		destination cidrKey
+		table       int
+	}
+	seen := make(map[ruleKey]bool, len(rules))
+	res := make([]RuleConfig, 0, len(rules))
 	for i := len(rules) - 1; i >= 0; i-- {
-		if !seen[rules[i]] {
-			seen[rules[i]] = true
-			res = append([]RuleConfig{rules[i]}, res...)
+		table := rules[i].Table
+		if table == 0 {
+			table = unix.RT_TABLE_MAIN
+		}
+		key := ruleKey{
+			priority:    rules[i].Priority,
+			source:      canonicalCIDRKey(rules[i].Source),
+			destination: canonicalCIDRKey(rules[i].Destination),
+			table:       table,
+		}
+		if !seen[key] {
+			seen[key] = true
+			res = append(res, rules[i])
 		}
 	}
+	slices.Reverse(res)
 	return res
 }
 
 func deduplicateNeighbors(neighbors []NeighborConfig) []NeighborConfig {
-	seen := make(map[string]bool)
-	var res []NeighborConfig
+	if len(neighbors) == 0 {
+		return nil
+	}
+	seen := make(map[ipKey]bool, len(neighbors))
+	res := make([]NeighborConfig, 0, len(neighbors))
 	for i := len(neighbors) - 1; i >= 0; i-- {
-		dest := neighbors[i].Destination
-		if !seen[dest] {
-			seen[dest] = true
-			res = append([]NeighborConfig{neighbors[i]}, res...)
+		key := canonicalIPKey(neighbors[i].Destination)
+		if !seen[key] {
+			seen[key] = true
+			res = append(res, neighbors[i])
 		}
 	}
+	slices.Reverse(res)
 	return res
 }

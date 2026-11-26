@@ -18,8 +18,6 @@ package apis
 
 import (
 	"encoding/json"
-	"reflect"
-	"strings"
 	"sync"
 	"testing"
 
@@ -306,6 +304,145 @@ func TestMergeNetworkConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "user sets ipvlan without ipvlan type preserves ipvlan for validation",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					IPVlan: &IPVlanConfig{Mode: IPVlanModeL2},
+				},
+			},
+			cloud: &NetworkConfig{},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					IPVlan: &IPVlanConfig{Mode: IPVlanModeL2},
+				},
+			},
+		},
+		{
+			name: "user sets passthrough and ipvlan preserves user ipvlan for validation",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:   InterfaceTypePassthrough,
+					IPVlan: &IPVlanConfig{Mode: IPVlanModeL2},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:   InterfaceTypeIPVLAN,
+					IPVlan: &IPVlanConfig{Flag: IPVlanFlagBridge},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:   InterfaceTypePassthrough,
+					IPVlan: &IPVlanConfig{Mode: IPVlanModeL2},
+				},
+			},
+		},
+		{
+			name: "provider sets ipvlan without ipvlan type preserves ipvlan for validation",
+			user: &NetworkConfig{},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					IPVlan: &IPVlanConfig{Mode: IPVlanModeL2},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					IPVlan: &IPVlanConfig{Mode: IPVlanModeL2},
+				},
+			},
+		},
+		{
+			name: "VRF same name keeps provider table",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a"},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(100)},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(100)},
+				},
+			},
+		},
+		{
+			name: "VRF different names drops provider table so foreign table is not inherited",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-b"},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(100)},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-b"},
+				},
+			},
+		},
+		{
+			name: "VRF different names keeps user explicit table",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-b", Table: ptr.To(200)},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(100)},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-b", Table: ptr.To(200)},
+				},
+			},
+		},
+		{
+			name: "VRF table-only user overrides provider table and keeps provider name",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Table: ptr.To(200)},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(100)},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(200)},
+				},
+			},
+		},
+		{
+			name: "VRF name-only user combines with table-only provider",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-b"},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Table: ptr.To(100)},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-b", Table: ptr.To(100)},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -493,12 +630,29 @@ func TestMergeNetworkConfigNilInputs(t *testing.T) {
 }
 
 func TestMergeNetworkConfigConcurrent(t *testing.T) {
+	addrs := make([]string, 1, 4)
+	addrs[0] = "192.0.2.1/24"
+	routes := make([]RouteConfig, 1, 4)
+	routes[0] = RouteConfig{Destination: "10.0.0.0/8", Gateway: "192.0.2.254"}
+	rules := make([]RuleConfig, 1, 4)
+	rules[0] = RuleConfig{Priority: 100, Source: "192.0.2.1/32", Table: 100}
+	neighbors := make([]NeighborConfig, 1, 4)
+	neighbors[0] = NeighborConfig{Destination: "192.0.2.254", HardwareAddr: "02:00:00:00:00:fe"}
+
 	cloud := &NetworkConfig{
 		Interface: InterfaceConfig{
+			Addresses:   addrs,
 			DHCP:        ptr.To(true),
 			MTU:         ptr.To[int32](1500),
 			ARPIgnore:   ptr.To[int32](1),
 			ARPAnnounce: ptr.To[int32](2),
+		},
+		Routes:    routes,
+		Rules:     rules,
+		Neighbors: neighbors,
+		Ethtool: &EthtoolConfig{
+			Features:     map[string]bool{"rx-checksum": true},
+			PrivateFlags: map[string]bool{"cloud-flag": true},
 		},
 	}
 	cloudBefore := cloneNetworkConfigForTest(t, cloud)
@@ -514,8 +668,27 @@ func TestMergeNetworkConfigConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			want := int32(i % 4)
-			user := &NetworkConfig{Interface: InterfaceConfig{ARPIgnore: ptr.To(want)}}
+			user := &NetworkConfig{
+				Interface: InterfaceConfig{
+					Addresses: []string{"198.51.100.1/24"},
+					ARPIgnore: ptr.To(want),
+				},
+				Routes:    []RouteConfig{{Destination: "198.51.100.0/24", Gateway: "198.51.100.254"}},
+				Rules:     []RuleConfig{{Priority: 200, Source: "198.51.100.1/32", Table: 200}},
+				Neighbors: []NeighborConfig{{Destination: "198.51.100.254", HardwareAddr: "02:00:00:00:00:01"}},
+				Ethtool: &EthtoolConfig{
+					Features:     map[string]bool{"rx-checksum": false},
+					PrivateFlags: map[string]bool{"user-flag": false},
+				},
+			}
 			merged := MergeNetworkConfig(user, cloud)
+			// Mutate returned slices and maps to surface any aliasing under -race.
+			merged.Interface.Addresses[0] = "203.0.113.1/24"
+			merged.Routes[0].Gateway = "203.0.113.254"
+			merged.Rules[0].Table = 300
+			merged.Neighbors[0].HardwareAddr = "02:00:00:00:00:ff"
+			merged.Ethtool.Features["rx-checksum"] = true
+			merged.Ethtool.PrivateFlags["cloud-flag"] = false
 			results <- result{got: *merged.Interface.ARPIgnore, want: want}
 		}()
 	}
@@ -532,6 +705,258 @@ func TestMergeNetworkConfigConcurrent(t *testing.T) {
 	}
 }
 
+func TestMergeNetworkConfigs(t *testing.T) {
+	t.Run("zero layers returns empty config", func(t *testing.T) {
+		got := MergeNetworkConfigs()
+		if diff := cmp.Diff(&NetworkConfig{}, got); diff != "" {
+			t.Fatalf("MergeNetworkConfigs() mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("single layer deep copies and deduplicates", func(t *testing.T) {
+		only := &NetworkConfig{
+			Interface: InterfaceConfig{
+				Addresses: []string{"192.0.2.1/24", "192.0.2.1/24"},
+				MTU:       ptr.To[int32](1500),
+			},
+		}
+		got := MergeNetworkConfigs(only)
+		want := &NetworkConfig{
+			Interface: InterfaceConfig{
+				Addresses: []string{"192.0.2.1/24"},
+				MTU:       ptr.To[int32](1500),
+			},
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("MergeNetworkConfigs(only) mismatch (-want +got):\n%s", diff)
+		}
+		*got.Interface.MTU = 9000
+		if *only.Interface.MTU != 1500 {
+			t.Fatal("MergeNetworkConfigs(only) aliased input pointer")
+		}
+	})
+
+	tests := []struct {
+		name   string
+		layers []*NetworkConfig
+		want   *NetworkConfig
+	}{
+		{
+			// Bottom-up folding merges DeviceClass's table override onto Cloud's
+			// "red" VRF first, then Claim's different "blue" VRF replaces that
+			// unit wholesale so Cloud/DeviceClass's foreign table does not leak.
+			name: "3-layer VRF: claim different name does not inherit deviceClass table for cloud VRF",
+			layers: []*NetworkConfig{
+				{Interface: InterfaceConfig{VRF: &VRFConfig{Name: "blue"}}},
+				{Interface: InterfaceConfig{VRF: &VRFConfig{Table: ptr.To(100)}}},
+				{Interface: InterfaceConfig{VRF: &VRFConfig{Name: "red"}}},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{VRF: &VRFConfig{Name: "blue"}},
+			},
+		},
+		{
+			// Bottom-up folding attaches DeviceClass's partial IPVlan block to
+			// Cloud's IPVLAN type first, so Claim switching to Passthrough drops
+			// the entire accumulated IPVlan block cleanly.
+			name: "3-layer IPVlan: claim Passthrough drops accumulated deviceClass and cloud IPVlan",
+			layers: []*NetworkConfig{
+				{Interface: InterfaceConfig{Type: InterfaceTypePassthrough}},
+				{Interface: InterfaceConfig{IPVlan: &IPVlanConfig{Mode: IPVlanModeL2}}},
+				{Interface: InterfaceConfig{Type: InterfaceTypeIPVLAN, IPVlan: &IPVlanConfig{Flag: IPVlanFlagBridge}}},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{Type: InterfaceTypePassthrough},
+			},
+		},
+		{
+			// Bottom-up folding lets DeviceClass's Passthrough drop Cloud's IPVlan
+			// before Claim switches back to IPVLAN, so Cloud's stale IPVlan is not
+			// resurrected across the intermediate Passthrough reset.
+			name: "3-layer Type reset: deviceClass Passthrough prevents resurrecting cloud IPVlan",
+			layers: []*NetworkConfig{
+				{Interface: InterfaceConfig{Type: InterfaceTypeIPVLAN}},
+				{Interface: InterfaceConfig{Type: InterfaceTypePassthrough}},
+				{Interface: InterfaceConfig{Type: InterfaceTypeIPVLAN, IPVlan: &IPVlanConfig{Mode: IPVlanModeL2}}},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{Type: InterfaceTypeIPVLAN},
+			},
+		},
+		{
+			name: "3-layer precedence: claim > deviceClass > cloud",
+			layers: []*NetworkConfig{
+				{
+					Interface: InterfaceConfig{
+						MTU:       ptr.To[int32](1400),
+						ARPIgnore: ptr.To[int32](0),
+					},
+				},
+				{
+					Interface: InterfaceConfig{
+						MTU:         ptr.To[int32](1450),
+						ARPIgnore:   ptr.To[int32](1),
+						ARPAnnounce: ptr.To[int32](2),
+						VRF:         &VRFConfig{Table: ptr.To(200)},
+					},
+				},
+				{
+					Interface: InterfaceConfig{
+						MTU:         ptr.To[int32](1500),
+						ARPAnnounce: ptr.To[int32](1),
+						AcceptRA:    ptr.To[int32](0),
+						VRF:         &VRFConfig{Name: "tenant-a", Table: ptr.To(100)},
+					},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					MTU:         ptr.To[int32](1400),
+					ARPIgnore:   ptr.To[int32](0),
+					ARPAnnounce: ptr.To[int32](2),
+					AcceptRA:    ptr.To[int32](0),
+					VRF:         &VRFConfig{Name: "tenant-a", Table: ptr.To(200)},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MergeNetworkConfigs(tt.layers...)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("MergeNetworkConfigs() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMergeNetworkConfigCanonicalDeduplication(t *testing.T) {
+	tests := []struct {
+		name  string
+		user  *NetworkConfig
+		cloud *NetworkConfig
+		want  *NetworkConfig
+	}{
+		{
+			name: "addresses: non-canonical IPv6 spelling and prefix length override keep user entry",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Addresses: []string{"2001:db8::1/128", "2001:db8::2/64", "10.0.0.1/16"},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Addresses: []string{"2001:0db8::1/64", "2001:DB8:0::2/64", "10.0.0.1/24", "10.0.0.2/24"},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Addresses: []string{"10.0.0.1/24", "10.0.0.2/24", "2001:db8::1/128", "2001:db8::2/64", "10.0.0.1/16"},
+				},
+			},
+		},
+		{
+			name: "routes: table 0 and 254 collide and unmasked/IPv6 CIDRs canonicalize",
+			user: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/24", Gateway: "192.168.1.1", Table: 254},
+					{Destination: "10.1.0.0/24", Gateway: "192.168.1.1", Table: 0},
+					{Destination: "2001:db8::/64", Gateway: "fe80::1"},
+				},
+			},
+			cloud: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.5/24", Gateway: "192.168.1.254", Table: 0},
+					{Destination: "10.1.0.0/24", Gateway: "192.168.1.254", Table: 254},
+					{Destination: "2001:0db8::1/64", Gateway: "fe80::fe"},
+				},
+			},
+			want: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/24", Gateway: "192.168.1.1", Table: 254},
+					{Destination: "10.1.0.0/24", Gateway: "192.168.1.1", Table: 0},
+					{Destination: "2001:db8::/64", Gateway: "fe80::1"},
+				},
+			},
+		},
+		{
+			name: "routes: VRF collapses route tables so user overrides cloud route",
+			user: &NetworkConfig{
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 200},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(100)},
+				},
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.254", Table: 100},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					VRF: &VRFConfig{Name: "vrf-a", Table: ptr.To(100)},
+				},
+				Routes: []RouteConfig{
+					{Destination: "10.0.0.0/8", Gateway: "192.168.1.1", Table: 200},
+				},
+			},
+		},
+		{
+			name: "rules: canonical CIDRs and table 0 vs 254 deduplicate keeping user",
+			user: &NetworkConfig{
+				Rules: []RuleConfig{
+					{Priority: 100, Source: "2001:db8::/64", Destination: "10.0.0.0/24", Table: 254},
+				},
+			},
+			cloud: &NetworkConfig{
+				Rules: []RuleConfig{
+					{Priority: 100, Source: "2001:0db8::1/64", Destination: "10.0.0.5/24", Table: 0},
+					{Priority: 200, Source: "2001:db8::/64", Table: 100},
+				},
+			},
+			want: &NetworkConfig{
+				Rules: []RuleConfig{
+					{Priority: 200, Source: "2001:db8::/64", Table: 100},
+					{Priority: 100, Source: "2001:db8::/64", Destination: "10.0.0.0/24", Table: 254},
+				},
+			},
+		},
+		{
+			name: "neighbors: canonical IPv6 and IPv4-mapped IPv6 deduplicate keeping user",
+			user: &NetworkConfig{
+				Neighbors: []NeighborConfig{
+					{Destination: "2001:db8::1", HardwareAddr: "02:00:00:00:00:01"},
+					{Destination: "192.0.2.1", HardwareAddr: "02:00:00:00:00:02"},
+				},
+			},
+			cloud: &NetworkConfig{
+				Neighbors: []NeighborConfig{
+					{Destination: "2001:0DB8::1", HardwareAddr: "02:00:00:00:00:fe"},
+					{Destination: "::ffff:192.0.2.1", HardwareAddr: "02:00:00:00:00:fd"},
+				},
+			},
+			want: &NetworkConfig{
+				Neighbors: []NeighborConfig{
+					{Destination: "2001:db8::1", HardwareAddr: "02:00:00:00:00:01"},
+					{Destination: "192.0.2.1", HardwareAddr: "02:00:00:00:00:02"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MergeNetworkConfig(tt.user, tt.cloud)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("MergeNetworkConfig() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func cloneNetworkConfigForTest(t *testing.T, config *NetworkConfig) *NetworkConfig {
 	t.Helper()
 
@@ -544,273 +969,4 @@ func cloneNetworkConfigForTest(t *testing.T, config *NetworkConfig) *NetworkConf
 		t.Fatalf("unmarshal NetworkConfig: %v", err)
 	}
 	return copy
-}
-
-// These lists drive the list-based tests below and must match the configuration types.
-var deepCopyInterfacePointerFields = []string{
-	"DHCP",
-	"MTU",
-	"HardwareAddr",
-	"GSOMaxSize",
-	"GROMaxSize",
-	"GSOIPv4MaxSize",
-	"GROIPv4MaxSize",
-	"DisableEBPFPrograms",
-	"Forwarding",
-	"ARPIgnore",
-	"ARPAnnounce",
-	"ARPNotify",
-	"AddrGenMode",
-	"AcceptRA",
-	"VRF",
-	"IPVlan",
-}
-
-var zeroOverrideInterfaceFields = []string{
-	"DHCP",
-	"MTU",
-	"HardwareAddr",
-	"GSOMaxSize",
-	"GROMaxSize",
-	"GSOIPv4MaxSize",
-	"GROIPv4MaxSize",
-	"DisableEBPFPrograms",
-	"Forwarding",
-	"ARPIgnore",
-	"ARPAnnounce",
-	"ARPNotify",
-	"AddrGenMode",
-	"AcceptRA",
-}
-
-var nestedZeroOverrideFields = []string{
-	"VRF.Table",
-}
-
-func TestMergeFieldListsCoverMutableFields(t *testing.T) {
-	expectedDeepCopies := []string{
-		"Interface.Addresses",
-		"Interface.VRF.Table",
-		"Routes",
-		"Rules",
-		"Neighbors",
-		"Ethtool",
-		"Ethtool.Features",
-		"Ethtool.PrivateFlags",
-	}
-	for _, name := range deepCopyInterfacePointerFields {
-		expectedDeepCopies = append(expectedDeepCopies, "Interface."+name)
-	}
-
-	wantDeepCopy := listAsSet(expectedDeepCopies)
-	gotDeepCopy := listAsSet(mutableFieldPaths(reflect.TypeOf(NetworkConfig{}), ""))
-	for path := range gotDeepCopy {
-		if !wantDeepCopy[path] {
-			t.Errorf("mutable field %s is missing from the deep copy field lists", path)
-		}
-	}
-	for path := range wantDeepCopy {
-		if !gotDeepCopy[path] {
-			t.Errorf("the deep copy field lists name an unknown mutable field %s", path)
-		}
-	}
-
-	zeroOverride := listAsSet(zeroOverrideInterfaceFields)
-	nested := listAsSet(nestedZeroOverrideFields)
-	interfaceType := reflect.TypeOf(InterfaceConfig{})
-	for i := range interfaceType.NumField() {
-		field := interfaceType.Field(i)
-		if field.Type.Kind() != reflect.Pointer {
-			continue
-		}
-		if field.Type.Elem().Kind() != reflect.Struct {
-			if !zeroOverride[field.Name] {
-				t.Errorf("pointer field %s is missing from the zero override field lists", field.Name)
-			}
-			continue
-		}
-		nestedType := field.Type.Elem()
-		for j := range nestedType.NumField() {
-			nestedField := nestedType.Field(j)
-			if nestedField.Type.Kind() != reflect.Pointer {
-				continue
-			}
-			path := field.Name + "." + nestedField.Name
-			if !nested[path] {
-				t.Errorf("pointer field %s is missing from the zero override field lists", path)
-			}
-		}
-	}
-
-	for _, name := range zeroOverrideInterfaceFields {
-		if _, ok := interfaceType.FieldByName(name); !ok {
-			t.Errorf("zeroOverrideInterfaceFields lists unknown field %s", name)
-		}
-	}
-	for _, path := range nestedZeroOverrideFields {
-		if !fieldPathExists(interfaceType, path) {
-			t.Errorf("nestedZeroOverrideFields lists unknown field %s", path)
-		}
-	}
-}
-
-func TestDeepCopyClonesEveryListedPointerField(t *testing.T) {
-	paths := append(append([]string{}, deepCopyInterfacePointerFields...), nestedZeroOverrideFields...)
-	for _, path := range paths {
-		t.Run(path, func(t *testing.T) {
-			user := configWithInterfacePointer(t, path)
-			provider := configWithInterfacePointer(t, path)
-			for _, tc := range []struct {
-				name   string
-				user   *NetworkConfig
-				cloud  *NetworkConfig
-				source *NetworkConfig
-			}{
-				{name: "nil provider", user: user, source: user},
-				{name: "user selected", user: user, cloud: ipvlanConfig(), source: user},
-				{name: "provider selected", user: &NetworkConfig{}, cloud: provider, source: provider},
-			} {
-				merged := MergeNetworkConfig(tc.user, tc.cloud)
-				mergedPtr := mustFieldPath(t, reflect.ValueOf(merged).Elem().FieldByName("Interface"), path)
-				if mergedPtr.IsNil() {
-					t.Fatalf("%s: merged %s is nil", tc.name, path)
-				}
-				sourcePtr := mustFieldPath(t, reflect.ValueOf(tc.source).Elem().FieldByName("Interface"), path)
-				if mergedPtr.Pointer() == sourcePtr.Pointer() {
-					t.Errorf("%s: merged %s aliases its source", tc.name, path)
-				}
-			}
-		})
-	}
-}
-
-func configWithInterfacePointer(t *testing.T, path string) *NetworkConfig {
-	t.Helper()
-	config := ipvlanConfig()
-	setFieldPointer(t, reflect.ValueOf(config).Elem().FieldByName("Interface"), path, false)
-	return config
-}
-
-func ipvlanConfig() *NetworkConfig {
-	return &NetworkConfig{Interface: InterfaceConfig{Type: InterfaceTypeIPVLAN}}
-}
-
-func TestExplicitZeroOverridesEveryListedField(t *testing.T) {
-	paths := append(append([]string{}, zeroOverrideInterfaceFields...), nestedZeroOverrideFields...)
-	for _, path := range paths {
-		t.Run(path, func(t *testing.T) {
-			user := &NetworkConfig{}
-			setFieldPointer(t, reflect.ValueOf(user).Elem().FieldByName("Interface"), path, true)
-			cloud := &NetworkConfig{}
-			setFieldPointer(t, reflect.ValueOf(cloud).Elem().FieldByName("Interface"), path, false)
-
-			merged := MergeNetworkConfig(user, cloud)
-			mergedPtr := mustFieldPath(t, reflect.ValueOf(merged).Elem().FieldByName("Interface"), path)
-			if mergedPtr.IsNil() {
-				t.Fatalf("merged %s is nil", path)
-			}
-			if !mergedPtr.Elem().IsZero() {
-				t.Errorf("merged %s = %v, want the explicit user zero value", path, mergedPtr.Elem().Interface())
-			}
-		})
-	}
-}
-
-func mutableFieldPaths(structType reflect.Type, prefix string) []string {
-	var paths []string
-	for i := range structType.NumField() {
-		field := structType.Field(i)
-		path := field.Name
-		if prefix != "" {
-			path = prefix + "." + field.Name
-		}
-
-		switch field.Type.Kind() {
-		case reflect.Pointer:
-			paths = append(paths, path)
-			if field.Type.Elem().Kind() == reflect.Struct {
-				paths = append(paths, mutableFieldPaths(field.Type.Elem(), path)...)
-			}
-		case reflect.Slice:
-			paths = append(paths, path)
-			if field.Type.Elem().Kind() == reflect.Struct {
-				paths = append(paths, mutableFieldPaths(field.Type.Elem(), path+"[]")...)
-			}
-		case reflect.Map:
-			paths = append(paths, path)
-		case reflect.Struct:
-			paths = append(paths, mutableFieldPaths(field.Type, path)...)
-		}
-	}
-	return paths
-}
-
-func listAsSet(names []string) map[string]bool {
-	set := make(map[string]bool, len(names))
-	for _, name := range names {
-		set[name] = true
-	}
-	return set
-}
-
-func fieldPathExists(structType reflect.Type, path string) bool {
-	for _, part := range strings.Split(path, ".") {
-		if structType.Kind() == reflect.Pointer {
-			structType = structType.Elem()
-		}
-		field, ok := structType.FieldByName(part)
-		if !ok {
-			return false
-		}
-		structType = field.Type
-	}
-	return true
-}
-
-// setFieldPointer sets the pointer at path to a new zero or non-zero value,
-// allocating any struct pointer along the way.
-func setFieldPointer(t *testing.T, structValue reflect.Value, path string, zero bool) {
-	t.Helper()
-
-	field := mustFieldPath(t, structValue, path)
-	value := reflect.New(field.Type().Elem())
-	if !zero {
-		switch elem := value.Elem(); elem.Kind() {
-		case reflect.Bool:
-			elem.SetBool(true)
-		case reflect.String:
-			elem.SetString("non-zero")
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			elem.SetInt(7)
-		case reflect.Struct:
-			// A struct pointer only needs to be non-nil here.
-		default:
-			t.Fatalf("unsupported pointer kind %s for %s; extend setFieldPointer", elem.Kind(), path)
-		}
-	}
-	field.Set(value)
-}
-
-// mustFieldPath walks a dotted field path, allocating struct pointers as needed.
-func mustFieldPath(t *testing.T, structValue reflect.Value, path string) reflect.Value {
-	t.Helper()
-
-	current := structValue
-	parts := strings.Split(path, ".")
-	for i, part := range parts {
-		if current.Kind() == reflect.Pointer {
-			if current.IsNil() {
-				if !current.CanSet() {
-					t.Fatalf("cannot allocate %s while resolving %s", parts[i-1], path)
-				}
-				current.Set(reflect.New(current.Type().Elem()))
-			}
-			current = current.Elem()
-		}
-		current = current.FieldByName(part)
-		if !current.IsValid() {
-			t.Fatalf("field %s not found while resolving %s", part, path)
-		}
-	}
-	return current
 }
