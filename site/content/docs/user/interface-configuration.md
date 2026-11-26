@@ -240,7 +240,7 @@ type NeighborConfig struct {
 }
 ```
 
-* **ipAddress** (string, required): The IP address of the neighbor (e.g., "192.168.1.1", "2001:db8::1").
+* **destination** (string, required): The IP address of the neighbor (e.g., "192.168.1.1", "2001:db8::1").
 * **hardwareAddr** (string, required): The MAC address of the neighbor (e.g., "00:11:22:33:44:55").
 
 #### Ethtool Configuration (EthtoolConfig)
@@ -263,6 +263,23 @@ type EthtoolConfig struct {
 
 * **features** (map[string]bool, optional): A map of ethtool feature names to their desired state (true for on, false for off). For example, {"tcp-segmentation-offload": true, "rx-checksum": true}.
 * **privateFlags** (map[string]bool, optional): A map of device-specific private flag names to their desired state. For example, {"my-custom-flag": true}.
+
+### Configuration Precedence and Merging
+
+When a device also has a cloud provider baseline (`GetDeviceConfig`) or a dynamic profile (`GetProfileConfig`), DRANET merges all sources in strict precedence order:
+
+1. **User `ResourceClaim` configuration** (highest precedence)
+2. **Cloud provider device configuration**
+3. **Dynamic profile configuration** (lowest precedence; enriches unset fields and may deny unsupported requests)
+
+Merge and defaulting rules:
+
+* **Strings and pointers**: Higher-precedence values win, including explicit zero pointer values such as `false` or `0` (for example, `arpIgnore: 0`, `forwarding: false`, or `arpNotify: false`).
+* **Slices (`addresses`, `routes`, `rules`, `neighbors`)**: Entries combine across sources (lower-precedence entries first) and deduplicate by canonical network identity so higher-precedence entries win (`addresses` matching kernel uniqueness including IPv6 prefix-length overrides, `routes` by masked destination CIDR and effective routing table—or destination-only when VRF is enabled, `rules` by canonical fields, and `neighbors` by canonical IP).
+* **Maps (`ethtool.features`, `ethtool.privateFlags`)**: Maps combine with higher-precedence keys winning.
+* **VRF (`interface.vrf`)**: Treated as a unit keyed by `name`. When two sources set different VRF names, the higher-precedence VRF replaces the lower-precedence VRF wholesale so it does not inherit a foreign routing table. When names match (or only one side sets a name), fields merge and explicit table IDs are preserved.
+* **Deprecated `dhcp` field**: Use `interface.addressing` (`"Static"`, `"DHCP"`, or `"Unnumbered"`) instead. At intake, `dhcp: true` normalizes to `addressing: "DHCP"` and `dhcp: false` (with unset `addressing`) normalizes to `addressing: "Static"`.
+* **Fallback defaults**: Derived defaults (such as `ipvlan` mode/flag and deterministic VRF table IDs) run once after all sources are merged, so a derived default never overrides an explicit value from another source.
 
 ### Example: Customizing a Network Interface and Routes
 
@@ -298,7 +315,7 @@ spec:
           - destination: "169.254.169.1/32"
             scope: 253
           neighbors:
-          - ipAddress: "192.168.1.1"
+          - destination: "192.168.1.1"
             hardwareAddr: "00:11:22:33:44:55"
           ethtool:
             features:
