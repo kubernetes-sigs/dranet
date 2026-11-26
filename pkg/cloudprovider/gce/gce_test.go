@@ -277,6 +277,24 @@ func testGetProfileConfig_Namespaced(t *testing.T) {
 			config: &apis.NetworkConfig{},
 		},
 		{
+			name: "unnumbered subinterface skips IPAM and routing",
+			mac:  mac,
+			iface: gceNetworkInterface{
+				Mac:         mac,
+				IPAliases:   []string{"10.24.3.0/24"},
+				IPv6:        []string{"2001:db8:1234:5678::/64"},
+				GatewayIPv6: "fe80::99",
+			},
+			config: &apis.NetworkConfig{
+				Interface: apis.InterfaceConfig{
+					Type:       apis.InterfaceTypeIPVLAN,
+					Addressing: apis.AddressingModeUnnumbered,
+				},
+			},
+			nilIPAM:   true,
+			wantAddrs: 0,
+		},
+		{
 			name:    "subinterface without cloud ranges returns error",
 			mac:     mac,
 			iface:   bareIface,

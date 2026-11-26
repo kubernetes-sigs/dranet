@@ -279,7 +279,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 			continue
 		}
 		// Check if there is a custom configuration
-		conf, errs := apis.ValidateConfig(&config.Opaque.Parameters)
+		conf, errs := apis.ValidateConfigIntake(&config.Opaque.Parameters)
 		if len(errs) > 0 {
 			configErrors = append(configErrors, errs...)
 			continue
@@ -299,7 +299,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		return err
 	}
 
-	netconf := *mergedConf
+	netconf := *mergedConf.Clone()
 
 	// deviceCommitted tracks whether the device config reached maturity and was persisted
 	// to the store. If the preparation fails in the middle, the deferred function will
@@ -327,7 +327,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 			Namespace: claim.Namespace,
 			Name:      claim.Name,
 		},
-		NetworkInterfaceConfigInPod: netconf,
+		NetworkInterfaceConfigInPod: *mergedConf.Clone(),
 		DeviceSnapshot:              deviceSnapshot,
 	}
 
@@ -801,37 +801,110 @@ func clearStaleRouteSources(routes []apis.RouteConfig, addresses []string) {
 	}
 }
 
-// getDeviceNetworkConfig merges the user configuration with the cloud provider configuration and resolves the dynamic profile.
-// User configuration always takes precedence in case of conflicts.
-// The merged result is defaulted and validated before it is returned.
+// deviceConfigPipeline injects the provider hooks used by
+// resolveDeviceNetworkConfig so the configuration pipeline contract can be
+// tested directly without a mocking framework.
+type deviceConfigPipeline struct {
+	getDeviceConfig      func(device string) (*apis.NetworkConfig, bool)
+	getProfileConfig     func(device string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
+	releaseProfileConfig func(device string, claimUID types.UID, config *apis.NetworkConfig) error
+}
+
+// getDeviceNetworkConfig merges the user configuration with the cloud provider
+// configuration and resolves the dynamic profile.
+// Precedence is user > cloud device config > profile config.
+// Fallback defaults and full validation run once after all sources are merged.
 func (np *NetworkDriver) getDeviceNetworkConfig(device string, claim *resourceapi.ResourceClaim, userConf *apis.NetworkConfig) (*apis.NetworkConfig, error) {
-	cloudConf, ok := np.netdb.GetDeviceConfig(device)
-	if ok && cloudConf != nil {
-		klog.V(4).Infof("Found cloud provider configuration for device %s: %#v", device, cloudConf)
+	return resolveDeviceNetworkConfig(device, claim, userConf, deviceConfigPipeline{
+		getDeviceConfig:      np.netdb.GetDeviceConfig,
+		getProfileConfig:     np.netdb.GetProfileConfig,
+		releaseProfileConfig: np.netdb.ReleaseProfileConfig,
+	})
+}
+
+// resolveDeviceNetworkConfig executes the documented network configuration
+// pipeline for a single device:
+//  1. Intake-normalize and validate userConf and the cached cloud DeviceConfig
+//     without mutating either input or applying fallback defaults.
+//  2. Merge userConf over cloudConf.
+//  3. If a profile is set, call getProfileConfig with the normalized,
+//     non-defaulted merged config, intake-normalize and validate the returned
+//     profile config, and merge it at the lowest precedence.
+//  4. Apply fallback defaults once and run full validation via Validate().
+//
+// Any failure after getProfileConfig succeeds triggers a best-effort
+// releaseProfileConfig call and joins the release error if cleanup also fails.
+func resolveDeviceNetworkConfig(device string, claim *resourceapi.ResourceClaim, userConf *apis.NetworkConfig, p deviceConfigPipeline) (*apis.NetworkConfig, error) {
+	var claimUID types.UID
+	if claim != nil {
+		claimUID = claim.UID
 	}
-	mergedConf := apis.MergeNetworkConfig(userConf, cloudConf)
+
+	normalizedUser, userErrs := userConf.ValidateIntake()
+	if len(userErrs) > 0 {
+		return nil, fmt.Errorf("user network config for device %s is invalid: %w", device, errors.Join(userErrs...))
+	}
+
+	var normalizedCloud *apis.NetworkConfig
+	if p.getDeviceConfig != nil {
+		cloudConf, ok := p.getDeviceConfig(device)
+		if ok && cloudConf != nil {
+			klog.V(4).Infof("Found cloud provider configuration for device %s: %#v", device, cloudConf)
+			var cloudErrs []error
+			normalizedCloud, cloudErrs = cloudConf.ValidateIntake()
+			if len(cloudErrs) > 0 {
+				return nil, fmt.Errorf("cloud provider network config for device %s is invalid: %w", device, errors.Join(cloudErrs...))
+			}
+		}
+	}
+
+	mergedConf := apis.MergeNetworkConfigs(normalizedUser, normalizedCloud)
 
 	profileAllocated := false
 	if mergedConf.Profile != "" {
-		profileConf, err := np.netdb.GetProfileConfig(device, claim, mergedConf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get profile config: %v", err)
+		if p.getProfileConfig == nil {
+			return nil, fmt.Errorf("profile %q requested for device %s, but no profile provider is configured", mergedConf.Profile, device)
 		}
-		mergedConf = apis.MergeNetworkConfig(mergedConf, profileConf)
+		// Pass a clone so an in-process ProfileProvider cannot mutate mergedConf
+		// and bypass higher-precedence user or cloud settings.
+		profileConf, err := p.getProfileConfig(device, claim, mergedConf.Clone())
+		if err != nil {
+			return nil, fmt.Errorf("failed to get profile config: %w", err)
+		}
 		profileAllocated = true
+
+		normalizedProfile, profileErrs := profileConf.ValidateIntake()
+		// Merge before returning on intake error so releaseProfileConfig
+		// receives both Profile and any allocated resources (such as addresses)
+		// returned by the profile provider.
+		mergedConf = apis.MergeNetworkConfig(mergedConf, normalizedProfile)
+		if len(profileErrs) > 0 {
+			err := fmt.Errorf("profile network config for device %s is invalid: %w", device, errors.Join(profileErrs...))
+			if p.releaseProfileConfig != nil {
+				if relErr := p.releaseProfileConfig(device, claimUID, mergedConf); relErr != nil {
+					err = errors.Join(err, fmt.Errorf("failed to release profile config: %w", relErr))
+				}
+			}
+			return nil, err
+		}
 	}
 
-	// The user configuration was already validated when the claim was parsed, but
-	// the cloud provider and profile configurations are unvalidated external input
-	// and some invariants only become checkable once everything is merged. Default
-	// and validate the configuration that is actually going to be applied, so a bad
-	// provider config fails here with a clear error instead of partially applying.
+	// Snapshot the pre-defaulted merged config before Validate mutates it so
+	// releaseProfileConfig sees the same shape on Stage 3 and Stage 4 failures.
+	var releaseConf *apis.NetworkConfig
+	if profileAllocated {
+		releaseConf = mergedConf.Clone()
+	}
+
+	// Apply fallback defaults once and validate all completeness and
+	// cross-field invariants on the final merged configuration so a bad
+	// combination fails here with a clear error instead of partially applying.
 	if errs := mergedConf.Validate(); len(errs) > 0 {
-		err := fmt.Errorf("merged network config for device %s is invalid: %v", device, errs)
+		err := fmt.Errorf("merged network config for device %s is invalid: %w", device, errors.Join(errs...))
 		// The profile allocated state before validation ran. Release it now so a
 		// retried Prepare does not leak it.
-		if profileAllocated {
-			if relErr := np.netdb.ReleaseProfileConfig(device, claim.UID, mergedConf); relErr != nil {
+		if profileAllocated && p.releaseProfileConfig != nil {
+			if relErr := p.releaseProfileConfig(device, claimUID, releaseConf); relErr != nil {
 				err = errors.Join(err, fmt.Errorf("failed to release profile config: %w", relErr))
 			}
 		}

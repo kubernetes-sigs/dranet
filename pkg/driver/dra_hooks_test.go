@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -2585,4 +2586,422 @@ func TestClearStaleRouteSources(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveDeviceNetworkConfigContract(t *testing.T) {
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-contract", Namespace: "default", Name: "claim-contract"},
+	}
+
+	parseUserJSON := func(t *testing.T, raw string) *apis.NetworkConfig {
+		t.Helper()
+		if raw == "" {
+			return &apis.NetworkConfig{}
+		}
+		cfg, errs := apis.ValidateConfigIntake(&runtime.RawExtension{Raw: []byte(raw)})
+		if len(errs) > 0 {
+			t.Fatalf("apis.ValidateConfigIntake(%s) unexpected errors: %v", raw, errs)
+		}
+		return cfg
+	}
+
+	t.Run("precedence is user > device > profile and profile sees normalized non-defaulted config", func(t *testing.T) {
+		userConf := parseUserJSON(t, `{"interface":{"mtu":1400,"arpIgnore":0,"vrf":{"name":"tenant-a"}}}`)
+		cloudConf := &apis.NetworkConfig{
+			Profile: "managed-profile",
+			Interface: apis.InterfaceConfig{
+				Type:        apis.InterfaceTypeIPVLAN,
+				MTU:         ptr.To[int32](1500),
+				ARPIgnore:   ptr.To[int32](1),
+				ARPAnnounce: ptr.To[int32](2),
+				VRF:         &apis.VRFConfig{Name: "tenant-a", Table: ptr.To(100)},
+			},
+		}
+		profileConf := &apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Addresses:   []string{"10.0.0.5/24"},
+				MTU:         ptr.To[int32](9000),
+				ARPIgnore:   ptr.To[int32](2),
+				ARPAnnounce: ptr.To[int32](1),
+				AcceptRA:    ptr.To[int32](0),
+			},
+		}
+
+		var gotProfileInput *apis.NetworkConfig
+		merged, err := resolveDeviceNetworkConfig("dev0", claim, userConf, deviceConfigPipeline{
+			getDeviceConfig: func(string) (*apis.NetworkConfig, bool) { return cloudConf, true },
+			getProfileConfig: func(_ string, _ *resourcev1.ResourceClaim, cfg *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				gotProfileInput = cfg.Clone()
+				return profileConf, nil
+			},
+			releaseProfileConfig: func(string, types.UID, *apis.NetworkConfig) error { return nil },
+		})
+		if err != nil {
+			t.Fatalf("resolveDeviceNetworkConfig() unexpected error: %v", err)
+		}
+
+		// The profile provider must receive real normalized intent without
+		// fallback defaults (IPVlan is still nil; VRF carries provider's explicit
+		// table 100 rather than a prematurely derived user table).
+		wantProfileInput := &apis.NetworkConfig{
+			Profile: "managed-profile",
+			Interface: apis.InterfaceConfig{
+				Type:        apis.InterfaceTypeIPVLAN,
+				MTU:         ptr.To[int32](1400),
+				ARPIgnore:   ptr.To[int32](0),
+				ARPAnnounce: ptr.To[int32](2),
+				VRF:         &apis.VRFConfig{Name: "tenant-a", Table: ptr.To(100)},
+			},
+		}
+		if diff := cmp.Diff(wantProfileInput, gotProfileInput); diff != "" {
+			t.Errorf("GetProfileConfig input mismatch (-want +got):\n%s", diff)
+		}
+
+		// Final result: user wins over device (MTU 1400, ARPIgnore 0), device
+		// wins over profile (ARPAnnounce 2, VRF table 100), profile fills unset
+		// fields (Addresses, AcceptRA 0), and fallback defaults run once (IPVlan).
+		wantMerged := &apis.NetworkConfig{
+			Profile: "managed-profile",
+			Interface: apis.InterfaceConfig{
+				Type:        apis.InterfaceTypeIPVLAN,
+				Addresses:   []string{"10.0.0.5/24"},
+				MTU:         ptr.To[int32](1400),
+				ARPIgnore:   ptr.To[int32](0),
+				ARPAnnounce: ptr.To[int32](2),
+				AcceptRA:    ptr.To[int32](0),
+				VRF:         &apis.VRFConfig{Name: "tenant-a", Table: ptr.To(100)},
+				IPVlan:      &apis.IPVlanConfig{Mode: apis.IPVlanModeL2, Flag: apis.IPVlanFlagBridge},
+			},
+		}
+		if diff := cmp.Diff(wantMerged, merged); diff != "" {
+			t.Errorf("resolved config mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("VRF cases A, B, and C from raw claim", func(t *testing.T) {
+		cases := []struct {
+			name        string
+			userJSON    string
+			cloudConf   *apis.NetworkConfig
+			profileConf *apis.NetworkConfig
+			wantVRF     *apis.VRFConfig
+		}{
+			{
+				name:      "Case A: same VRF name keeps provider explicit table",
+				userJSON:  `{"interface":{"vrf":{"name":"a"}}}`,
+				cloudConf: &apis.NetworkConfig{Interface: apis.InterfaceConfig{VRF: &apis.VRFConfig{Name: "a", Table: ptr.To(100)}}},
+				wantVRF:   &apis.VRFConfig{Name: "a", Table: ptr.To(100)},
+			},
+			{
+				name:      "Case B: different VRF name derives user VRF table instead of inheriting provider table",
+				userJSON:  `{"interface":{"vrf":{"name":"b"}}}`,
+				cloudConf: &apis.NetworkConfig{Interface: apis.InterfaceConfig{VRF: &apis.VRFConfig{Name: "a", Table: ptr.To(100)}}},
+				wantVRF:   &apis.VRFConfig{Name: "b", Table: ptr.To(apis.TableIDForName("b"))},
+			},
+			{
+				name:        "Case C: device VRF name does not inherit profile foreign VRF table",
+				cloudConf:   &apis.NetworkConfig{Profile: "p", Interface: apis.InterfaceConfig{VRF: &apis.VRFConfig{Name: "a"}}},
+				profileConf: &apis.NetworkConfig{Interface: apis.InterfaceConfig{VRF: &apis.VRFConfig{Name: "c", Table: ptr.To(7)}}},
+				wantVRF:     &apis.VRFConfig{Name: "a", Table: ptr.To(apis.TableIDForName("a"))},
+			},
+			{
+				name:      "partial table-only user VRF combines with provider VRF name",
+				userJSON:  `{"interface":{"vrf":{"table":200}}}`,
+				cloudConf: &apis.NetworkConfig{Interface: apis.InterfaceConfig{VRF: &apis.VRFConfig{Name: "a", Table: ptr.To(100)}}},
+				wantVRF:   &apis.VRFConfig{Name: "a", Table: ptr.To(200)},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := resolveDeviceNetworkConfig("dev0", claim, parseUserJSON(t, tc.userJSON), deviceConfigPipeline{
+					getDeviceConfig: func(string) (*apis.NetworkConfig, bool) { return tc.cloudConf, tc.cloudConf != nil },
+					getProfileConfig: func(string, *resourcev1.ResourceClaim, *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+						return tc.profileConf, nil
+					},
+					releaseProfileConfig: func(string, types.UID, *apis.NetworkConfig) error { return nil },
+				})
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if diff := cmp.Diff(tc.wantVRF, got.Interface.VRF); diff != "" {
+					t.Errorf("VRF mismatch (-want +got):\n%s", diff)
+				}
+			})
+		}
+	})
+
+	t.Run("deprecated dhcp normalization across sources", func(t *testing.T) {
+		cases := []struct {
+			name           string
+			userJSON       string
+			cloudConf      *apis.NetworkConfig
+			wantAddressing apis.AddressingMode
+		}{
+			{
+				name:           "user addressing Static beats provider dhcp true",
+				userJSON:       `{"interface":{"addressing":"Static"}}`,
+				cloudConf:      &apis.NetworkConfig{Interface: apis.InterfaceConfig{DHCP: ptr.To(true)}},
+				wantAddressing: apis.AddressingModeStatic,
+			},
+			{
+				name:           "user dhcp false beats provider dhcp true",
+				userJSON:       `{"interface":{"dhcp":false}}`,
+				cloudConf:      &apis.NetworkConfig{Interface: apis.InterfaceConfig{DHCP: ptr.To(true)}},
+				wantAddressing: apis.AddressingModeStatic,
+			},
+			{
+				name:           "user dhcp false beats provider addressing DHCP",
+				userJSON:       `{"interface":{"dhcp":false}}`,
+				cloudConf:      &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addressing: apis.AddressingModeDHCP}},
+				wantAddressing: apis.AddressingModeStatic,
+			},
+			{
+				name:           "user dhcp true beats provider addressing Static",
+				userJSON:       `{"interface":{"dhcp":true}}`,
+				cloudConf:      &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addressing: apis.AddressingModeStatic}},
+				wantAddressing: apis.AddressingModeDHCP,
+			},
+			{
+				name:           "user dhcp false overrides provider addressing Unnumbered to Static",
+				userJSON:       `{"interface":{"dhcp":false}}`,
+				cloudConf:      &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN, Addressing: apis.AddressingModeUnnumbered}},
+				wantAddressing: apis.AddressingModeStatic,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := resolveDeviceNetworkConfig("dev0", claim, parseUserJSON(t, tc.userJSON), deviceConfigPipeline{
+					getDeviceConfig: func(string) (*apis.NetworkConfig, bool) { return tc.cloudConf, true },
+				})
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got.Interface.Addressing != tc.wantAddressing {
+					t.Errorf("Addressing = %q, want %q", got.Interface.Addressing, tc.wantAddressing)
+				}
+				if got.Interface.DHCP != nil {
+					t.Errorf("DHCP = %v, want nil after normalization", *got.Interface.DHCP)
+				}
+			})
+		}
+	})
+
+	t.Run("partial user configs resolve with provider type and misconfigured ipvlan is rejected", func(t *testing.T) {
+		// User sets Unnumbered + partial IPVlan without repeating Type: IPVLAN.
+		userConf := parseUserJSON(t, `{"interface":{"addressing":"Unnumbered","ipvlan":{"mode":"L2"}}}`)
+		cloudConf := &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN}}
+		got, err := resolveDeviceNetworkConfig("dev0", claim, userConf, deviceConfigPipeline{
+			getDeviceConfig: func(string) (*apis.NetworkConfig, bool) { return cloudConf, true },
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Interface.IPVlan == nil || got.Interface.IPVlan.Mode != apis.IPVlanModeL2 || got.Interface.IPVlan.Flag != apis.IPVlanFlagBridge {
+			t.Errorf("IPVlan = %+v, want {Mode: L2, Flag: Bridge}", got.Interface.IPVlan)
+		}
+
+		// Without a provider setting Type: IPVLAN, an explicit user ipvlan block
+		// must NOT be silently dropped during merge; final Validate must reject it.
+		userMisconf := parseUserJSON(t, `{"interface":{"ipvlan":{"mode":"L2"}}}`)
+		_, err = resolveDeviceNetworkConfig("dev0", claim, userMisconf, deviceConfigPipeline{
+			getDeviceConfig: func(string) (*apis.NetworkConfig, bool) { return nil, false },
+		})
+		if err == nil || !strings.Contains(err.Error(), "configuration invalid for non-ipvlan interface type") {
+			t.Fatalf("expected non-ipvlan error, got %v", err)
+		}
+	})
+
+	t.Run("invalid cloud device config fails before calling profile provider", func(t *testing.T) {
+		profileCalled := false
+		_, err := resolveDeviceNetworkConfig("dev0", claim, &apis.NetworkConfig{}, deviceConfigPipeline{
+			getDeviceConfig: func(string) (*apis.NetworkConfig, bool) {
+				return &apis.NetworkConfig{
+					Profile:   "p",
+					Interface: apis.InterfaceConfig{MTU: ptr.To[int32](1)},
+				}, true
+			},
+			getProfileConfig: func(string, *resourcev1.ResourceClaim, *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				profileCalled = true
+				return nil, nil
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "mtu: must be at least") {
+			t.Fatalf("expected MTU error, got %v", err)
+		}
+		if profileCalled {
+			t.Fatal("GetProfileConfig should not be called when cloud DeviceConfig fails intake validation")
+		}
+	})
+
+	t.Run("invalid profile intake releases allocated resources and preserves both errors", func(t *testing.T) {
+		var releasedCfg *apis.NetworkConfig
+		_, err := resolveDeviceNetworkConfig("dev0", claim, &apis.NetworkConfig{}, deviceConfigPipeline{
+			getDeviceConfig: func(string) (*apis.NetworkConfig, bool) {
+				return &apis.NetworkConfig{Profile: "p"}, true
+			},
+			getProfileConfig: func(string, *resourcev1.ResourceClaim, *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				return &apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						Addresses: []string{"10.0.0.5/24"},
+						MTU:       ptr.To[int32](1),
+					},
+				}, nil
+			},
+			releaseProfileConfig: func(_ string, uid types.UID, cfg *apis.NetworkConfig) error {
+				if uid != claim.UID {
+					t.Errorf("release claimUID = %q, want %q", uid, claim.UID)
+				}
+				releasedCfg = cfg.Clone()
+				return fmt.Errorf("release failed")
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "mtu: must be at least") || !strings.Contains(err.Error(), "failed to release profile config: release failed") {
+			t.Fatalf("expected both validation and release errors, got %v", err)
+		}
+		if releasedCfg == nil || releasedCfg.Profile != "p" || len(releasedCfg.Interface.Addresses) != 1 || releasedCfg.Interface.Addresses[0] != "10.0.0.5/24" {
+			t.Errorf("ReleaseProfileConfig received %+v, want Profile 'p' and allocated address 10.0.0.5/24", releasedCfg)
+		}
+	})
+
+	t.Run("concurrent resolutions do not mutate shared cached cloud config", func(t *testing.T) {
+		sharedCloud := &apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				DHCP:      ptr.To(true),
+				MTU:       ptr.To[int32](1500),
+				ARPIgnore: ptr.To[int32](1),
+			},
+		}
+		cloudBefore := sharedCloud.Clone()
+
+		var wg sync.WaitGroup
+		for i := range 32 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				userConf := &apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						DHCP:      ptr.To(i%2 == 0),
+						ARPIgnore: ptr.To(int32(i % 4)),
+					},
+				}
+				got, err := resolveDeviceNetworkConfig("dev0", claim, userConf, deviceConfigPipeline{
+					getDeviceConfig: func(string) (*apis.NetworkConfig, bool) { return sharedCloud, true },
+				})
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				wantAddr := apis.AddressingModeStatic
+				if i%2 == 0 {
+					wantAddr = apis.AddressingModeDHCP
+				}
+				if got.Interface.Addressing != wantAddr {
+					t.Errorf("Addressing = %q, want %q", got.Interface.Addressing, wantAddr)
+				}
+			}()
+		}
+		wg.Wait()
+
+		if diff := cmp.Diff(cloudBefore, sharedCloud); diff != "" {
+			t.Fatalf("shared cached cloud config mutated during concurrent resolutions (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("Stage 4 final validation failure releases pre-defaulted profile config and joins errors", func(t *testing.T) {
+		releaseErrSentinel := errors.New("release backend down")
+		var releasedCfg *apis.NetworkConfig
+		_, err := resolveDeviceNetworkConfig("dev0", claim, parseUserJSON(t, `{"interface":{"type":"IPVLAN","addressing":"Unnumbered"}}`), deviceConfigPipeline{
+			getDeviceConfig: func(string) (*apis.NetworkConfig, bool) {
+				return &apis.NetworkConfig{Profile: "p"}, true
+			},
+			getProfileConfig: func(string, *resourcev1.ResourceClaim, *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				// Valid at single-source intake, but conflicts with user's
+				// Unnumbered addressing at Stage 4 final validation.
+				return &apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{
+						Addresses: []string{"10.0.0.5/24"},
+					},
+				}, nil
+			},
+			releaseProfileConfig: func(_ string, uid types.UID, cfg *apis.NetworkConfig) error {
+				if uid != claim.UID {
+					t.Errorf("release claimUID = %q, want %q", uid, claim.UID)
+				}
+				releasedCfg = cfg.Clone()
+				return releaseErrSentinel
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "cannot be set together with addresses") {
+			t.Fatalf("expected Unnumbered+addresses final validation error, got %v", err)
+		}
+		if !errors.Is(err, releaseErrSentinel) {
+			t.Fatalf("expected joined release error %v, got %v", releaseErrSentinel, err)
+		}
+		// ReleaseProfileConfig must see the pre-defaulted merged config (no
+		// fallback IPVlan defaults populated) with Profile and allocated IPs.
+		if releasedCfg == nil || releasedCfg.Profile != "p" || len(releasedCfg.Interface.Addresses) != 1 || releasedCfg.Interface.Addresses[0] != "10.0.0.5/24" {
+			t.Fatalf("ReleaseProfileConfig received %+v, want Profile 'p' and allocated address 10.0.0.5/24", releasedCfg)
+		}
+		if releasedCfg.Interface.IPVlan != nil {
+			t.Errorf("ReleaseProfileConfig received defaulted IPVlan %+v, want nil (pre-defaulted snapshot)", releasedCfg.Interface.IPVlan)
+		}
+	})
+
+	t.Run("in-process profile provider mutating input config cannot bypass precedence", func(t *testing.T) {
+		userConf := parseUserJSON(t, `{"interface":{"mtu":1400,"vrf":{"name":"tenant-a"}}}`)
+		cloudConf := &apis.NetworkConfig{
+			Profile: "p",
+			Interface: apis.InterfaceConfig{
+				MTU: ptr.To[int32](1500),
+				VRF: &apis.VRFConfig{Name: "tenant-a", Table: ptr.To(100)},
+			},
+		}
+		got, err := resolveDeviceNetworkConfig("dev0", claim, userConf, deviceConfigPipeline{
+			getDeviceConfig: func(string) (*apis.NetworkConfig, bool) { return cloudConf, true },
+			getProfileConfig: func(_ string, _ *resourcev1.ResourceClaim, cfg *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				// Attempt to mutate the input config in place.
+				*cfg.Interface.MTU = 1280
+				cfg.Interface.VRF.Name = "hijacked"
+				*cfg.Interface.VRF.Table = 999
+				return &apis.NetworkConfig{
+					Interface: apis.InterfaceConfig{Addresses: []string{"10.0.0.5/24"}},
+				}, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Interface.MTU == nil || *got.Interface.MTU != 1400 {
+			t.Errorf("MTU = %v, want 1400 (provider mutation leaked)", got.Interface.MTU)
+		}
+		if got.Interface.VRF == nil || got.Interface.VRF.Name != "tenant-a" || got.Interface.VRF.Table == nil || *got.Interface.VRF.Table != 100 {
+			t.Errorf("VRF = %+v, want {Name: tenant-a, Table: 100}", got.Interface.VRF)
+		}
+	})
+
+	t.Run("nil callbacks and nil claim do not panic", func(t *testing.T) {
+		got, err := resolveDeviceNetworkConfig("dev0", nil, &apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		}, deviceConfigPipeline{})
+		if err != nil {
+			t.Fatalf("unexpected error with empty pipeline: %v", err)
+		}
+		if got.Interface.Name != "eth0" {
+			t.Errorf("Name = %q, want eth0", got.Interface.Name)
+		}
+
+		// Requesting a profile without getProfileConfig must return an error.
+		if _, err := resolveDeviceNetworkConfig("dev0", nil, &apis.NetworkConfig{Profile: "p"}, deviceConfigPipeline{}); err == nil || !strings.Contains(err.Error(), "no profile provider is configured") {
+			t.Fatalf("expected missing profile provider error, got %v", err)
+		}
+
+		// Profile intake error with nil releaseProfileConfig and nil claim must not panic.
+		if _, err := resolveDeviceNetworkConfig("dev0", nil, &apis.NetworkConfig{Profile: "p"}, deviceConfigPipeline{
+			getProfileConfig: func(string, *resourcev1.ResourceClaim, *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				return &apis.NetworkConfig{Interface: apis.InterfaceConfig{MTU: ptr.To[int32](1)}}, nil
+			},
+		}); err == nil || !strings.Contains(err.Error(), "mtu: must be at least") {
+			t.Fatalf("expected MTU intake error, got %v", err)
+		}
+	})
 }

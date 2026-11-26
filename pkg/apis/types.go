@@ -70,10 +70,11 @@ type InterfaceConfig struct {
 	// DHCP, if true, indicates that the interface should be configured via DHCP.
 	// This is mutually exclusive with the 'addresses' field.
 	//
-	// Deprecated: use Addressing: "DHCP" instead. Retained for backward
-	// compatibility: when Addressing is unset, DHCP=true is normalized to
-	// Addressing: "DHCP". Setting DHCP together with an explicit Addressing is
-	// rejected by validation.
+	// Deprecated: use Addressing: "DHCP" (or "Static") instead. Retained for
+	// backward compatibility: during intake normalization, when Addressing is
+	// unset, DHCP=true folds into Addressing: "DHCP" and DHCP=false folds into
+	// Addressing: "Static", after which DHCP is cleared. Setting DHCP=true with
+	// a non-DHCP Addressing or DHCP=false with Addressing: "DHCP" is rejected.
 	DHCP *bool `json:"dhcp,omitempty"`
 
 	// MTU is the Maximum Transmission Unit for the interface.
@@ -156,11 +157,14 @@ type InterfaceConfig struct {
 // VRFConfig represents the configuration for a Virtual Routing and Forwarding domain.
 type VRFConfig struct {
 	// Name is the name of the VRF device to create (e.g., "vrf0").
-	// If not specified, a name will be automatically generated based on the interface index.
+	// Required in the final merged configuration; may be omitted in a partial
+	// source (such as a table override) that merges with a named VRF from
+	// another source.
 	Name string `json:"name,omitempty"`
 
 	// Table is the routing table ID to use for this VRF.
-	// If not specified, a unique table ID will be automatically assigned (typically interface index + 100).
+	// If not specified, a deterministic table ID is derived from Name via
+	// TableIDForName during post-merge defaulting.
 	// Common reserved tables: 255 (local), 254 (main), 253 (default).
 	Table *int `json:"table,omitempty"`
 }

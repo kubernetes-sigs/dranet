@@ -43,11 +43,22 @@ const (
 	MaxTableID uint32 = math.MaxUint32
 )
 
-// ValidateConfig unmarshals and validates the NetworkConfig from a runtime.RawExtension.
-// It performs strict unmarshalling and then defaults and validates the result via Validate.
-// Returns the parsed NetworkConfig and a slice of errors if any validation fails.
-func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
-	if raw == nil || raw.Raw == nil || len(raw.Raw) == 0 {
+type validationMode int
+
+const (
+	// validationModeIntake validates a single source before merging: syntax,
+	// numeric ranges, enum values, and conflicts within that source. Partial
+	// blocks whose prerequisites can come from another source (such as a VRF
+	// table override without a name, or an IPVlan block without Type: IPVLAN)
+	// are allowed and checked at final validation.
+	validationModeIntake validationMode = iota
+	// validationModeFinal validates the complete configuration after all sources
+	// have been merged and fallback defaults have been applied.
+	validationModeFinal
+)
+
+func unmarshalConfigStrict(raw *runtime.RawExtension) (*NetworkConfig, []error) {
+	if raw == nil || len(raw.Raw) == 0 {
 		return nil, nil // No configuration provided, so no validation errors.
 	}
 
@@ -61,35 +72,94 @@ func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
 		// If basic unmarshalling fails, we can't proceed with further validation.
 		return nil, allErrors
 	}
-	if len(strictErrs) > 0 {
-		for _, e := range strictErrs {
-			allErrors = append(allErrors, fmt.Errorf("failed to unmarshal strict JSON data: %w", e))
-		}
+	for _, e := range strictErrs {
+		allErrors = append(allErrors, fmt.Errorf("failed to unmarshal strict JSON data: %w", e))
+	}
+	return &config, allErrors
+}
+
+// ValidateConfig strictly unmarshals a standalone NetworkConfig from a
+// runtime.RawExtension, normalizes deprecated fields, applies fallback
+// defaults, and runs full completeness and cross-field validation.
+//
+// For multi-source pipelines where a raw configuration will be merged with
+// other sources before fallback defaults and completeness checks run, use
+// ValidateConfigIntake followed by MergeNetworkConfig/MergeNetworkConfigs and
+// NetworkConfig.Validate.
+func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
+	config, allErrors := unmarshalConfigStrict(raw)
+	if config == nil {
+		return nil, allErrors
 	}
 
 	allErrors = append(allErrors, config.Validate()...)
-
 	if len(allErrors) > 0 {
-		return &config, allErrors // Return partially parsed config with errors
+		return config, allErrors // Return partially parsed config with errors
 	}
-
-	return &config, nil
+	return config, nil
 }
 
-// Validate applies defaults to an already parsed NetworkConfig and validates it.
-// Use it for configurations assembled in memory rather than unmarshalled from a
-// ResourceClaim, most importantly the result of MergeNetworkConfig: the cloud
-// provider and profile configurations merged in there are unvalidated external
-// input, and cross-field invariants (e.g. rules combined with a VRF) only become
-// checkable once every source has been merged.
-func (c *NetworkConfig) Validate() []error {
-	// Apply defaults
-	c.Default()
+// ValidateConfigIntake strictly unmarshals a single-source NetworkConfig from a
+// runtime.RawExtension, normalizes deprecated fields, and validates single-source
+// intake rules without applying fallback defaults. Fallback defaults and
+// completeness checks run once after all sources have been merged via
+// NetworkConfig.Validate.
+//
+// When strict unmarshal or intake validation reports errors, ValidateConfigIntake
+// still returns the partially parsed normalized config alongside the errors
+// (or nil if JSON syntax unmarshalling failed).
+func ValidateConfigIntake(raw *runtime.RawExtension) (*NetworkConfig, []error) {
+	config, allErrors := unmarshalConfigStrict(raw)
+	if config == nil {
+		return nil, allErrors
+	}
 
+	normalized, intakeErrs := config.ValidateIntake()
+	allErrors = append(allErrors, intakeErrs...)
+
+	if len(allErrors) > 0 {
+		return normalized, allErrors // Return partially parsed config with errors
+	}
+	return normalized, nil
+}
+
+// ValidateIntake returns a normalized deep copy of c and validates single-source
+// intake rules (syntax, ranges, enum values, and conflicts within c) without
+// applying fallback defaults or mutating c.
+//
+// When intake reports errors, ValidateIntake still returns the normalized deep
+// copy alongside the errors so callers (such as profile rollback) can inspect
+// allocated fields without mutating c.
+func (c *NetworkConfig) ValidateIntake() (*NetworkConfig, []error) {
+	if c == nil {
+		return nil, nil
+	}
+	normalized, allErrors := c.Normalize()
+	allErrors = append(allErrors, validateNetworkConfig(normalized, validationModeIntake)...)
+	return normalized, allErrors
+}
+
+// Validate normalizes any remaining deprecated fields, applies fallback defaults
+// once when normalization succeeds, and validates completeness and cross-field
+// invariants in place. Use it on the final merged NetworkConfig returned by
+// MergeNetworkConfig or MergeNetworkConfigs.
+func (c *NetworkConfig) Validate() []error {
+	if c == nil {
+		return nil
+	}
+	allErrors := c.Interface.normalize("interface")
+	if len(allErrors) == 0 {
+		c.Default()
+	}
+	allErrors = append(allErrors, validateNetworkConfig(c, validationModeFinal)...)
+	return allErrors
+}
+
+func validateNetworkConfig(c *NetworkConfig, mode validationMode) []error {
 	var allErrors []error
 
 	// Validate InterfaceConfig
-	allErrors = append(allErrors, validateInterfaceConfig(&c.Interface, "interface")...)
+	allErrors = append(allErrors, validateInterfaceConfig(&c.Interface, "interface", mode)...)
 
 	// Validate Routes
 	if len(c.Routes) > 0 {
@@ -100,9 +170,8 @@ func (c *NetworkConfig) Validate() []error {
 	if len(c.Rules) > 0 {
 		if c.Interface.VRF != nil {
 			allErrors = append(allErrors, fmt.Errorf("rules are not supported when VRF is enabled"))
-		} else {
-			allErrors = append(allErrors, validateRules(c.Rules, "rules")...)
 		}
+		allErrors = append(allErrors, validateRules(c.Rules, "rules")...)
 	}
 
 	// Validate EthtoolConfig if present
@@ -154,7 +223,7 @@ func isValidLinuxInterfaceName(name string, fieldPath string) (allErrors []error
 }
 
 // validateInterfaceConfig validates the InterfaceConfig part of the NetworkConfig.
-func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors []error) {
+func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string, mode validationMode) (allErrors []error) {
 	if cfg == nil {
 		return
 	}
@@ -171,14 +240,12 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' is not supported", fieldPath, cfg.Addressing))
 	}
 
-	// The deprecated dhcp field may only coexist with "DHCP" addressing.
-	if cfg.DHCP != nil && *cfg.DHCP && cfg.Addressing != "" && cfg.Addressing != AddressingModeDHCP {
-		allErrors = append(allErrors, fmt.Errorf("%s: dhcp is deprecated and conflicts with addressing '%s'", fieldPath, cfg.Addressing))
-	}
-
 	// Unnumbered is only valid for subinterfaces and cannot carry addresses.
+	// At intake, allow an omitted Type because another source (such as the
+	// cloud provider or DeviceClass) may select a subinterface type; reject an
+	// explicit non-subinterface type immediately.
 	if cfg.Addressing == AddressingModeUnnumbered {
-		if !cfg.IsSubinterface() {
+		if !cfg.IsSubinterface() && (mode == validationModeFinal || cfg.Type != "") {
 			allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' is only valid for subinterface types", fieldPath, AddressingModeUnnumbered))
 		}
 		if len(cfg.Addresses) > 0 {
@@ -267,24 +334,27 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 	}
 
 	if cfg.VRF != nil {
-		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf")...)
+		allErrors = append(allErrors, validateVRFConfig(cfg.VRF, fieldPath+".vrf", mode)...)
 	}
 
 	if cfg.IPVlan != nil {
 		// Surface an error for the misconfiguration instead of silently dropping it.
-		if cfg.Type != InterfaceTypeIPVLAN {
+		// At intake, allow an omitted Type because another source may select IPVLAN.
+		if cfg.Type != InterfaceTypeIPVLAN && (mode == validationModeFinal || cfg.Type != "") {
 			allErrors = append(allErrors, fmt.Errorf("%s.ipvlan: configuration invalid for non-ipvlan interface type", fieldPath))
 		} else {
-			allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlan, fieldPath+".ipvlan")...)
+			allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlan, fieldPath+".ipvlan", mode)...)
 		}
 	}
 
 	return allErrors
 }
 
-func validateVRFConfig(cfg *VRFConfig, fieldPath string) (allErrors []error) {
+func validateVRFConfig(cfg *VRFConfig, fieldPath string, mode validationMode) (allErrors []error) {
 	if cfg.Name == "" {
-		allErrors = append(allErrors, fmt.Errorf("%s.name: cannot be empty", fieldPath))
+		if mode == validationModeFinal {
+			allErrors = append(allErrors, fmt.Errorf("%s.name: cannot be empty", fieldPath))
+		}
 	} else {
 		// The VRF is created as a link device, so its name must be a valid interface name.
 		allErrors = append(allErrors, isValidLinuxInterfaceName(cfg.Name, fieldPath+".name")...)
@@ -306,11 +376,11 @@ func validateVRFConfig(cfg *VRFConfig, fieldPath string) (allErrors []error) {
 	return allErrors
 }
 
-func validateIPVlanConfig(cfg *IPVlanConfig, fieldPath string) (allErrors []error) {
-	if cfg.Mode != IPVlanModeL2 {
+func validateIPVlanConfig(cfg *IPVlanConfig, fieldPath string, mode validationMode) (allErrors []error) {
+	if cfg.Mode != IPVlanModeL2 && (mode == validationModeFinal || cfg.Mode != "") {
 		allErrors = append(allErrors, fmt.Errorf("%s.mode: '%s' is not supported", fieldPath, cfg.Mode))
 	}
-	if cfg.Flag != IPVlanFlagBridge {
+	if cfg.Flag != IPVlanFlagBridge && (mode == validationModeFinal || cfg.Flag != "") {
 		allErrors = append(allErrors, fmt.Errorf("%s.flag: '%s' is not supported", fieldPath, cfg.Flag))
 	}
 

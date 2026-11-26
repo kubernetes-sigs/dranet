@@ -63,6 +63,13 @@ func TestValidateConfig(t *testing.T) {
 		GSOIPv4MaxSize: ptr.To[int32](65536), GROIPv4MaxSize: ptr.To[int32](65536),
 		ARPIgnore: ptr.To[int32](1), ARPAnnounce: ptr.To[int32](2), DHCP: ptr.To(false),
 	}}
+	ipvlanSettingsNormalized := NetworkConfig{Interface: InterfaceConfig{
+		Name: "eth0", Type: InterfaceTypeIPVLAN, Addressing: AddressingModeStatic,
+		Addresses: []string{"192.168.1.1/24"},
+		MTU:       ptr.To[int32](1400), GSOMaxSize: ptr.To[int32](65536), GROMaxSize: ptr.To[int32](65536),
+		GSOIPv4MaxSize: ptr.To[int32](65536), GROIPv4MaxSize: ptr.To[int32](65536),
+		ARPIgnore: ptr.To[int32](1), ARPAnnounce: ptr.To[int32](2),
+	}}
 	ipvlanHardwareAddrConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"192.168.1.1/24"}, HardwareAddr: ptr.To("00:11:22:33:44:55")}}
 	ipvlanLowMTUConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"192.168.1.1/24"}, MTU: ptr.To[int32](67)}}
 	ipvlanARPRangeConf := NetworkConfig{Interface: InterfaceConfig{Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"192.168.1.1/24"}, ARPIgnore: ptr.To[int32](9)}}
@@ -145,7 +152,7 @@ func TestValidateConfig(t *testing.T) {
 			name:        "ipvlan with mtu, offload sizes, arp settings and dhcp false",
 			raw:         newRawExtension(t, ipvlanSettingsConf),
 			expectErr:   false,
-			expectedCfg: &ipvlanSettingsConf,
+			expectedCfg: &ipvlanSettingsNormalized,
 		},
 		{
 			name:        "ipvlan with hardwareAddr",
@@ -179,8 +186,9 @@ func TestValidateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.expectedCfg != nil {
-				tt.expectedCfg.Default()
+			expectedCfg := tt.expectedCfg.Clone()
+			if expectedCfg != nil {
+				expectedCfg.Default()
 			}
 			cfg, errs := ValidateConfig(tt.raw)
 			hasErrs := len(errs) > 0
@@ -204,8 +212,8 @@ func TestValidateConfig(t *testing.T) {
 				}
 			}
 
-			if !reflect.DeepEqual(cfg, tt.expectedCfg) {
-				t.Errorf("ValidateConfig() cfg = %+v, expectedCfg %+v", cfg, tt.expectedCfg)
+			if !reflect.DeepEqual(cfg, expectedCfg) {
+				t.Errorf("ValidateConfig() cfg = %+v, expectedCfg %+v", cfg, expectedCfg)
 			}
 		})
 	}
@@ -617,6 +625,13 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
+			name:      "dhcp false conflicts with explicit dhcp addressing",
+			cfg:       &InterfaceConfig{DHCP: ptr.To(false), Addressing: AddressingModeDHCP},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
 			name:      "unnumbered with dhcp on ipvlan type",
 			cfg:       &InterfaceConfig{Type: "IPVLAN", Addressing: AddressingModeUnnumbered, DHCP: ptr.To(true)},
 			fieldPath: "iface",
@@ -626,12 +641,16 @@ func TestValidateInterfaceConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			var errs []error
 			if tt.cfg != nil {
 				nc := &NetworkConfig{Interface: *tt.cfg}
-				nc.Default()
+				errs = append(errs, nc.Interface.normalize(tt.fieldPath)...)
+				if len(errs) == 0 {
+					nc.Default()
+				}
 				tt.cfg = &nc.Interface
 			}
-			errs := validateInterfaceConfig(tt.cfg, tt.fieldPath)
+			errs = append(errs, validateInterfaceConfig(tt.cfg, tt.fieldPath, validationModeFinal)...)
 			if (len(errs) > 0) != tt.expectErr {
 				t.Errorf("validateInterfaceConfig() expectErr %v, got errors: %v", tt.expectErr, errs)
 			}
@@ -1197,7 +1216,7 @@ func TestValidateVRFConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			errs := validateVRFConfig(tt.cfg, "interface.vrf")
+			errs := validateVRFConfig(tt.cfg, "interface.vrf", validationModeFinal)
 			if (len(errs) > 0) != tt.expectErr {
 				t.Fatalf("validateVRFConfig() expectErr %v, got errors: %v", tt.expectErr, errs)
 			}
@@ -1321,13 +1340,46 @@ func TestNetworkConfigValidate(t *testing.T) {
 			},
 		},
 		{
-			name: "folds the deprecated dhcp field into addressing",
+			name: "folds the deprecated dhcp field into addressing and clears dhcp",
 			config: &NetworkConfig{
 				Interface: InterfaceConfig{Name: "eth0", DHCP: ptr.To(true)},
 			},
 			expectedCfg: &NetworkConfig{
-				Interface: InterfaceConfig{Name: "eth0", DHCP: ptr.To(true), Addressing: AddressingModeDHCP},
+				Interface: InterfaceConfig{Name: "eth0", Addressing: AddressingModeDHCP},
 			},
+		},
+		{
+			name: "folds dhcp false into static addressing and clears dhcp",
+			config: &NetworkConfig{
+				Interface: InterfaceConfig{Name: "eth0", DHCP: ptr.To(false)},
+			},
+			expectedCfg: &NetworkConfig{
+				Interface: InterfaceConfig{Name: "eth0", Addressing: AddressingModeStatic},
+			},
+		},
+		{
+			name: "rejects dhcp false combined with addressing DHCP",
+			config: &NetworkConfig{
+				Interface: InterfaceConfig{Name: "eth0", DHCP: ptr.To(false), Addressing: AddressingModeDHCP},
+			},
+			expectErr:   true,
+			errContains: []string{"dhcp is deprecated and conflicts with addressing 'DHCP'"},
+		},
+		{
+			name: "rejects a VRF without a name",
+			config: &NetworkConfig{
+				Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Table: ptr.To(200)}},
+			},
+			expectErr:   true,
+			errContains: []string{"interface.vrf.name: cannot be empty"},
+		},
+		{
+			name: "rejects ipvlan without ipvlan interface type",
+			config: &NetworkConfig{
+				Interface: InterfaceConfig{Name: "eth0", IPVlan: &IPVlanConfig{Mode: IPVlanModeL2}},
+			},
+			expectErr:   true,
+			errContains: []string{"interface.ipvlan: configuration invalid for non-ipvlan interface type"},
 		},
 		{
 			name: "derives a vrf table from the vrf name",
@@ -1342,13 +1394,41 @@ func TestNetworkConfigValidate(t *testing.T) {
 			},
 		},
 		{
-			name: "rejects rules combined with a vrf",
+			name: "rejects rules combined with a vrf and still validates invalid rules",
 			config: &NetworkConfig{
 				Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: "vrf0"}},
-				Rules:     []RuleConfig{{Source: "10.0.0.0/8", Table: 100}},
+				Rules:     []RuleConfig{{Priority: -1, Source: "not-a-cidr", Table: 100}},
 			},
-			expectErr:   true,
-			errContains: []string{"rules are not supported when VRF is enabled"},
+			expectErr: true,
+			errContains: []string{
+				"rules are not supported when VRF is enabled",
+				"rules[0].priority: must be an integer between 0 and 32767",
+				"rules[0].source: invalid CIDR format 'not-a-cidr'",
+			},
+		},
+		{
+			name: "skips fallback defaults when normalization fails",
+			config: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:       InterfaceTypeIPVLAN,
+					Addressing: AddressingModeUnnumbered,
+					DHCP:       ptr.To(true),
+					VRF:        &VRFConfig{Name: "tenant-a"},
+				},
+			},
+			expectErr: true,
+			errContains: []string{
+				"dhcp is deprecated and conflicts with addressing 'Unnumbered'",
+				"not supported for subinterface types",
+			},
+			expectedCfg: &NetworkConfig{
+				Interface: InterfaceConfig{
+					Type:       InterfaceTypeIPVLAN,
+					Addressing: AddressingModeUnnumbered,
+					DHCP:       ptr.To(true),
+					VRF:        &VRFConfig{Name: "tenant-a"},
+				},
+			},
 		},
 		{
 			name: "rejects an mtu below the minimum",
@@ -1422,21 +1502,196 @@ func TestNetworkConfigValidate(t *testing.T) {
 			}
 		})
 	}
+	t.Run("nil receiver returns no errors", func(t *testing.T) {
+		var nilCfg *NetworkConfig
+		if errs := nilCfg.Validate(); len(errs) > 0 {
+			t.Fatalf("nil.Validate() = %v, want nil", errs)
+		}
+	})
 }
 
 func TestValidateConfigDelegatesToValidate(t *testing.T) {
-	// ValidateConfig must keep defaulting and validating via Validate, so the two
-	// entry points cannot drift apart.
-	raw := newRawExtensionFromString(t, `{"interface": {"type": "IPVLAN", "addressing": "Unnumbered", "ipvlan": {}}}`)
-
+	// ValidateConfig keeps its standalone full-validation contract: it
+	// normalizes deprecated fields, applies fallback defaults, and rejects
+	// incomplete configs without needing a subsequent merge.
+	raw := newRawExtensionFromString(t, `{"interface": {"type": "IPVLAN", "addressing": "Unnumbered", "ipvlan": {}, "vrf": {"name": "tenant-a"}}}`)
 	cfg, errs := ValidateConfig(raw)
 	if len(errs) > 0 {
 		t.Fatalf("ValidateConfig() unexpected errors: %v", errs)
 	}
-	if cfg.Interface.IPVlan == nil {
-		t.Fatalf("ValidateConfig() left ipvlan nil")
-	}
-	if cfg.Interface.IPVlan.Mode != IPVlanModeL2 || cfg.Interface.IPVlan.Flag != IPVlanFlagBridge {
+	if cfg.Interface.IPVlan == nil || cfg.Interface.IPVlan.Mode != IPVlanModeL2 || cfg.Interface.IPVlan.Flag != IPVlanFlagBridge {
 		t.Errorf("ValidateConfig() ipvlan = %+v, want mode %s flag %s", cfg.Interface.IPVlan, IPVlanModeL2, IPVlanFlagBridge)
 	}
+	if cfg.Interface.VRF == nil || cfg.Interface.VRF.Table == nil || *cfg.Interface.VRF.Table != TableIDForName("tenant-a") {
+		t.Errorf("ValidateConfig() VRF = %+v, want derived table %d", cfg.Interface.VRF, TableIDForName("tenant-a"))
+	}
+
+	if _, errs := ValidateConfig(newRawExtensionFromString(t, `{"interface": {"addressing": "Unnumbered"}}`)); len(errs) == 0 {
+		t.Errorf("ValidateConfig() accepted standalone Unnumbered without subinterface type")
+	}
+	if _, errs := ValidateConfig(newRawExtensionFromString(t, `{"interface": {"vrf": {"table": 200}}}`)); len(errs) == 0 {
+		t.Errorf("ValidateConfig() accepted standalone VRF without name")
+	}
+}
+
+func TestValidateConfigIntakeContract(t *testing.T) {
+	// ValidateConfigIntake performs intake only: it strictly unmarshals,
+	// normalizes deprecated fields, and checks single-source syntax/ranges
+	// without deriving fallback defaults or rejecting partial cross-source
+	// blocks. Final completeness and fallback defaulting run once in Validate()
+	// after merging.
+	t.Run("nil inputs return nil without errors", func(t *testing.T) {
+		if cfg, errs := ValidateConfigIntake(nil); cfg != nil || len(errs) > 0 {
+			t.Fatalf("ValidateConfigIntake(nil) = (%#v, %v), want (nil, nil)", cfg, errs)
+		}
+		var nilCfg *NetworkConfig
+		if cfg, errs := nilCfg.ValidateIntake(); cfg != nil || len(errs) > 0 {
+			t.Fatalf("nil.ValidateIntake() = (%#v, %v), want (nil, nil)", cfg, errs)
+		}
+	})
+
+	t.Run("ValidateIntake returns populated deep copy on error without mutating receiver", func(t *testing.T) {
+		orig := &NetworkConfig{
+			Profile: "p",
+			Interface: InterfaceConfig{
+				Addresses: []string{"10.0.0.5/24"},
+				MTU:       ptr.To[int32](1),
+			},
+		}
+		before := orig.Clone()
+		got, errs := orig.ValidateIntake()
+		if len(errs) == 0 {
+			t.Fatal("ValidateIntake() expected error for MTU 1, got none")
+		}
+		if got == nil || got.Profile != "p" || len(got.Interface.Addresses) != 1 || got.Interface.Addresses[0] != "10.0.0.5/24" {
+			t.Fatalf("ValidateIntake() returned %+v on error, want populated copy", got)
+		}
+		got.Interface.Addresses[0] = "198.51.100.1/24"
+		*got.Interface.MTU = 1500
+		if !reflect.DeepEqual(orig, before) {
+			t.Fatalf("ValidateIntake() mutated or aliased receiver:\ngot  %+v\nwant %+v", orig, before)
+		}
+	})
+
+	t.Run("does not apply IPVlan or VRF fallback defaults at intake", func(t *testing.T) {
+		raw := newRawExtensionFromString(t, `{"interface": {"type": "IPVLAN", "addressing": "Unnumbered", "ipvlan": {}, "vrf": {"name": "tenant-a"}}}`)
+		cfg, errs := ValidateConfigIntake(raw)
+		if len(errs) > 0 {
+			t.Fatalf("ValidateConfigIntake() unexpected errors: %v", errs)
+		}
+		if cfg.Interface.IPVlan == nil || cfg.Interface.IPVlan.Mode != "" || cfg.Interface.IPVlan.Flag != "" {
+			t.Errorf("ValidateConfigIntake() applied IPVlan fallback defaults at intake: %+v", cfg.Interface.IPVlan)
+		}
+		if cfg.Interface.VRF == nil || cfg.Interface.VRF.Table != nil {
+			t.Errorf("ValidateConfigIntake() derived VRF table at intake: %+v", cfg.Interface.VRF)
+		}
+
+		if errs := cfg.Validate(); len(errs) > 0 {
+			t.Fatalf("Validate() unexpected errors: %v", errs)
+		}
+		if cfg.Interface.IPVlan.Mode != IPVlanModeL2 || cfg.Interface.IPVlan.Flag != IPVlanFlagBridge {
+			t.Errorf("Validate() ipvlan = %+v, want mode %s flag %s", cfg.Interface.IPVlan, IPVlanModeL2, IPVlanFlagBridge)
+		}
+		if cfg.Interface.VRF.Table == nil || *cfg.Interface.VRF.Table != TableIDForName("tenant-a") {
+			t.Errorf("Validate() VRF table = %v, want %d", cfg.Interface.VRF.Table, TableIDForName("tenant-a"))
+		}
+	})
+
+	t.Run("allows partial cross-source blocks at intake and rejects them if still incomplete at final Validate", func(t *testing.T) {
+		cases := []struct {
+			name        string
+			raw         string
+			wantFinalEr string
+		}{
+			{
+				name:        "unnumbered without type",
+				raw:         `{"interface": {"addressing": "Unnumbered"}}`,
+				wantFinalEr: "is only valid for subinterface types",
+			},
+			{
+				name:        "ipvlan block without type",
+				raw:         `{"interface": {"ipvlan": {"mode": "L2"}}}`,
+				wantFinalEr: "configuration invalid for non-ipvlan interface type",
+			},
+			{
+				name:        "vrf table override without name",
+				raw:         `{"interface": {"vrf": {"table": 200}}}`,
+				wantFinalEr: "interface.vrf.name: cannot be empty",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg, errs := ValidateConfigIntake(newRawExtensionFromString(t, tc.raw))
+				if len(errs) > 0 {
+					t.Fatalf("ValidateConfigIntake() rejected partial config at intake: %v", errs)
+				}
+				finalErrs := cfg.Validate()
+				if len(finalErrs) == 0 {
+					t.Fatalf("Validate() accepted incomplete config without other sources")
+				}
+				found := false
+				for _, err := range finalErrs {
+					if strings.Contains(err.Error(), tc.wantFinalEr) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Validate() errors %v do not contain %q", finalErrs, tc.wantFinalEr)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects explicit single-source contradictions and invalid values at intake", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			raw     string
+			wantErr string
+		}{
+			{
+				name:    "passthrough with unnumbered",
+				raw:     `{"interface": {"type": "Passthrough", "addressing": "Unnumbered"}}`,
+				wantErr: "is only valid for subinterface types",
+			},
+			{
+				name:    "passthrough with ipvlan",
+				raw:     `{"interface": {"type": "Passthrough", "ipvlan": {"mode": "L2"}}}`,
+				wantErr: "configuration invalid for non-ipvlan interface type",
+			},
+			{
+				name:    "unsupported ipvlan mode without type",
+				raw:     `{"interface": {"ipvlan": {"mode": "L3"}}}`,
+				wantErr: "interface.ipvlan.mode: 'L3' is not supported",
+			},
+			{
+				name:    "reserved vrf table without name",
+				raw:     `{"interface": {"vrf": {"table": 254}}}`,
+				wantErr: "cannot use reserved table ID 254",
+			},
+			{
+				name:    "dhcp false with addressing DHCP",
+				raw:     `{"interface": {"dhcp": false, "addressing": "DHCP"}}`,
+				wantErr: "dhcp is deprecated and conflicts with addressing 'DHCP'",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, errs := ValidateConfigIntake(newRawExtensionFromString(t, tc.raw))
+				if len(errs) == 0 {
+					t.Fatalf("ValidateConfigIntake() expected error containing %q, got none", tc.wantErr)
+				}
+				found := false
+				for _, err := range errs {
+					if strings.Contains(err.Error(), tc.wantErr) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("ValidateConfigIntake() errors %v do not contain %q", errs, tc.wantErr)
+				}
+			})
+		}
+	})
 }

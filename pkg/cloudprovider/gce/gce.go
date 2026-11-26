@@ -214,6 +214,12 @@ func (g *GCEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim
 	if config == nil || !config.Interface.IsSubinterface() {
 		return nil, nil
 	}
+	if config.Interface.Addressing == apis.AddressingModeUnnumbered {
+		// Unnumbered subinterfaces must not receive addresses or synthesized
+		// source routing. Skip IPAM allocation so final validation does not
+		// reject and roll back an unwanted lease on every prepare retry.
+		return nil, nil
+	}
 	if g.localIPAM == nil {
 		return nil, fmt.Errorf("GCE profile IPAM is not initialized for subinterface device %q", id.MAC)
 	}
