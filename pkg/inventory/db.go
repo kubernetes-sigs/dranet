@@ -106,6 +106,9 @@ type DB struct {
 	// deviceAttributeMachineModifiers is used to redirect the upstream
 	// topology helpers to a synthetic sysfs in unit tests.
 	deviceAttributeMachineModifiers []deviceattribute.MachineModifier
+	// vfioSysRoot is the sysfs root used to evaluate dra.net/vfio. Empty
+	// when the VFIODriverRebind feature gate is disabled.
+	vfioSysRoot string
 }
 
 // hostDevice is the published Device plus node-local facts the driver needs
@@ -161,6 +164,14 @@ func WithMoveIBInterfaces(move bool) Option {
 func WithListNUMAAttributes() Option {
 	return func(db *DB) {
 		db.numaAttributeForm = deviceattribute.ListAttribute
+	}
+}
+
+// WithVFIOAttributes publishes dra.net/vfio and resource.kubernetes.io/pciBusID
+// for PCI devices, reading sysfs from sysRoot.
+func WithVFIOAttributes(sysRoot string) Option {
+	return func(db *DB) {
+		db.vfioSysRoot = sysRoot
 	}
 }
 
@@ -956,6 +967,10 @@ func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hos
 			} else {
 				devices[i].Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
 			}
+		}
+
+		if db.vfioSysRoot != "" && isDirectPCI {
+			db.addVFIOAttributes(&devices[i], pciAddr)
 		}
 
 		pciDev, inGhw := pciMap[normalizedAddr]

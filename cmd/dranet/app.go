@@ -109,6 +109,9 @@ func main() {
 			klog.Fatalf("Failed to set feature gates: %v", err)
 		}
 	}
+	if features.DefaultFeatureGate.Enabled(features.VFIODriverRebind) && dbPath == "" {
+		klog.Fatalf("the %s feature gate requires --db-path, to keep the original driver of each function across restarts", features.VFIODriverRebind)
+	}
 
 	printVersion()
 	flag.VisitAll(func(f *flag.Flag) {
@@ -240,6 +243,9 @@ func main() {
 	}
 	if features.DefaultFeatureGate.Enabled(features.DRAListTypeAttributes) {
 		optsDb = append(optsDb, inventory.WithListNUMAAttributes())
+	}
+	if features.DefaultFeatureGate.Enabled(features.VFIODriverRebind) {
+		optsDb = append(optsDb, inventory.WithVFIOAttributes(inventory.SysfsRoot))
 	}
 
 	if cloudInst != nil {

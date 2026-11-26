@@ -263,7 +263,10 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Handle, claim *resourceapi.ResourceClaim, podUID types.UID, result resourceapi.DeviceRequestAllocationResult, rulesByTable map[int][]apis.RuleConfig) error {
 	// Idempotency check: reuse the device configuration if it already exists, as a
 	// second resolution would allocate new profile resources and leak the stored ones.
-	if _, ok := np.podConfigStore.GetDeviceConfig(podUID, result.Device); ok {
+	if stored, ok := np.podConfigStore.GetDeviceConfig(podUID, result.Device); ok {
+		if stored.VFIO != nil && !stored.VFIO.Bound {
+			return np.prepareVFIODevice(claim, podUID, result, &stored.NetworkInterfaceConfigInPod, &stored)
+		}
 		klog.V(4).Infof("device %s of pod %s is already prepared, reusing the stored configuration", result.Device, podUID)
 		return nil
 	}
@@ -292,6 +295,12 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	}
 	if len(configErrors) > 0 {
 		return errors.Join(configErrors...)
+	}
+
+	// The cloud provider and profile configurations describe the network
+	// interface, which a VFIO device does not have, so they are not merged.
+	if userConf.VFIO != nil {
+		return np.prepareVFIODevice(claim, podUID, result, userConf, nil)
 	}
 
 	mergedConf, err := np.getDeviceNetworkConfig(result.Device, claim, userConf)
@@ -601,6 +610,12 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 }
 
 func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+	// DeleteClaim drops every device of the pods using this claim, so the
+	// functions those pods hold through VFIO are bound back first. Until that
+	// succeeds the checkpoint is kept and kubelet retries.
+	if err := np.restoreVFIODevices(claim.NamespacedName); err != nil {
+		return err
+	}
 	for _, podUID := range np.podConfigStore.ListPods() {
 		podCfg, ok := np.podConfigStore.GetPodConfig(podUID)
 		if !ok {
