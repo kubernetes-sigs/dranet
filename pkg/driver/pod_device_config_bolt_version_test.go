@@ -199,30 +199,69 @@ func seedPreVersioningDB(t *testing.T, path, podUID, deviceName string, cfg Devi
 	}
 }
 
-// TestDeviceConfigFixturePopulated ensures all DeviceConfig fields are populated
-// in fullDeviceConfig().
+// TestDeviceConfigFixturePopulated ensures all DRANET-owned fields in
+// DeviceConfig (including nested structs such as VRFConfig, IPVlanConfig, and
+// any future additions) are populated in fullDeviceConfig().
 func TestDeviceConfigFixturePopulated(t *testing.T) {
 	cfg := fullDeviceConfig()
-	for name, v := range map[string]reflect.Value{
-		"DeviceConfig":          reflect.ValueOf(cfg),
-		"NetworkConfig":         reflect.ValueOf(cfg.NetworkInterfaceConfigInPod),
-		"InterfaceConfig":       reflect.ValueOf(cfg.NetworkInterfaceConfigInPod.Interface),
-		"RDMAConfig":            reflect.ValueOf(cfg.RDMADevice),
-		"LinuxDevice":           reflect.ValueOf(cfg.RDMADevice.DevChars[0]),
-		"RouteConfig":           reflect.ValueOf(cfg.NetworkInterfaceConfigInPod.Routes[0]),
-		"RuleConfig":            reflect.ValueOf(cfg.NetworkInterfaceConfigInPod.Rules[0]),
-		"NeighborConfig":        reflect.ValueOf(cfg.NetworkInterfaceConfigInPod.Neighbors[0]),
-		"EthtoolConfig":         reflect.ValueOf(*cfg.NetworkInterfaceConfigInPod.Ethtool),
-		"NetworkInterfaceState": reflect.ValueOf(*cfg.NetworkInterfaceStateInPod),
-		"DHCPLeaseRecord":       reflect.ValueOf(*cfg.NetworkInterfaceStateInPod.DHCPLease),
-	} {
+	checkFixturePopulated(t, "DeviceConfig", reflect.ValueOf(cfg))
+}
+
+func checkFixturePopulated(t *testing.T, path string, v reflect.Value) {
+	t.Helper()
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			t.Errorf("%s is nil in fullDeviceConfig(): set it and regenerate goldenDeviceConfigJSON", path)
+			return
+		}
+		if strings.HasPrefix(v.Elem().Type().PkgPath(), "sigs.k8s.io/dranet/") {
+			checkFixturePopulated(t, path, v.Elem())
+		}
+	case reflect.Struct:
 		for i := 0; i < v.NumField(); i++ {
 			field := v.Type().Field(i)
 			if !field.IsExported() {
 				continue
 			}
-			if v.Field(i).IsZero() {
-				t.Errorf("%s.%s is not populated by fullDeviceConfig(): set it and regenerate goldenDeviceConfigJSON", name, field.Name)
+			fieldPath := path + "." + field.Name
+			fv := v.Field(i)
+			if fv.IsZero() {
+				t.Errorf("%s is not populated by fullDeviceConfig(): set it and regenerate goldenDeviceConfigJSON", fieldPath)
+				continue
+			}
+			// NetworkInterfaceConfigInHost intentionally records only the
+			// host-side identity fields (Name, Addresses, HardwareAddr).
+			if fieldPath == "DeviceConfig.NetworkInterfaceConfigInHost" {
+				continue
+			}
+			checkFixturePopulated(t, fieldPath, fv)
+		}
+	case reflect.Slice:
+		if v.Len() == 0 {
+			t.Errorf("%s is empty in fullDeviceConfig(): set it and regenerate goldenDeviceConfigJSON", path)
+			return
+		}
+		elemType := v.Type().Elem()
+		if elemType.Kind() == reflect.Pointer {
+			elemType = elemType.Elem()
+		}
+		if strings.HasPrefix(elemType.PkgPath(), "sigs.k8s.io/dranet/") {
+			checkFixturePopulated(t, path+"[0]", v.Index(0))
+		}
+	case reflect.Map:
+		if v.Len() == 0 {
+			t.Errorf("%s is empty in fullDeviceConfig(): set it and regenerate goldenDeviceConfigJSON", path)
+			return
+		}
+		elemType := v.Type().Elem()
+		if elemType.Kind() == reflect.Pointer {
+			elemType = elemType.Elem()
+		}
+		if strings.HasPrefix(elemType.PkgPath(), "sigs.k8s.io/dranet/") {
+			iter := v.MapRange()
+			for iter.Next() {
+				checkFixturePopulated(t, fmt.Sprintf("%s[%v]", path, iter.Key().Interface()), iter.Value())
 			}
 		}
 	}
