@@ -396,6 +396,24 @@ func testGetProfileConfig_Namespaced(t *testing.T) {
 		}
 	})
 
+	t.Run("unnumbered subinterface skips IPAM and routing", func(t *testing.T) {
+		instance := &AlibabaInstance{}
+		id := cloudprovider.DeviceIdentifiers{Name: "bond0"}
+		req := &apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Type:       apis.InterfaceTypeIPVLAN,
+				Addressing: apis.AddressingModeUnnumbered,
+			},
+		}
+		got, err := instance.GetProfileConfig(id, nil, req)
+		if err != nil {
+			t.Fatalf("GetProfileConfig() error = %v", err)
+		}
+		if got != nil {
+			t.Errorf("GetProfileConfig() = %+v, want nil", got)
+		}
+	})
+
 	t.Run("non-subinterface request is a no-op", func(t *testing.T) {
 		instance := &AlibabaInstance{localIPAM: ipam.NewLocalIPAM(nil)}
 		id := cloudprovider.DeviceIdentifiers{Name: "bond0"}

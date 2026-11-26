@@ -161,6 +161,12 @@ func (a *AlibabaInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, c
 	if config == nil || !config.Interface.IsSubinterface() {
 		return nil, nil
 	}
+	if config.Interface.Addressing == apis.AddressingModeUnnumbered {
+		// Unnumbered subinterfaces must not receive addresses or synthesized
+		// source routing. Skip IPAM allocation so final validation does not
+		// reject and roll back an unwanted lease on every prepare retry.
+		return nil, nil
+	}
 	if a.localIPAM == nil {
 		return nil, fmt.Errorf("alibaba profile IPAM is not initialized for subinterface device %q", id.Name)
 	}
