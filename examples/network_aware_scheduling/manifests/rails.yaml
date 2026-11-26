@@ -1,0 +1,59 @@
+# One DeviceClass for each rail, and the claim of a Pod: one interface on
+# each rail.
+#
+# In this lab all the nodes are cabled in the same order, so the name of an
+# interface tells its rail: eth1 is on rail 1 and eth2 is on rail 2.
+#
+# The class also gives the interface its name in the Pod.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: rail-1
+spec:
+  selectors:
+  - cel:
+      expression: device.driver == "dra.net"
+  - cel:
+      expression: >-
+        "ifName" in device.attributes["dra.net"] &&
+        device.attributes["dra.net"].ifName == "eth1"
+  config:
+  - opaque:
+      driver: dra.net
+      parameters:
+        interface:
+          name: rail1
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: rail-2
+spec:
+  selectors:
+  - cel:
+      expression: device.driver == "dra.net"
+  - cel:
+      expression: >-
+        "ifName" in device.attributes["dra.net"] &&
+        device.attributes["dra.net"].ifName == "eth2"
+  config:
+  - opaque:
+      driver: dra.net
+      parameters:
+        interface:
+          name: rail2
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: one-interface-on-each-rail
+spec:
+  spec:
+    devices:
+      requests:
+      - name: rail1
+        exactly:
+          deviceClassName: rail-1
+      - name: rail2
+        exactly:
+          deviceClassName: rail-2

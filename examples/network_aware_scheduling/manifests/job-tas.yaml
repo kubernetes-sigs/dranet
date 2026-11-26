@@ -1,0 +1,50 @@
+# The same job with the topology constraint of Kubernetes 1.37: all the Pods
+# of the group must be on nodes with the same value of a node label, here the
+# leaf group.
+apiVersion: scheduling.k8s.io/v1beta1
+kind: PodGroup
+metadata:
+  name: job-tas
+spec:
+  schedulingPolicy:
+    gang:
+      minCount: 2
+  schedulingConstraints:
+    topology:
+    - key: fabric.example.com/leaf-group
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: job-tas-0
+  labels:
+    app: job-tas
+spec:
+  terminationGracePeriodSeconds: 1
+  schedulingGroup:
+    podGroupName: job-tas
+  resourceClaims:
+  - name: rails
+    resourceClaimTemplateName: one-interface-on-each-rail
+  containers:
+  - name: agnhost
+    image: registry.k8s.io/e2e-test-images/agnhost:2.54
+    command: ["sleep", "infinity"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: job-tas-1
+  labels:
+    app: job-tas
+spec:
+  terminationGracePeriodSeconds: 1
+  schedulingGroup:
+    podGroupName: job-tas
+  resourceClaims:
+  - name: rails
+    resourceClaimTemplateName: one-interface-on-each-rail
+  containers:
+  - name: agnhost
+    image: registry.k8s.io/e2e-test-images/agnhost:2.54
+    command: ["sleep", "infinity"]

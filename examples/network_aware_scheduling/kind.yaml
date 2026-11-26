@@ -1,0 +1,17 @@
+# The kind cluster of the example: Kubernetes 1.37 with the workload
+# scheduling API and topology-aware workload scheduling.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+featureGates:
+  # PodGroup and pod.spec.schedulingGroup (KEP-4671). Beta, off by default.
+  GenericWorkload: true
+  # podGroup.spec.schedulingConstraints.topology (KEP-5732). Alpha.
+  TopologyAwareWorkloadScheduling: true
+runtimeConfig:
+  # Beta API versions are off by default.
+  "scheduling.k8s.io/v1beta1": "true"
+nodes:
+- role: control-plane
+- role: worker
+- role: worker
+- role: worker
