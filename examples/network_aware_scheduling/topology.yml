@@ -1,0 +1,66 @@
+# A rail-optimized fabric with two leaf groups, for netlab with the kind
+# plugin (https://netlab.tools/plugins/kind/).
+#
+#                        spine
+#              /       /       \       \
+#          leaf1    leaf2     leaf3    leaf4
+#          rail 1   rail 2    rail 1   rail 2
+#          \__ group a __/    \__ group b __/
+#           |  |    |  |        |        |
+#         tas-worker           tas-worker3
+#         tas-worker2
+#
+# A leaf group is the set of leaves that serves the same nodes. Two nodes of
+# one group reach each other through one leaf on each rail. Two nodes of
+# different groups reach each other through the spine, also on the same rail.
+#
+#   node          eth1     eth2
+#   tas-worker    leaf1    leaf2
+#   tas-worker2   leaf1    leaf2
+#   tas-worker3   leaf3    leaf4
+#
+# The control-plane node is not on the fabric.
+name: dranettas
+plugin: [ kind ]
+provider: clab
+defaults.device: srlinux
+
+nodes:
+  spine:
+    clab.startup-config: configs/spine.cfg
+  leaf1:
+    clab.startup-config: configs/leaf1.cfg
+  leaf2:
+    clab.startup-config: configs/leaf2.cfg
+  leaf3:
+    clab.startup-config: configs/leaf3.cfg
+  leaf4:
+    clab.startup-config: configs/leaf4.cfg
+  tas:
+    device: kind
+    kind.workers: 3
+    box: kindest/node:v1.37.0
+    # The kind configuration with the feature gates. It must have the same
+    # number of workers as kind.workers.
+    clab.startup-config: kind.yaml
+  tas-worker:
+    device: kind-node
+  tas-worker2:
+    device: kind-node
+  tas-worker3:
+    device: kind-node
+
+links:
+# Port 1 of each leaf goes to the spine.
+- leaf1-spine
+- leaf2-spine
+- leaf3-spine
+- leaf4-spine
+# Ports 2 and 3 of each leaf go to the workers of its group. The order of
+# the links of a node gives the names of its interfaces: eth1, eth2.
+- interfaces: [ tas-worker, leaf1 ]
+- interfaces: [ tas-worker, leaf2 ]
+- interfaces: [ tas-worker2, leaf1 ]
+- interfaces: [ tas-worker2, leaf2 ]
+- interfaces: [ tas-worker3, leaf3 ]
+- interfaces: [ tas-worker3, leaf4 ]
