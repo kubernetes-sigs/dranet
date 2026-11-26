@@ -50,6 +50,7 @@ func registerMetrics() {
 		prometheus.MustRegister(nriPluginDisconnectsTotal)
 		prometheus.MustRegister(nriPluginReconnectAttemptsTotal)
 		prometheus.MustRegister(netdbReconnectAttemptsTotal)
+		prometheus.MustRegister(podsMissingDevicesTotal)
 	})
 }
 
@@ -112,22 +113,29 @@ var (
 	})
 	// nriPluginReconnectAttemptsTotal and netdbReconnectAttemptsTotal count
 	// every retry of each subsystem's loop in Start(), regardless of cause --
-	// a superset of nriPluginDisconnectsTotal above. Both loops cap at
-	// maxAttempts before klog.Fatalf, so either value approaching maxAttempts
-	// warns of an imminent exit before the container restart itself is
-	// visible (kube_pod_container_status_restarts_total). Counters, not
-	// Gauges: within a process's life they only increase, resetting on
-	// process restart like a Gauge would anyway.
+	// a superset of nriPluginDisconnectsTotal above. Consecutive failures are
+	// capped at maxAttempts before klog.Fatalf; for NRI, the failure streak
+	// resets after each successful connection so routine runtime restarts do
+	// not crash the driver.
 	nriPluginReconnectAttemptsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",
 		Name:      "nri_plugin_reconnect_attempts_total",
-		Help:      "Total number of times the NRI plugin connection loop has been restarted. Resets on process restart; approaches maxAttempts before the process exits.",
+		Help:      "Total number of times the NRI plugin connection loop has been retried.",
 	})
 	netdbReconnectAttemptsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",
 		Name:      "netdb_reconnect_attempts_total",
 		Help:      "Total number of times the host network device database's connection loop has been restarted. Resets on process restart; approaches maxAttempts before the process exits.",
+	})
+	// podsMissingDevicesTotal counts the running pods that dranet found without
+	// a network device that they claim, each time it synchronizes with the
+	// runtime. See reportMissingDevices.
+	podsMissingDevicesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "dranet",
+		Subsystem: "driver",
+		Name:      "pods_missing_devices_total",
+		Help:      "Total number of times dranet found a running pod without a network device that the pod claims.",
 	})
 )

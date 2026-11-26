@@ -167,6 +167,7 @@ func TestPrepareResourceClaimsMetrics(t *testing.T) {
 			eventRecorder:  record.NewFakeRecorder(100),
 			podConfigStore: mustNewPodConfigStore(),
 		}
+		np.nriConnected.Store(true)
 
 		claims := []*resourcev1.ResourceClaim{
 			{
@@ -273,6 +274,7 @@ func TestClaimPrepareFailedEvent(t *testing.T) {
 		eventRecorder:  fakeRecorder,
 		podConfigStore: mustNewPodConfigStore(),
 	}
+	np.nriConnected.Store(true)
 
 	claims := []*resourcev1.ResourceClaim{
 		{
@@ -415,6 +417,7 @@ func TestDynamicProfiles(t *testing.T) {
 			driverName:     "test.driver",
 			podConfigStore: mustNewPodConfigStore(),
 		}
+		np.nriConnected.Store(true)
 
 		claims := []*resourcev1.ResourceClaim{
 			{
@@ -475,6 +478,7 @@ func TestDynamicProfiles(t *testing.T) {
 			podConfigStore: mustNewPodConfigStore(),
 			eventRecorder:  record.NewFakeRecorder(100),
 		}
+		np.nriConnected.Store(true)
 
 		claims := []*resourcev1.ResourceClaim{
 			{
@@ -525,6 +529,7 @@ func TestDynamicProfiles(t *testing.T) {
 			podConfigStore: mustNewPodConfigStore(),
 			eventRecorder:  record.NewFakeRecorder(100),
 		}
+		np.nriConnected.Store(true)
 
 		claims := []*resourcev1.ResourceClaim{
 			{
@@ -573,6 +578,7 @@ func TestDynamicProfiles(t *testing.T) {
 			driverName:     "test.driver",
 			podConfigStore: mustNewPodConfigStore(),
 		}
+		np.nriConnected.Store(true)
 
 		claimName := types.NamespacedName{Namespace: "default", Name: "claim-td"}
 		// Inject a profile in pod config store
@@ -631,6 +637,7 @@ func TestDynamicProfiles(t *testing.T) {
 			podConfigStore: mustNewPodConfigStore(),
 			eventRecorder:  record.NewFakeRecorder(100),
 		}
+		np.nriConnected.Store(true)
 
 		claims := []*resourcev1.ResourceClaim{
 			{
@@ -713,6 +720,7 @@ func TestDynamicProfiles(t *testing.T) {
 			podConfigStore: mustNewPodConfigStore(),
 			eventRecorder:  record.NewFakeRecorder(100),
 		}
+		np.nriConnected.Store(true)
 
 		claims := []*resourcev1.ResourceClaim{
 			{
@@ -2584,5 +2592,41 @@ func TestClearStaleRouteSources(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPrepareResourceClaimsGatedWhenNRIDisconnected(t *testing.T) {
+	ctx := context.Background()
+	np := &NetworkDriver{
+		driverName:     "test.driver",
+		netdb:          newFakeInventoryDB(),
+		podConfigStore: mustNewPodConfigStore(),
+	}
+
+	// Empty claim batches still succeed when NRI is disconnected.
+	if res, err := np.PrepareResourceClaims(ctx, nil); err != nil || res != nil {
+		t.Fatalf("PrepareResourceClaims(nil) = (%v, %v), want (nil, nil)", res, err)
+	}
+
+	claims := []*resourcev1.ResourceClaim{
+		{ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-1", Namespace: "default", Name: "claim-1"}},
+	}
+
+	draPluginRequestsTotal.Reset()
+	if _, err := np.PrepareResourceClaims(ctx, claims); err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Fatalf("PrepareResourceClaims while NRI disconnected: err = %v, want not connected error", err)
+	}
+	if got := testutil.ToFloat64(draPluginRequestsTotal.WithLabelValues(methodPrepareResourceClaims, statusFailed)); got != 1 {
+		t.Errorf("failed metric = %v, want 1", got)
+	}
+
+	// Once NRI is connected, PrepareResourceClaims proceeds normally.
+	np.nriConnected.Store(true)
+	res, err := np.PrepareResourceClaims(ctx, claims)
+	if err != nil {
+		t.Fatalf("PrepareResourceClaims while NRI connected failed: %v", err)
+	}
+	if res["claim-uid-1"].Err != nil {
+		t.Fatalf("unexpected per-claim error: %v", res["claim-uid-1"].Err)
 	}
 }

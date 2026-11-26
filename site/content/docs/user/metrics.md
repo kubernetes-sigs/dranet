@@ -15,7 +15,9 @@ endpoints are reachable on port `9177` of each node's IP address.
 
 | Path | Description |
 |------|-------------|
-| `/healthz` | Returns `503 Service Unavailable` until the kubelet has registered the DRA plugin and the driver has started, and `200 OK` after that. The startup and readiness probes of the DaemonSet use it. It does not report later failures; see [Connection loops](#connection-loops) for those. |
+| `/healthz` | Evaluates the logical AND of the DRA (`dra`) and NRI (`nri`) checks, returning `200 OK` (`ok`) only when both are healthy and `503 Service Unavailable` with per-check details otherwise. Supports `?verbose` and `?exclude=<check>` like Kubernetes apiserver healthz endpoints. The startup and readiness probes of the DaemonSet use it. |
+| `/healthz/dra` | Returns `200 OK` when the DRA kubelet plugin is started and registered with kubelet, and `503 Service Unavailable` otherwise. |
+| `/healthz/nri` | Returns `200 OK` when the NRI plugin is connected to the container runtime, and `503 Service Unavailable` otherwise. |
 | `/metrics` | Prometheus metrics in the text exposition format. |
 
 DRANET binds the address before it starts the driver. If the port is already in
@@ -103,10 +105,11 @@ well. On a node where DRANET has never found a device,
 ### Connection loops
 
 DRANET runs its NRI plugin connection and its device inventory in loops that
-DRANET restarts when they stop. When either loop has stopped 5 times, the
-DRANET process exits and the kubelet restarts the container. These counters
-reset when the process restarts, so a value that approaches 5 warns that the
-process is about to exit.
+DRANET restarts when they stop. When either loop fails 5 consecutive times, the
+DRANET process exits and the kubelet restarts the container (for NRI, the
+consecutive failure counter resets after each successful connection so routine
+container runtime restarts do not crash DRANET). These counters reset when the
+process restarts.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -119,6 +122,32 @@ open, while `dranet_driver_nri_plugin_reconnect_attempts_total` also counts
 attempts that failed to connect or register. A disconnect can happen after
 DRANET has already handled a request successfully, so it does not show up in
 `dranet_driver_nri_plugin_requests_total{status="failed"}`.
+
+### Pods without their devices
+
+A pod can start without the network devices that it claims if the container
+runtime creates its sandbox while the runtime does not have the DRANET NRI
+plugin. That needs a fault on the node at that moment: DRANET is killed or
+panics, or the container runtime restarts. A graceful stop of DRANET, for
+example an update, is safe. The kubelet does not prepare the claims again for
+such a pod, so nothing attaches the devices later.
+
+DRANET cannot prevent this, because it is not connected when it happens. Each
+time DRANET connects to the container runtime, it looks at the running pods that
+it prepared, and it reports the ones that do not have a claimed network
+interface in their network namespace:
+
+- a `Warning` event with the reason `NetworkDeviceMissing` on the Pod;
+- an error in the DRANET log;
+- the metric below.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `dranet_driver_pods_missing_devices_total` | Counter | none | Number of times DRANET found a running pod without a network device that the pod claims. |
+
+Delete the pod to create it again with its devices. DRANET does not check the
+devices that have no network interface in the pod, for example RDMA only
+devices.
 
 ## Example queries
 
@@ -149,4 +178,11 @@ Nodes where a DRANET loop has stopped, so the process may exit soon:
 ```promql
 dranet_driver_nri_plugin_reconnect_attempts_total > 0
   or dranet_driver_netdb_reconnect_attempts_total > 0
+```
+
+Nodes where DRANET found a pod that runs without a claimed network device in
+the last hour:
+
+```promql
+increase(dranet_driver_pods_missing_devices_total[1h]) > 0
 ```

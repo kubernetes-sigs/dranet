@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -44,6 +46,15 @@ func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox
 	logger := klog.FromContext(ctx)
 	logger.Info("Synchronized state with the runtime", "pods", len(pods), "containers", len(containers))
 
+	// A sandbox with a running container is past RunPodSandbox and is not in
+	// teardown, so its claimed network devices must be in its namespace.
+	running := set.Set[string]{}
+	for _, ctr := range containers {
+		if ctr.GetState() == api.ContainerState_CONTAINER_RUNNING {
+			running.Insert(ctr.GetPodSandboxId())
+		}
+	}
+
 	// livePodNetNs map tracks live pods by UID and their network namespace paths.
 	livePodNetNs := make(map[types.UID]string)
 	for _, pod := range pods {
@@ -51,6 +62,9 @@ func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox
 		podLogger.Info("Synchronize Pod")
 		podLogger.V(2).Info("Pod network details", "netns", getNetworkNamespace(pod), "ips", pod.GetIps())
 		livePodNetNs[types.UID(pod.Uid)] = getNetworkNamespace(pod)
+		if running.Has(pod.GetId()) {
+			np.reportMissingDevices(klog.NewContext(ctx, podLogger), pod)
+		}
 	}
 
 	// Process stored pods: update NetNS for live pods.
@@ -61,6 +75,51 @@ func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox
 	}
 
 	return nil, nil
+}
+
+// reportMissingDevices reports the network devices that a running pod claims
+// and that are not in its network namespace.
+//
+// This happens when the runtime creates the pod sandbox while it does not have
+// the NRI plugin: DRANET was killed, or the runtime restarted. The kubelet does
+// not prepare the claims again for such a pod, so nothing attaches the devices
+// later and the pod runs without them. DRANET cannot prevent it, because it is
+// not connected at that time, but it can find it when it connects again.
+func (np *NetworkDriver) reportMissingDevices(ctx context.Context, pod *api.PodSandbox) {
+	podConfig, ok := np.podConfigStore.GetPodConfig(types.UID(pod.GetUid()))
+	if !ok {
+		return
+	}
+	ns := getNetworkNamespace(pod)
+	if ns == "" {
+		return
+	}
+	logger := klog.FromContext(ctx)
+
+	var missing []string
+	for deviceName, config := range podConfig.DeviceConfigs {
+		// A device with no network interface has no link in the namespace.
+		if config.NetworkInterfaceConfigInHost.Interface.Name == "" {
+			continue
+		}
+		found, err := nsHasLink(ns, config.NetworkInterfaceConfigInPod.Interface.Name)
+		if err != nil {
+			logger.Error(err, "Failed to check the network device of the pod", "device", deviceName)
+			continue
+		}
+		if !found {
+			missing = append(missing, deviceName)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	slices.Sort(missing)
+	podsMissingDevicesTotal.Inc()
+	logger.Error(nil, "Pod runs without network devices that it claims", "devices", missing)
+	np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceMissing",
+		"pod %s/%s runs without the claimed network devices %s: its sandbox was created while DRANET was not connected to the container runtime. Delete the pod to create it again with the devices.",
+		pod.GetNamespace(), pod.GetName(), strings.Join(missing, ", "))
 }
 
 // CreateContainer handles container creation requests.
