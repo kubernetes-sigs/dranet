@@ -193,12 +193,16 @@ func New(opts ...Option) *DB {
 	return db
 }
 
+// Run discovers devices and publishes updates to the notifications channel
+// until ctx is canceled. It does not close the notifications channel, so a
+// caller can retry Run on the same DB without panicking on a closed channel
+// or terminating consumers.
 func (db *DB) Run(ctx context.Context) error {
-	defer close(db.notifications)
-
 	// Resources are published periodically or if there is a netlink notification
-	// indicating a new interfaces was added or changed
-	nlChannel := make(chan netlink.LinkUpdate)
+	// indicating a new interface was added or changed. Buffer both channels so a
+	// burst of link or address events is drained below and triggers a single scan.
+	const netlinkSubscribeBufSize = 64
+	nlChannel := make(chan netlink.LinkUpdate, netlinkSubscribeBufSize)
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 	if err := netlink.LinkSubscribe(nlChannel, doneCh); err != nil {
@@ -207,10 +211,8 @@ func (db *DB) Run(ctx context.Context) error {
 	// Address changes do not produce link notifications, so without this
 	// subscription an address added to or removed from an interface that is
 	// already up is only reflected in the ipv4 and ipv6 attributes on the
-	// next periodic poll. The channel is buffered so a burst of address
-	// events, for example when an interface gets several addresses at once,
-	// is drained below and triggers a single scan.
-	addrChannel := make(chan netlink.AddrUpdate, 64)
+	// next periodic poll.
+	addrChannel := make(chan netlink.AddrUpdate, netlinkSubscribeBufSize)
 	if err := netlink.AddrSubscribeWithOptions(addrChannel, doneCh, netlink.AddrSubscribeOptions{
 		ErrorCallback: func(err error) {
 			select {
@@ -229,17 +231,25 @@ func (db *DB) Run(ctx context.Context) error {
 	db.gwInterfaces = getExcludedUplinkInterfaces()
 	klog.V(2).Infof("Excluded uplink interfaces and children: %v", db.gwInterfaces.UnsortedList())
 
+	rescanRequested := false
 	for {
-		err := db.rateLimiter.Wait(ctx)
-		if err != nil {
+		if err := db.rateLimiter.Wait(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			klog.Error(err, "unexpected rate limited error trying to get system interfaces")
 		}
 
 		filteredDevices := db.scan()
-		if len(filteredDevices) > 0 || db.hasDevices {
-			db.hasDevices = len(filteredDevices) > 0
-			db.notifications <- filteredDevices
+		if len(filteredDevices) > 0 || db.hasDevices || rescanRequested {
+			select {
+			case db.notifications <- filteredDevices:
+				db.hasDevices = len(filteredDevices) > 0
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
+		rescanRequested = false
 
 		select {
 		// trigger a reconcile
@@ -263,6 +273,7 @@ func (db *DB) Run(ctx context.Context) error {
 			}
 		case <-db.rescanCh:
 			klog.V(3).Infof("Triggering inventory rescan due to manual request")
+			rescanRequested = true
 		case <-time.After(db.maxPollInterval):
 		case <-ctx.Done():
 			return ctx.Err()

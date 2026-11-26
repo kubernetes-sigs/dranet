@@ -59,43 +59,74 @@ const (
 // The hooks NodePrepareResources and NodeUnprepareResources are needed to collect the necessary
 // information so the NRI hooks can perform the configuration and attachment of Pods at runtime.
 
+// PublishResources is the only goroutine that publishes the ResourceSlice, so
+// the publications are in sequence and the last one has the latest state.
 func (np *NetworkDriver) PublishResources(ctx context.Context) {
 	klog.V(2).Infof("Publishing resources")
+	// lastLive is the last inventory received. A request on republishCh
+	// publishes it again without a new scan.
+	var lastLive []resourceapi.Device
+	hasLive := false
 	for {
 		select {
 		// Wait for updates from the host-discovered (live) device inventory
-		case live := <-np.netdb.GetResources(ctx):
+		case live, ok := <-np.netdb.GetResources(ctx):
+			if !ok {
+				return
+			}
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(live), formatDeviceNames(live, 15))
-
-			// Fetch device snapshots from BoltDB store and merge
-			merged := live
-			if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
-				snapshots := np.podConfigStore.GetAllocatedDeviceSnapshots()
-				merged = mergeDevices(live, snapshots)
-			}
-
-			// Apply filtering on the merged set of devices
-			filtered := filter.FilterDevices(np.celProgram, merged)
-
-			klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
-
-			np.publishResourcesPrometheusMetrics(filtered)
-
-			resources := resourceslice.DriverResources{
-				Pools: map[string]resourceslice.Pool{
-					np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
-				},
-			}
-			err := np.draPlugin.PublishResources(ctx, resources)
-			if err != nil {
-				klog.Error(err, "unexpected error trying to publish resources")
-			} else {
-				lastPublishedTime.SetToCurrentTime()
+			lastLive, hasLive = live, true
+			np.publishDevices(ctx, lastLive)
+		case <-np.republishCh:
+			if hasLive {
+				np.publishDevices(ctx, lastLive)
 			}
 		case <-ctx.Done():
 			klog.Error(ctx.Err(), "context canceled")
 			return
 		}
+	}
+}
+
+// requestRepublish asks PublishResources to publish again from the last
+// inventory, without a new scan. It does not block. A request that is already
+// pending is sufficient, because PublishResources reads the device snapshots
+// after it takes the request.
+func (np *NetworkDriver) requestRepublish() {
+	select {
+	case np.republishCh <- struct{}{}:
+	default:
+	}
+}
+
+// publishDevices merges the live inventory with the snapshots of the allocated
+// devices, applies the CEL filter, and gives the result to draPlugin. Only
+// PublishResources calls it.
+func (np *NetworkDriver) publishDevices(ctx context.Context, live []resourceapi.Device) {
+	// Fetch device snapshots from BoltDB store and merge
+	merged := live
+	if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
+		snapshots := np.podConfigStore.GetAllocatedDeviceSnapshots()
+		merged = mergeDevices(live, snapshots)
+	}
+
+	// Apply filtering on the merged set of devices
+	filtered := filter.FilterDevices(np.celProgram, merged)
+
+	klog.V(3).Infof("After database merging and filtering, publishing %d devices in ResourceSlice(s): %s", len(filtered), formatDeviceNames(filtered, 15))
+
+	np.publishResourcesPrometheusMetrics(filtered)
+
+	resources := resourceslice.DriverResources{
+		Pools: map[string]resourceslice.Pool{
+			np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
+		},
+	}
+	err := np.draPlugin.PublishResources(ctx, resources)
+	if err != nil {
+		klog.Error(err, "unexpected error trying to publish resources")
+	} else {
+		lastPublishedTime.SetToCurrentTime()
 	}
 }
 
@@ -556,6 +587,16 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 			klog.Infof("error unpreparing ressources for claim %s/%s : %v", claim.Namespace, claim.Name, err)
 		}
 	}
+
+	// The claims' device snapshots are gone. When PersistentResourceSliceAttributes
+	// is enabled, publish again from the last inventory so the ResourceSlice
+	// drops the deleted snapshots without the delay of an inventory scan. Also
+	// queue an async rescan for devices that returned without a netlink event.
+	if features.DefaultFeatureGate.Enabled(features.PersistentResourceSliceAttributes) {
+		np.requestRepublish()
+	}
+	np.netdb.RequestRescan()
+
 	return result, nil
 }
 
@@ -591,10 +632,6 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 	}
 
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
-	// The claim's device snapshots are gone, so republish now instead of on
-	// the next periodic poll. Otherwise attributes merged from the snapshots
-	// stay in the ResourceSlice after the device becomes allocatable again.
-	np.netdb.RequestRescan()
 	return nil
 }
 

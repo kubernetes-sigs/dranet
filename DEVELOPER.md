@@ -26,6 +26,13 @@ and README of the scenarios you are testing.
 
 You can run your tests locally using `bats tests/`
 
+For scheduling and pod lifecycle ordering tests that need the real control
+plane and kubelet timing but not a full multi-node run, use the Go
+integration suite in [tests/integration](./tests/integration/README.md):
+`make integration-test`. It runs against a single node kind cluster with
+dranet as a host process in the node, so a code change is a rebuild and a
+restart, not an image build and rollout.
+
 
 ## Develop in a cluster
 
